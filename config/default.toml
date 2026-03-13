@@ -34,6 +34,7 @@ compare_presets = ["balanced", "crisp"]
 left_panel_width = 280.0
 bottom_panel_height = 220.0
 thumbnail_panel_width = 220.0
+continuous_page_gap_px = 100.0
 show_metrics = true
 show_logs_hint = true
 show_thumbnails = true

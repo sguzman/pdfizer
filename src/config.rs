@@ -123,6 +123,10 @@ impl AppConfig {
                 "ui.thumbnail_panel_width",
                 f64::from(defaults.ui.thumbnail_panel_width),
             )?
+            .set_default(
+                "ui.continuous_page_gap_px",
+                f64::from(defaults.ui.continuous_page_gap_px),
+            )?
             .set_default("ui.show_metrics", defaults.ui.show_metrics)?
             .set_default("ui.show_logs_hint", defaults.ui.show_logs_hint)?
             .set_default("ui.show_thumbnails", defaults.ui.show_thumbnails)?
@@ -720,6 +724,7 @@ pub struct UiConfig {
     pub left_panel_width: f32,
     pub bottom_panel_height: f32,
     pub thumbnail_panel_width: f32,
+    pub continuous_page_gap_px: f32,
     pub show_metrics: bool,
     pub show_logs_hint: bool,
     pub show_thumbnails: bool,
@@ -733,6 +738,7 @@ impl Default for UiConfig {
             left_panel_width: 280.0,
             bottom_panel_height: 220.0,
             thumbnail_panel_width: 220.0,
+            continuous_page_gap_px: 100.0,
             show_metrics: true,
             show_logs_hint: true,
             show_thumbnails: true,

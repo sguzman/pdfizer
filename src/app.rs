@@ -25,8 +25,9 @@ use crate::{
         TileRenderRequest,
     },
     tts::{
-        self, PdfTtsMode, PreparedSentenceClip, SentenceSyncConfidence, SentenceSyncTarget,
-        TtsAnalysisArtifacts, TtsEngineKind, TtsPlaybackState, TtsWorkerMessage,
+        self, AnalysisScope, PdfTtsMode, PreparedSentenceClip, SentenceSyncConfidence,
+        SentenceSyncTarget, TtsAnalysisArtifacts, TtsEngineKind, TtsPlaybackState,
+        TtsWorkerMessage,
     },
 };
 
@@ -69,6 +70,8 @@ pub struct PdfizerApp {
     tts_analysis_progress: Option<String>,
     tts_analysis_started_at: Option<Instant>,
     tts_analysis_last_heartbeat_at: Option<Instant>,
+    tts_pending_analysis_scope: Option<AnalysisScope>,
+    tts_pending_analysis_request: Option<TtsAnalysisRequest>,
     tts_policy: Option<tts::TtsRuntimePolicy>,
     pending_tts_sentence_id: Option<u64>,
     tts_worker_tx: Option<Sender<TtsWorkerMessage>>,
@@ -153,6 +156,32 @@ enum TtsAnalysisRequest {
     Startup,
     Windowed,
     FullDocument,
+}
+
+impl TtsAnalysisRequest {
+    fn label(&self) -> &'static str {
+        match self {
+            Self::Startup => "startup",
+            Self::Windowed => "windowed",
+            Self::FullDocument => "full_document",
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct TtsAnalysisStateSnapshot {
+    source_path: String,
+    status: String,
+    request: String,
+    stage: String,
+    start_page: usize,
+    end_page: usize,
+    full_document: bool,
+    processed_pages: usize,
+    total_pages: usize,
+    current_page: Option<usize>,
+    updated_at_unix_secs: u64,
+    error: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -285,6 +314,8 @@ impl PdfizerApp {
             tts_analysis_progress: None,
             tts_analysis_started_at: None,
             tts_analysis_last_heartbeat_at: None,
+            tts_pending_analysis_scope: None,
+            tts_pending_analysis_request: None,
             tts_policy: None,
             pending_tts_sentence_id: None,
             tts_worker_tx: None,
@@ -360,6 +391,8 @@ impl PdfizerApp {
                 self.tts_analysis_progress = None;
                 self.tts_analysis_started_at = None;
                 self.tts_analysis_last_heartbeat_at = None;
+                self.tts_pending_analysis_scope = None;
+                self.tts_pending_analysis_request = None;
                 self.tts_policy = None;
                 self.pending_tts_sentence_id = None;
                 self.reset_tts_runtime();
@@ -397,7 +430,62 @@ impl PdfizerApp {
         self.tts_analysis_progress = Some("Queued TTS analysis".into());
         self.tts_analysis_started_at = Some(Instant::now());
         self.tts_analysis_last_heartbeat_at = Some(Instant::now());
-        let analysis_scope = self.planned_tts_analysis_scope(request);
+        let analysis_scope = self.analysis_scope_for_request(request);
+        self.tts_pending_analysis_scope = analysis_scope.clone();
+        self.tts_pending_analysis_request = Some(request);
+        self.persist_tts_analysis_state(
+            &path,
+            "queued",
+            request,
+            "Queued TTS analysis",
+            0,
+            analysis_scope
+                .as_ref()
+                .map(|scope| scope.end_page.saturating_sub(scope.start_page) + 1)
+                .unwrap_or(0),
+            None,
+            None,
+            analysis_scope.as_ref(),
+        );
+        info!(
+            path = %path.display(),
+            request = %request.label(),
+            scope = ?analysis_scope,
+            "starting TTS analysis"
+        );
+
+        if matches!(request, TtsAnalysisRequest::Startup) {
+            let analysis_result = self.run_startup_tts_analysis(&path, analysis_scope.as_ref());
+            match analysis_result {
+                Ok(artifacts) => self.apply_tts_analysis_artifacts(artifacts, "built"),
+                Err(err) => {
+                    let error = err.to_string();
+                    error!(path = %path.display(), error = %error, "TTS analysis failed");
+                    self.last_error = Some(format!("TTS analysis failed: {error}"));
+                    self.tts_analysis_status = TtsAnalysisStatus::Failed(error.clone());
+                    self.tts_analysis_progress = None;
+                    self.tts_analysis_started_at = None;
+                    self.tts_analysis_last_heartbeat_at = None;
+                    self.tts_pending_analysis_scope = None;
+                    self.tts_pending_analysis_request = None;
+                    self.persist_tts_analysis_state(
+                        &path,
+                        "failed",
+                        request,
+                        "startup analysis failed",
+                        0,
+                        analysis_scope
+                            .as_ref()
+                            .map(|scope| scope.end_page.saturating_sub(scope.start_page) + 1)
+                            .unwrap_or(0),
+                        None,
+                        Some(&error),
+                        analysis_scope.as_ref(),
+                    );
+                }
+            }
+            return;
+        }
 
         thread::spawn(move || {
             let progress_tx = tx.clone();
@@ -414,11 +502,11 @@ impl PdfizerApp {
                 });
             };
             let analysis_result = match analysis_scope {
-                Some((start_page, end_page)) => tts::analyze_pdf_for_tts_in_scope_with_progress(
+                Some(scope) => tts::analyze_pdf_for_tts_in_scope_with_progress(
                     &config,
                     &path,
-                    start_page,
-                    end_page,
+                    scope.start_page,
+                    scope.end_page,
                     send_progress,
                 ),
                 None => tts::analyze_pdf_for_tts_with_progress(&config, &path, send_progress),
@@ -435,6 +523,60 @@ impl PdfizerApp {
             };
             let _ = tx.send(message);
         });
+    }
+
+    fn run_startup_tts_analysis(
+        &mut self,
+        path: &PathBuf,
+        scope: Option<&AnalysisScope>,
+    ) -> Result<TtsAnalysisArtifacts> {
+        let config = self.config.clone();
+        let document = self
+            .document
+            .as_ref()
+            .context("open PDF document is unavailable for startup TTS analysis")?;
+        let fallback_scope = AnalysisScope {
+            start_page: 0,
+            end_page: document.metadata.page_count.saturating_sub(1),
+            full_document: true,
+        };
+        let scope = scope.unwrap_or(&fallback_scope);
+        let total_pages = scope.end_page.saturating_sub(scope.start_page) + 1;
+        let mut progress = |stage: &str,
+                            processed_pages: usize,
+                            total_pages_from_worker: usize,
+                            current_page: Option<usize>| {
+            let total = total_pages_from_worker.max(total_pages);
+            debug!(
+                request = %TtsAnalysisRequest::Startup.label(),
+                stage,
+                processed_pages,
+                total_pages = total,
+                current_page,
+                "startup TTS analysis progress"
+            );
+            Self::persist_tts_analysis_state_with_config(
+                &config,
+                path,
+                "running",
+                TtsAnalysisRequest::Startup,
+                stage,
+                processed_pages,
+                total,
+                current_page,
+                None,
+                Some(scope),
+            );
+        };
+
+        tts::build_artifacts_from_document_with_scope_and_progress(
+            &config,
+            path,
+            document,
+            scope.start_page,
+            scope.end_page,
+            &mut progress,
+        )
     }
 
     fn try_load_cached_tts_analysis(&mut self) -> bool {
@@ -454,38 +596,7 @@ impl PdfizerApp {
                 return false;
             }
         };
-
-        let policy = tts::evaluate_runtime_policy(&self.config, &artifacts);
-        self.status_message = Some(format!(
-            "Loaded cached TTS analysis: {} sentences ({}, {}, pages {}-{}{})",
-            artifacts.sentences.len(),
-            artifacts.mode.label(),
-            policy.reason,
-            artifacts.analysis_scope.start_page + 1,
-            artifacts.analysis_scope.end_page + 1,
-            if artifacts.analysis_scope.full_document {
-                ""
-            } else {
-                ", windowed"
-            }
-        ));
-        self.tts_policy = Some(policy);
-        self.tts_analysis = Some(artifacts);
-        self.tts_analysis_status = TtsAnalysisStatus::Ready;
-        self.tts_analysis_progress = None;
-        self.tts_analysis_started_at = None;
-        self.tts_analysis_last_heartbeat_at = None;
-        if let Some(sentence_id) = self.pending_tts_sentence_id.take() {
-            if let Some(analysis) = &self.tts_analysis {
-                if let Some(index) = tts::sentence_index_for_id(analysis, sentence_id) {
-                    self.tts_active_sentence_index = index;
-                } else {
-                    self.sync_tts_sentence_to_current_page();
-                }
-            }
-        } else {
-            self.sync_tts_sentence_to_current_page();
-        }
+        self.apply_tts_analysis_artifacts(artifacts, "cached");
         true
     }
 
@@ -512,10 +623,14 @@ impl PdfizerApp {
         self.status_message = Some("Rebuilding full-document TTS analysis".into());
     }
 
-    fn planned_tts_analysis_scope(&self, request: TtsAnalysisRequest) -> Option<(usize, usize)> {
+    fn analysis_scope_for_request(&self, request: TtsAnalysisRequest) -> Option<AnalysisScope> {
         let document = self.document.as_ref()?;
         if matches!(request, TtsAnalysisRequest::FullDocument) {
-            return None;
+            return Some(AnalysisScope {
+                start_page: 0,
+                end_page: document.metadata.page_count.saturating_sub(1),
+                full_document: true,
+            });
         }
 
         let page_count = document.metadata.page_count;
@@ -547,7 +662,147 @@ impl PdfizerApp {
             start = end.saturating_sub(max_pages - 1);
         }
 
-        Some((start, end))
+        Some(AnalysisScope {
+            start_page: start,
+            end_page: end,
+            full_document: page_count <= max_pages,
+        })
+    }
+
+    fn persist_tts_analysis_state(
+        &self,
+        source_path: &PathBuf,
+        status: &str,
+        request: TtsAnalysisRequest,
+        stage: &str,
+        processed_pages: usize,
+        total_pages: usize,
+        current_page: Option<usize>,
+        error: Option<&str>,
+        scope: Option<&AnalysisScope>,
+    ) {
+        Self::persist_tts_analysis_state_with_config(
+            &self.config,
+            source_path,
+            status,
+            request,
+            stage,
+            processed_pages,
+            total_pages,
+            current_page,
+            error,
+            scope,
+        );
+    }
+
+    fn persist_tts_analysis_state_with_config(
+        config: &AppConfig,
+        source_path: &PathBuf,
+        status: &str,
+        request: TtsAnalysisRequest,
+        stage: &str,
+        processed_pages: usize,
+        total_pages: usize,
+        current_page: Option<usize>,
+        error: Option<&str>,
+        scope: Option<&AnalysisScope>,
+    ) {
+        let Some(scope) = scope else {
+            return;
+        };
+        let Ok(cache_dir) = config.tts_document_cache_dir(source_path) else {
+            return;
+        };
+        let snapshot = TtsAnalysisStateSnapshot {
+            source_path: source_path.display().to_string(),
+            status: status.into(),
+            request: request.label().into(),
+            stage: stage.into(),
+            start_page: scope.start_page,
+            end_page: scope.end_page,
+            full_document: scope.full_document,
+            processed_pages,
+            total_pages,
+            current_page,
+            updated_at_unix_secs: unix_timestamp_secs(),
+            error: error.map(str::to_owned),
+        };
+        let path = cache_dir.join("analysis-state.toml");
+        if let Ok(contents) = toml::to_string_pretty(&snapshot) {
+            let _ = fs::write(path, contents);
+        }
+    }
+
+    fn apply_tts_analysis_artifacts(
+        &mut self,
+        artifacts: TtsAnalysisArtifacts,
+        state_status: &str,
+    ) {
+        let policy = tts::evaluate_runtime_policy(&self.config, &artifacts);
+        if artifacts.mode != PdfTtsMode::HighTextTrust && self.tts_verbose_degraded_logging_enabled
+        {
+            warn!(
+                path = %artifacts.source_path.display(),
+                mode = %artifacts.mode.label(),
+                confidence = artifacts.confidence,
+                "PDF TTS analysis completed in degraded mode"
+            );
+        }
+        self.status_message = Some(format!(
+            "TTS analysis ready: {} sentences ({}, {}, pages {}-{}{})",
+            artifacts.sentences.len(),
+            artifacts.mode.label(),
+            policy.reason,
+            artifacts.analysis_scope.start_page + 1,
+            artifacts.analysis_scope.end_page + 1,
+            if artifacts.analysis_scope.full_document {
+                ""
+            } else {
+                ", windowed"
+            }
+        ));
+        self.persist_tts_analysis_state(
+            &artifacts.source_path,
+            state_status,
+            if artifacts.analysis_scope.full_document {
+                TtsAnalysisRequest::FullDocument
+            } else {
+                TtsAnalysisRequest::Windowed
+            },
+            "analysis ready",
+            artifacts
+                .analysis_scope
+                .end_page
+                .saturating_sub(artifacts.analysis_scope.start_page)
+                + 1,
+            artifacts
+                .analysis_scope
+                .end_page
+                .saturating_sub(artifacts.analysis_scope.start_page)
+                + 1,
+            None,
+            None,
+            Some(&artifacts.analysis_scope),
+        );
+        self.tts_policy = Some(policy);
+        self.tts_analysis = Some(artifacts);
+        self.tts_analysis_status = TtsAnalysisStatus::Ready;
+        self.tts_analysis_progress = None;
+        self.tts_analysis_started_at = None;
+        self.tts_analysis_last_heartbeat_at = None;
+        self.tts_pending_analysis_scope = None;
+        self.tts_pending_analysis_request = None;
+        if let Some(sentence_id) = self.pending_tts_sentence_id.take() {
+            if let Some(analysis) = &self.tts_analysis {
+                if let Some(index) = tts::sentence_index_for_id(analysis, sentence_id) {
+                    self.tts_active_sentence_index = index;
+                } else {
+                    self.sync_tts_sentence_to_current_page();
+                }
+            }
+        } else {
+            self.sync_tts_sentence_to_current_page();
+        }
     }
 
     fn poll_tts_analysis(&mut self) {
@@ -561,57 +816,35 @@ impl PdfizerApp {
                     request_id,
                     artifacts,
                 }) if request_id == self.tts_request_id => {
-                    let policy = tts::evaluate_runtime_policy(&self.config, &artifacts);
-                    if artifacts.mode != PdfTtsMode::HighTextTrust
-                        && self.tts_verbose_degraded_logging_enabled
-                    {
-                        warn!(
-                            path = %artifacts.source_path.display(),
-                            mode = %artifacts.mode.label(),
-                            confidence = artifacts.confidence,
-                            "PDF TTS analysis completed in degraded mode"
-                        );
-                    }
-                    self.status_message = Some(format!(
-                        "TTS analysis ready: {} sentences ({}, {}, pages {}-{}{})",
-                        artifacts.sentences.len(),
-                        artifacts.mode.label(),
-                        policy.reason,
-                        artifacts.analysis_scope.start_page + 1,
-                        artifacts.analysis_scope.end_page + 1,
-                        if artifacts.analysis_scope.full_document {
-                            ""
-                        } else {
-                            ", windowed"
-                        }
-                    ));
-                    self.tts_policy = Some(policy);
-                    self.tts_analysis = Some(artifacts);
-                    self.tts_analysis_status = TtsAnalysisStatus::Ready;
-                    self.tts_analysis_progress = None;
-                    self.tts_analysis_started_at = None;
-                    self.tts_analysis_last_heartbeat_at = None;
-                    if let Some(sentence_id) = self.pending_tts_sentence_id.take() {
-                        if let Some(analysis) = &self.tts_analysis {
-                            if let Some(index) = tts::sentence_index_for_id(analysis, sentence_id) {
-                                self.tts_active_sentence_index = index;
-                            } else {
-                                self.sync_tts_sentence_to_current_page();
-                            }
-                        }
-                    } else {
-                        self.sync_tts_sentence_to_current_page();
-                    }
+                    self.apply_tts_analysis_artifacts(artifacts, "built");
                 }
                 Ok(TtsWorkerMessage::Failed { request_id, error })
                     if request_id == self.tts_request_id =>
                 {
                     error!(error = %error, "TTS analysis failed");
                     self.last_error = Some(format!("TTS analysis failed: {error}"));
-                    self.tts_analysis_status = TtsAnalysisStatus::Failed(error);
+                    self.tts_analysis_status = TtsAnalysisStatus::Failed(error.clone());
                     self.tts_analysis_progress = None;
                     self.tts_analysis_started_at = None;
                     self.tts_analysis_last_heartbeat_at = None;
+                    if let (Some(path), Some(scope)) = (
+                        self.current_document_path.as_ref(),
+                        self.tts_pending_analysis_scope.as_ref(),
+                    ) {
+                        self.persist_tts_analysis_state(
+                            path,
+                            "failed",
+                            self.tts_pending_analysis_request
+                                .unwrap_or(TtsAnalysisRequest::Windowed),
+                            "analysis failed",
+                            0,
+                            scope.end_page.saturating_sub(scope.start_page) + 1,
+                            None,
+                            Some(&error),
+                            Some(scope),
+                        );
+                    }
+                    self.tts_pending_analysis_scope = None;
                 }
                 Ok(TtsWorkerMessage::AnalysisProgress {
                     request_id,
@@ -646,6 +879,23 @@ impl PdfizerApp {
                     self.tts_analysis_progress = Some(progress.clone());
                     self.tts_analysis_last_heartbeat_at = Some(Instant::now());
                     self.status_message = Some(format!("TTS analysis progress: {progress}"));
+                    if let (Some(path), Some(scope)) = (
+                        self.current_document_path.as_ref(),
+                        self.tts_pending_analysis_scope.as_ref(),
+                    ) {
+                        self.persist_tts_analysis_state(
+                            path,
+                            "running",
+                            self.tts_pending_analysis_request
+                                .unwrap_or(TtsAnalysisRequest::Windowed),
+                            &stage,
+                            processed_pages,
+                            total_pages,
+                            current_page,
+                            None,
+                            Some(scope),
+                        );
+                    }
                 }
                 Ok(TtsWorkerMessage::PrefetchCompleted {
                     request_id,
@@ -798,6 +1048,7 @@ impl PdfizerApp {
         self.tts_analysis_progress = None;
         self.tts_analysis_started_at = None;
         self.tts_analysis_last_heartbeat_at = None;
+        self.tts_pending_analysis_scope = None;
         self.tts_active_sentence_index = 0;
         self.tts_prepared_clips.clear();
         self.tts_sync_targets.clear();
@@ -1937,9 +2188,19 @@ impl PdfizerApp {
         }
 
         let factor = clamped / self.zoom.max(0.0001);
+        let continuous_anchor = self
+            .continuous_offset_anchor(self.continuous_scroll_offset.y)
+            .map(|(page_index, y_in_page)| (page_index, y_in_page * factor));
         self.zoom = clamped;
         self.single_scroll_offset *= factor;
-        self.continuous_scroll_offset *= factor;
+        if let Some((page_index, y_in_page)) = continuous_anchor {
+            self.continuous_scroll_offset = Vec2::new(
+                self.continuous_scroll_offset.x,
+                self.continuous_page_top(page_index) + y_in_page,
+            );
+        } else {
+            self.continuous_scroll_offset *= factor;
+        }
         self.render_current_page(ctx);
         self.persist_session();
     }
@@ -2033,11 +2294,28 @@ impl PdfizerApp {
         Some((page_top + y_in_page).max(0.0))
     }
 
+    fn continuous_offset_anchor(&self, offset_y: f32) -> Option<(usize, f32)> {
+        let document = self.document.as_ref()?;
+        let gap = self.config.ui.continuous_page_gap_px.max(0.0);
+        let mut cursor = 0.0;
+        for page_index in 0..document.metadata.page_count {
+            let size = self.page_image_size(page_index)?;
+            let page_bottom = cursor + size.y;
+            if offset_y <= page_bottom || page_index + 1 == document.metadata.page_count {
+                let y_in_page = (offset_y - cursor).clamp(0.0, size.y);
+                return Some((page_index, y_in_page));
+            }
+            cursor = page_bottom + gap;
+        }
+        None
+    }
+
     fn continuous_page_top(&self, page_index: usize) -> f32 {
+        let gap = self.config.ui.continuous_page_gap_px.max(0.0);
         let mut offset = 0.0;
         for index in 0..page_index {
             if let Some(size) = self.page_image_size(index) {
-                offset += size.y + 14.0;
+                offset += size.y + gap;
             }
         }
         offset
@@ -3144,6 +3422,7 @@ impl PdfizerApp {
         };
 
         let page_count = document.metadata.page_count;
+        let gap = self.config.ui.continuous_page_gap_px.max(0.0);
         let output = ScrollArea::both()
             .id_salt("continuous_document")
             .scroll_offset(self.continuous_scroll_offset)
@@ -3197,7 +3476,7 @@ impl PdfizerApp {
                         );
                     }
 
-                    ui.add_space(14.0);
+                    ui.add_space(gap);
                 }
             });
         self.continuous_viewport = ScrollViewport {
