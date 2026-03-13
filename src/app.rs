@@ -3220,7 +3220,9 @@ impl PdfizerApp {
         let tts_reconfigured = self.tts_engine != TtsEngineKind::from_name(&new_config.tts.engine)
             || (self.config.tts.rate - new_config.tts.rate).abs() > f32::EPSILON
             || (self.config.tts.volume - new_config.tts.volume).abs() > f32::EPSILON
-            || self.config.tts.voice != new_config.tts.voice;
+            || self.config.tts.voice != new_config.tts.voice
+            || self.config.tts.model_path != new_config.tts.model_path
+            || self.config.tts.espeak_data_path != new_config.tts.espeak_data_path;
         let path = new_config.preferred_config_path()?;
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)

@@ -88,7 +88,10 @@ mod tts {
     fn sample_settings() -> TtsSynthesisSettings {
         TtsSynthesisSettings {
             language: "en".into(),
-            voice: "default".into(),
+            voice: "amy".into(),
+            model_path: "/home/admin/Music/models/piper/en-US/female/en_US-amy-medium.onnx"
+                .into(),
+            espeak_data_path: "/usr/share".into(),
             rate: 1.0,
             volume: 1.0,
             sentence_pause_ms: 140,

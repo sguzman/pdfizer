@@ -169,6 +169,11 @@ impl AppConfig {
             .set_default("tts.language", defaults.tts.language.clone())?
             .set_default("tts.engine", defaults.tts.engine.clone())?
             .set_default("tts.voice", defaults.tts.voice.clone())?
+            .set_default("tts.model_path", defaults.tts.model_path.clone())?
+            .set_default(
+                "tts.espeak_data_path",
+                defaults.tts.espeak_data_path.clone(),
+            )?
             .set_default("tts.rate", f64::from(defaults.tts.rate))?
             .set_default("tts.volume", f64::from(defaults.tts.volume))?
             .set_default(
@@ -797,6 +802,8 @@ pub struct TtsConfig {
     pub language: String,
     pub engine: String,
     pub voice: String,
+    pub model_path: String,
+    pub espeak_data_path: String,
     pub rate: f32,
     pub volume: f32,
     pub analysis_progress_log_interval_secs: f32,
@@ -860,8 +867,10 @@ impl Default for TtsConfig {
             normalizer_config_path: "config/normalizer.toml".into(),
             abbreviations_config_path: "config/abbreviations.toml".into(),
             language: "en".into(),
-            engine: "tone_preview".into(),
-            voice: "default".into(),
+            engine: "piper".into(),
+            voice: "amy".into(),
+            model_path: "/home/admin/Music/models/piper/en-US/female/en_US-amy-medium.onnx".into(),
+            espeak_data_path: "/usr/share".into(),
             rate: 1.0,
             volume: 1.0,
             analysis_progress_log_interval_secs: 5.0,

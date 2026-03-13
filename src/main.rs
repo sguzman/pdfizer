@@ -12,6 +12,7 @@ use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitEx
 
 fn main() -> Result<()> {
     let config = AppConfig::load()?;
+    configure_tts_environment(&config);
     let _guard = init_tracing(&config)?;
     info!(?config, "loaded application configuration");
 
@@ -29,6 +30,25 @@ fn main() -> Result<()> {
     .map_err(|err| anyhow!(err.to_string()))?;
 
     Ok(())
+}
+
+fn configure_tts_environment(config: &AppConfig) {
+    if config.tts.engine != "piper" {
+        return;
+    }
+    if std::env::var_os("PIPER_ESPEAKNG_DATA_DIRECTORY").is_some() {
+        return;
+    }
+    if config.tts.espeak_data_path.is_empty() {
+        return;
+    }
+    // Safe here because this runs during process startup before background worker threads exist.
+    unsafe {
+        std::env::set_var(
+            "PIPER_ESPEAKNG_DATA_DIRECTORY",
+            &config.tts.espeak_data_path,
+        );
+    }
 }
 
 fn init_tracing(config: &AppConfig) -> Result<Option<WorkerGuard>> {

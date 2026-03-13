@@ -1,12 +1,14 @@
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
-    fs,
+    env, fs,
     hash::{DefaultHasher, Hash, Hasher},
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
+use piper_rs::from_config_path;
+use piper_rs::synth::PiperSpeechSynthesizer;
 use regex::{Regex, RegexBuilder};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, instrument};
@@ -531,6 +533,7 @@ pub struct TtsRuntimePolicy {
 pub enum TtsEngineKind {
     DryRun,
     TonePreview,
+    Piper,
 }
 
 impl TtsEngineKind {
@@ -538,11 +541,13 @@ impl TtsEngineKind {
         match self {
             Self::DryRun => "dry_run",
             Self::TonePreview => "tone_preview",
+            Self::Piper => "piper",
         }
     }
 
     pub fn from_name(name: &str) -> Self {
         match name {
+            "piper" => Self::Piper,
             "tone_preview" => Self::TonePreview,
             _ => Self::DryRun,
         }
@@ -620,6 +625,8 @@ impl PreparedClipCacheKey {
 pub struct TtsSynthesisSettings {
     pub language: String,
     pub voice: String,
+    pub model_path: String,
+    pub espeak_data_path: String,
     pub rate: f32,
     pub volume: f32,
     pub sentence_pause_ms: u64,
@@ -630,6 +637,8 @@ impl TtsSynthesisSettings {
         Self {
             language: config.tts.language.clone(),
             voice: config.tts.voice.clone(),
+            model_path: config.tts.model_path.clone(),
+            espeak_data_path: config.tts.espeak_data_path.clone(),
             rate: config.tts.rate,
             volume: config.tts.volume,
             sentence_pause_ms: config.tts.sentence_pause_ms,
@@ -687,6 +696,7 @@ pub trait TtsEngine {
 
 struct DryRunEngine;
 struct TonePreviewEngine;
+struct PiperEngine;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TtsPrefetchSnapshot {
@@ -1168,7 +1178,9 @@ pub fn prepare_sentence_clip(
     let manifest_path = audio_cache_dir.join(format!("{stem}.toml"));
     let audio_path = match backend.kind() {
         TtsEngineKind::DryRun => None,
-        TtsEngineKind::TonePreview => Some(audio_cache_dir.join(format!("{stem}.wav"))),
+        TtsEngineKind::TonePreview | TtsEngineKind::Piper => {
+            Some(audio_cache_dir.join(format!("{stem}.wav")))
+        }
     };
 
     if manifest_path.exists() {
@@ -1231,6 +1243,7 @@ pub fn create_tts_engine(kind: TtsEngineKind) -> Box<dyn TtsEngine + Send + Sync
     match kind {
         TtsEngineKind::DryRun => Box::new(DryRunEngine),
         TtsEngineKind::TonePreview => Box::new(TonePreviewEngine),
+        TtsEngineKind::Piper => Box::new(PiperEngine),
     }
 }
 
@@ -1724,6 +1737,40 @@ impl TtsEngine for TonePreviewEngine {
     }
 }
 
+impl TtsEngine for PiperEngine {
+    fn kind(&self) -> TtsEngineKind {
+        TtsEngineKind::Piper
+    }
+
+    fn build_cache_key(
+        &self,
+        analysis: &TtsAnalysisArtifacts,
+        sentence: &SentencePlan,
+        settings: &TtsSynthesisSettings,
+    ) -> PreparedClipCacheKey {
+        PreparedClipCacheKey {
+            source_fingerprint: analysis.source_fingerprint.clone(),
+            sentence_id: sentence.id,
+            engine: self.kind(),
+            language: settings.language.clone(),
+            voice: settings.voice.clone(),
+            rate_milli: (settings.rate * 1000.0).round() as u32,
+            sentence_pause_ms: settings.sentence_pause_ms,
+            text_hash: stable_text_hash(&format!("{}|{}", settings.model_path, sentence.text)),
+        }
+    }
+
+    fn synthesize_clip(
+        &self,
+        audio_path: &Path,
+        sentence: &SentencePlan,
+        settings: &TtsSynthesisSettings,
+    ) -> Result<Option<PathBuf>> {
+        synthesize_piper_clip(audio_path, &sentence.text, settings)?;
+        Ok(Some(audio_path.to_path_buf()))
+    }
+}
+
 #[derive(Debug, Clone)]
 struct ClassificationResult {
     mode: PdfTtsMode,
@@ -2128,6 +2175,105 @@ fn generate_tone_preview_clip(path: &Path, sentence_index: usize, duration_ms: u
         writer.write_sample((sample * i16::MAX as f32) as i16)?;
     }
 
+    writer.finalize()?;
+    Ok(())
+}
+
+fn synthesize_piper_clip(
+    path: &Path,
+    sentence: &str,
+    settings: &TtsSynthesisSettings,
+) -> Result<()> {
+    let model_path = PathBuf::from(&settings.model_path);
+    if !model_path.exists() {
+        bail!("Piper model not found at {}", model_path.display());
+    }
+
+    let espeak_root = PathBuf::from(&settings.espeak_data_path);
+    if !espeak_root.exists() {
+        bail!(
+            "Piper espeak data path not found at {}",
+            espeak_root.display()
+        );
+    }
+
+    if env::var_os("PIPER_ESPEAKNG_DATA_DIRECTORY").is_none() {
+        // Safe here because synthesis runs on background worker threads with a deterministic value.
+        unsafe {
+            env::set_var("PIPER_ESPEAKNG_DATA_DIRECTORY", &espeak_root);
+        }
+    }
+
+    let config_path = resolve_piper_config_path(&model_path);
+    if !config_path.exists() {
+        bail!(
+            "Piper config not found at {} (expected next to {})",
+            config_path.display(),
+            model_path.display()
+        );
+    }
+
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+
+    let model = from_config_path(&config_path)
+        .with_context(|| format!("failed to load Piper config {}", config_path.display()))?;
+    let piper = PiperSpeechSynthesizer::new(model).context("failed to initialize Piper engine")?;
+
+    let mut samples: Vec<f32> = Vec::new();
+    let mut sample_rate: Option<u32> = None;
+    let mut channels: Option<u16> = None;
+    for chunk in piper
+        .synthesize_lazy(sentence.to_string(), None)
+        .context("failed to synthesize Piper audio")?
+    {
+        let chunk = chunk.context("failed to stream Piper audio chunk")?;
+        if sample_rate.is_none() {
+            sample_rate = Some(chunk.info.sample_rate as u32);
+            channels = Some(chunk.info.num_channels as u16);
+        }
+        samples.extend_from_slice(chunk.samples.as_slice());
+    }
+
+    if samples.is_empty() {
+        bail!("Piper produced no audio samples");
+    }
+
+    write_wav_samples(
+        path,
+        sample_rate.unwrap_or(22_050),
+        channels.unwrap_or(1),
+        &samples,
+    )
+}
+
+fn resolve_piper_config_path(model_path: &Path) -> PathBuf {
+    if model_path
+        .extension()
+        .map(|ext| ext == "onnx")
+        .unwrap_or(false)
+    {
+        model_path.with_extension("onnx.json")
+    } else {
+        model_path.to_path_buf()
+    }
+}
+
+fn write_wav_samples(path: &Path, sample_rate: u32, channels: u16, samples: &[f32]) -> Result<()> {
+    let spec = hound::WavSpec {
+        channels,
+        sample_rate,
+        bits_per_sample: 16,
+        sample_format: hound::SampleFormat::Int,
+    };
+    let mut writer = hound::WavWriter::create(path, spec)
+        .with_context(|| format!("failed to create {}", path.display()))?;
+    for &sample in samples {
+        let clamped = (sample * i16::MAX as f32).clamp(i16::MIN as f32, i16::MAX as f32) as i16;
+        writer.write_sample(clamped)?;
+    }
     writer.finalize()?;
     Ok(())
 }

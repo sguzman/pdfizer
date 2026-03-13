@@ -20,6 +20,12 @@ tracing = "0.1.44"
 tracing-appender = "0.2.4"
 tracing-subscriber = { version = "0.3.22", features = ["env-filter", "fmt"] }
 regex = "1.12.3"
+piper-rs = "0.1.9"
+ort = "=2.0.0-rc.9"
+ort-sys = "=2.0.0-rc.9"
 
 [dev-dependencies]
 tempfile = "3.27.0"
+
+[patch.crates-io]
+espeak-rs-sys = { path = "tmp/lantern-leaf/vendor/espeak-rs-sys" }
