@@ -527,22 +527,26 @@ pub enum TtsWorkerMessage {
     },
     PrefetchCompleted {
         request_id: u64,
+        cancel_token: u64,
         clip: PreparedSentenceClip,
         elapsed_ms: u64,
     },
     PrefetchFailed {
         request_id: u64,
+        cancel_token: u64,
         sentence_index: usize,
         error: String,
         elapsed_ms: u64,
     },
     SyncCompleted {
         request_id: u64,
+        cancel_token: u64,
         target: SentenceSyncTarget,
         elapsed_ms: u64,
     },
     SyncFailed {
         request_id: u64,
+        cancel_token: u64,
         sentence_index: usize,
         error: String,
         elapsed_ms: u64,

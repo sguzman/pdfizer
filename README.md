@@ -4,7 +4,7 @@
 
 The current build is no longer just a minimal viewer. It includes thumbnail navigation, cached page renders, large-page tiled rendering, comparison presets, a pixel inspector, benchmark export, persisted session state, layered TOML config, and file-backed tracing.
 
-It also now includes the first four PDF TTS tranches plus completed Phase 1 through Phase 8 roadmap work: canonical PDF text analysis with page/block/line/token provenance, a dedicated segment-based TTS extraction pipeline, explicit multi-column ordering, normalization heuristics for duplicate/rotated text and boilerplate, stable sentence ids, configurable sentence boundary rules, block-fallback playback units, persisted trust classification summaries, a persisted sentence-sync artifact with score breakdowns and token lineage, OCR sidecar contracts for scanned PDFs, a Rust-side pluggable TTS engine contract, synthesis cache-key policy, ahead-of-time clip generation with duration-bounded prefetch, cached sentence-to-PDF sync targets, confidence-scored overlays, OCR/degraded-mode runtime policy, viewport-local TTS budgeting, and tranche-level diagnostics. OCR-backed extraction generation and stronger alignment still remain future work.
+It also now includes the first four PDF TTS tranches plus completed Phase 1 through Phase 10 roadmap work: canonical PDF text analysis with page/block/line/token provenance, a dedicated segment-based TTS extraction pipeline, explicit multi-column ordering, normalization heuristics for duplicate/rotated text and boilerplate, stable sentence ids, configurable sentence boundary rules, block-fallback playback units, persisted trust classification summaries, a persisted sentence-sync artifact with score breakdowns and token lineage, OCR sidecar contracts for scanned PDFs, a Rust-side pluggable TTS engine contract, synthesis cache-key policy, ahead-of-time clip generation with duration-bounded prefetch, cached sentence-to-PDF sync targets, confidence-scored overlays, OCR/degraded-mode runtime policy, viewport-local TTS budgeting, worker-owned playback control, explicit TTS cancellation tokens, dedicated playback UI, and tranche-level diagnostics. OCR-backed extraction generation and stronger alignment still remain future work.
 
 ## Stack
 
@@ -35,6 +35,9 @@ It also now includes the first four PDF TTS tranches plus completed Phase 1 thro
 - Use a pluggable Rust-side TTS engine contract with synthesis settings and stable cache keys
 - Bound audio prefetch by both sentence count and duration budget so preparation stays ahead without overrunning the reader
 - Exercise a tone-preview TTS runtime with play/pause, sentence stepping, direct sentence seek, follow mode, and cached prepared clips
+- Run playback control on a dedicated worker so audio commands do not block the viewer UI thread
+- Cancel stale TTS work explicitly on document close, seek, sentence jump, and engine reconfiguration
+- Use a dedicated TTS player bar that surfaces sentence index, page provenance, sync confidence, and degraded-mode messaging
 - Highlight the active spoken sentence on the PDF with exact, fuzzy, block, or page-level fallback behavior
 - Apply OCR/degraded-mode policy so scan-first PDFs degrade honestly instead of pretending sentence-accurate sync exists
 - Track TTS prep, sync, activation latency, and cache-hit diagnostics while keeping runtime state bounded around the viewport

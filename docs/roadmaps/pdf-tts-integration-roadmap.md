@@ -189,24 +189,24 @@ Checked items reflect capabilities already present in this repository that reduc
 
 ## Phase 9: Threading And Scheduling
 
-- [ ] Run synthesis preparation off the UI thread.
-- [ ] Run audio playback control off the UI thread.
-- [ ] Introduce explicit cancellation tokens for document close, seek, jump, and engine reconfiguration.
+- [x] Run synthesis preparation off the UI thread.
+- [x] Run audio playback control off the UI thread.
+- [x] Introduce explicit cancellation tokens for document close, seek, jump, and engine reconfiguration.
 - [x] Keep PDF rendering, text extraction, sync mapping, and audio preparation in separate work lanes.
 - [x] Bound concurrency so prefetch does not starve page rendering or search responsiveness.
 - [x] Add a scheduler policy that prioritizes current-page rendering over future audio generation when resources are tight.
-- [ ] Log queue depths, task latency, cancellation outcomes, and starvation signals.
+- [x] Log queue depths, task latency, cancellation outcomes, and starvation signals.
 
 ## Phase 10: Playback UI And Controls
 
-- [ ] Add a dedicated player bar suited to the current `egui` layout rather than copying the Lantern Leaf widget literally.
-- [ ] Support play/pause.
-- [ ] Support previous/next sentence.
-- [ ] Support stop.
-- [ ] Surface current sentence index, page, and sync confidence tier.
-- [ ] Surface degraded-mode messaging when sentence-accurate sync is unavailable.
-- [ ] Keep control state updates independent from expensive page rerenders.
-- [ ] Support keyboard shortcuts for playback and sentence navigation.
+- [x] Add a dedicated player bar suited to the current `egui` layout rather than copying the Lantern Leaf widget literally.
+- [x] Support play/pause.
+- [x] Support previous/next sentence.
+- [x] Support stop.
+- [x] Surface current sentence index, page, and sync confidence tier.
+- [x] Surface degraded-mode messaging when sentence-accurate sync is unavailable.
+- [x] Keep control state updates independent from expensive page rerenders.
+- [x] Support keyboard shortcuts for playback and sentence navigation.
 
 ## Phase 11: Sentence Highlight Overlay
 
