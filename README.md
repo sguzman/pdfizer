@@ -49,6 +49,7 @@ It also now includes the first four PDF TTS tranches plus completed Phase 1 thro
 - Gate experimental PDF sync behavior at runtime and demote weak sync targets using configurable score thresholds
 - Export TTS debug snapshots with sentence plan, sync targets, visible highlight state, and runtime counters
 - Track explicit sync failure counters for wrong-page, distant-geometry, and unmappable cases
+- Load Lantern Leaf-style text normalization and abbreviation configs for PDF TTS cleanup, including regex replacements, acronym expansion, and pronunciation overrides
 
 ## Pdfium Runtime
 
@@ -87,6 +88,13 @@ PDFIZER__RENDERING__INITIAL_ZOOM=1.75 cargo run
 ```
 
 The in-app config editor saves to `startup.preferred_config_name`.
+
+PDF TTS normalization also loads:
+
+- [config/normalizer.toml](/win/linux/Code/rust/pdfizer/config/normalizer.toml)
+- [config/abbreviations.toml](/win/linux/Code/rust/pdfizer/config/abbreviations.toml)
+
+Those files drive abbreviation expansion, regex text rewrites, token drops, acronym speaking forms, and pronunciation overrides before sentence planning.
 
 ## Modes
 

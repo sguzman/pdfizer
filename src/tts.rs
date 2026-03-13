@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     fs,
     hash::{DefaultHasher, Hash, Hasher},
     path::{Path, PathBuf},
@@ -7,6 +7,7 @@ use std::{
 };
 
 use anyhow::{Context, Result};
+use regex::{Regex, RegexBuilder};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, instrument};
 
@@ -24,6 +25,198 @@ const PDF_LIGATURES: [(&str, &str); 7] = [
     ("\u{FB05}", "ft"),
     ("\u{FB06}", "st"),
 ];
+
+#[derive(Debug, Clone)]
+struct PdfTextNormalizer {
+    config: ExternalNormalizationConfig,
+    case_rules: Vec<CompiledReplacementRule>,
+    nocase_rules: Vec<CompiledReplacementRule>,
+    regex_rules: Vec<CompiledRegexRule>,
+    abbreviation_guards: HashSet<String>,
+}
+
+impl Default for PdfTextNormalizer {
+    fn default() -> Self {
+        let config = ExternalNormalizationConfig::default();
+        Self {
+            abbreviation_guards: default_sentence_abbreviation_guards(),
+            case_rules: Vec::new(),
+            nocase_rules: Vec::new(),
+            regex_rules: Vec::new(),
+            config,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct CompiledReplacementRule {
+    regex: Regex,
+    replace: String,
+}
+
+#[derive(Debug, Clone)]
+struct CompiledRegexRule {
+    regex: Regex,
+    replace: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+struct ExternalNormalizerFile {
+    normalization: ExternalNormalizationConfig,
+}
+
+impl Default for ExternalNormalizerFile {
+    fn default() -> Self {
+        Self {
+            normalization: ExternalNormalizationConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+struct ExternalNormalizationConfig {
+    enabled: bool,
+    collapse_whitespace: bool,
+    remove_space_before_punctuation: bool,
+    strip_inline_code: bool,
+    strip_markdown_links: bool,
+    drop_numeric_bracket_citations: bool,
+    drop_parenthetical_numeric_citations: bool,
+    drop_superscript_citations: bool,
+    drop_word_suffix_numeric_footnotes: bool,
+    drop_square_bracket_text: bool,
+    drop_curly_brace_text: bool,
+    min_sentence_chars: usize,
+    require_alphanumeric: bool,
+    replacements: BTreeMap<String, String>,
+    drop_tokens: Vec<String>,
+    acronyms: ExternalAcronymConfig,
+    pronunciation: ExternalPronunciationConfig,
+}
+
+impl Default for ExternalNormalizationConfig {
+    fn default() -> Self {
+        let mut replacements = BTreeMap::new();
+        replacements.insert("#".into(), " ".into());
+        replacements.insert("*".into(), " ".into());
+        replacements.insert(":".into(), " ".into());
+        replacements.insert("%".into(), " percent ".into());
+        Self {
+            enabled: true,
+            collapse_whitespace: true,
+            remove_space_before_punctuation: true,
+            strip_inline_code: true,
+            strip_markdown_links: true,
+            drop_numeric_bracket_citations: true,
+            drop_parenthetical_numeric_citations: true,
+            drop_superscript_citations: true,
+            drop_word_suffix_numeric_footnotes: true,
+            drop_square_bracket_text: true,
+            drop_curly_brace_text: true,
+            min_sentence_chars: 2,
+            require_alphanumeric: true,
+            replacements,
+            drop_tokens: Vec::new(),
+            acronyms: ExternalAcronymConfig::default(),
+            pronunciation: ExternalPronunciationConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+struct ExternalAcronymConfig {
+    enabled: bool,
+    tokens: Vec<String>,
+    letter_separator: String,
+    digit_separator: String,
+    letter_sounds: BTreeMap<String, String>,
+}
+
+impl Default for ExternalAcronymConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            tokens: vec![
+                "CSS".into(),
+                "HTML".into(),
+                "HTTP".into(),
+                "HTTPS".into(),
+                "URL".into(),
+                "API".into(),
+                "CPU".into(),
+                "GPU".into(),
+                "JSON".into(),
+                "SQL".into(),
+                "XML".into(),
+                "TTS".into(),
+                "XTTS".into(),
+                "LLM".into(),
+            ],
+            letter_separator: " ".into(),
+            digit_separator: " point ".into(),
+            letter_sounds: default_letter_sounds(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+struct ExternalPronunciationConfig {
+    enable_brand_map: bool,
+    brand_map: BTreeMap<String, String>,
+    custom_pronunciations: BTreeMap<String, String>,
+}
+
+impl Default for ExternalPronunciationConfig {
+    fn default() -> Self {
+        let mut brand_map = BTreeMap::new();
+        brand_map.insert("MySQL".into(), "My S Q L".into());
+        brand_map.insert("Mysql".into(), "My S Q L".into());
+        brand_map.insert("SQLite".into(), "S Q Lite".into());
+        brand_map.insert("SQLITE".into(), "S Q Lite".into());
+        brand_map.insert("PostCSS".into(), "Post C S S".into());
+        Self {
+            enable_brand_map: true,
+            brand_map,
+            custom_pronunciations: BTreeMap::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default)]
+struct ExternalAbbreviationsFile {
+    abbreviations: ExternalAbbreviationConfig,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default)]
+struct ExternalAbbreviationConfig {
+    nocase: BTreeMap<String, String>,
+    case: BTreeMap<String, String>,
+    regex: Vec<ExternalRegexRule>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+struct ExternalRegexRule {
+    pattern: String,
+    replace: String,
+    case_sensitive: bool,
+}
+
+impl Default for ExternalRegexRule {
+    fn default() -> Self {
+        Self {
+            pattern: String::new(),
+            replace: String::new(),
+            case_sensitive: false,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -991,6 +1184,428 @@ pub fn create_tts_engine(kind: TtsEngineKind) -> Box<dyn TtsEngine + Send + Sync
     }
 }
 
+impl PdfTextNormalizer {
+    fn load_from_app_config(config: &AppConfig) -> Self {
+        let mut normalizer = Self::default();
+        normalizer.abbreviation_guards.extend(
+            config
+                .tts
+                .abbreviations
+                .iter()
+                .map(|value| value.trim().to_ascii_lowercase())
+                .filter(|value| !value.is_empty()),
+        );
+
+        match fs::read_to_string(&config.tts.normalizer_config_path) {
+            Ok(contents) => match toml::from_str::<ExternalNormalizerFile>(&contents) {
+                Ok(file) => {
+                    normalizer.config = file.normalization;
+                    info!(
+                        path = %config.tts.normalizer_config_path,
+                        "loaded PDF TTS normalizer config"
+                    );
+                }
+                Err(err) => {
+                    debug!(
+                        path = %config.tts.normalizer_config_path,
+                        error = %err,
+                        "failed to parse PDF TTS normalizer config; using defaults"
+                    );
+                }
+            },
+            Err(err) => {
+                debug!(
+                    path = %config.tts.normalizer_config_path,
+                    error = %err,
+                    "failed to read PDF TTS normalizer config; using defaults"
+                );
+            }
+        }
+
+        let mut abbreviations = ExternalAbbreviationConfig::default();
+        match fs::read_to_string(&config.tts.abbreviations_config_path) {
+            Ok(contents) => match toml::from_str::<ExternalAbbreviationsFile>(&contents) {
+                Ok(file) => {
+                    abbreviations = file.abbreviations;
+                    info!(
+                        path = %config.tts.abbreviations_config_path,
+                        "loaded PDF TTS abbreviations config"
+                    );
+                }
+                Err(err) => {
+                    debug!(
+                        path = %config.tts.abbreviations_config_path,
+                        error = %err,
+                        "failed to parse PDF TTS abbreviations config; using defaults"
+                    );
+                }
+            },
+            Err(err) => {
+                debug!(
+                    path = %config.tts.abbreviations_config_path,
+                    error = %err,
+                    "failed to read PDF TTS abbreviations config; using defaults"
+                );
+            }
+        }
+
+        normalizer.case_rules = compile_literal_rules(&abbreviations.case, true);
+        normalizer.nocase_rules = compile_literal_rules(&abbreviations.nocase, false);
+        normalizer.regex_rules = compile_regex_rules(&abbreviations.regex);
+        normalizer.abbreviation_guards.extend(
+            abbreviations
+                .case
+                .keys()
+                .map(|value| value.to_ascii_lowercase()),
+        );
+        normalizer.abbreviation_guards.extend(
+            abbreviations
+                .nocase
+                .keys()
+                .map(|value| value.to_ascii_lowercase()),
+        );
+        normalizer
+    }
+
+    fn clean_text_core(&self, input: &str) -> String {
+        if !self.config.enabled {
+            return input.trim().to_string();
+        }
+
+        let mut text = normalize_unicode_punctuation(input);
+        text = text.replace('"', "");
+
+        if self.config.strip_markdown_links {
+            text = replace_markdown_links(&text);
+        }
+
+        if self.config.strip_inline_code {
+            text = strip_inline_code(&text);
+        }
+
+        if self.config.drop_numeric_bracket_citations {
+            text = remove_numeric_bracket_citations(&text);
+        }
+
+        if self.config.drop_parenthetical_numeric_citations {
+            text = remove_parenthetical_numeric_citations(&text);
+        }
+
+        if self.config.drop_superscript_citations {
+            text = strip_superscript_citations(&text);
+        }
+
+        if self.config.drop_word_suffix_numeric_footnotes {
+            text = remove_word_suffix_numeric_footnotes(&text);
+        }
+
+        if self.config.drop_square_bracket_text {
+            text = strip_balanced_regions(&text, &['[', '【', '［'], &[']', '】', '］']);
+        }
+
+        if self.config.drop_curly_brace_text {
+            text = strip_balanced_regions(&text, &['{'], &['}']);
+        }
+
+        text = apply_compiled_rules(&text, &self.case_rules);
+        text = apply_compiled_rules(&text, &self.nocase_rules);
+        text = apply_compiled_regex_rules(&text, &self.regex_rules);
+
+        if !self.config.replacements.is_empty() {
+            let mut entries = self.config.replacements.iter().collect::<Vec<_>>();
+            entries.sort_by_key(|(from, _)| std::cmp::Reverse(from.len()));
+            for (from, to) in entries {
+                text = text.replace(from.as_str(), to.as_str());
+            }
+        }
+
+        for token in &self.config.drop_tokens {
+            if !token.is_empty() {
+                text = text.replace(token, " ");
+            }
+        }
+
+        if self.config.pronunciation.enable_brand_map {
+            text = apply_pronunciation_map(&text, &self.config.pronunciation.brand_map);
+        }
+        text = apply_pronunciation_map(&text, &self.config.pronunciation.custom_pronunciations);
+        text = apply_acronym_expansion(&text, &self.config.acronyms);
+
+        if self.config.collapse_whitespace {
+            text = collapse_horizontal_whitespace(&text);
+        }
+        if self.config.remove_space_before_punctuation {
+            text = remove_space_before_punctuation(&text);
+        }
+
+        text.trim().to_string()
+    }
+
+    fn min_sentence_chars(&self, fallback: usize) -> usize {
+        self.config.min_sentence_chars.max(fallback)
+    }
+}
+
+fn default_sentence_abbreviation_guards() -> HashSet<String> {
+    ["mr.", "mrs.", "ms.", "dr.", "prof.", "etc.", "e.g.", "i.e."]
+        .into_iter()
+        .map(str::to_string)
+        .collect()
+}
+
+fn default_letter_sounds() -> BTreeMap<String, String> {
+    [
+        ("A", "ay"),
+        ("B", "bee"),
+        ("C", "see"),
+        ("D", "dee"),
+        ("E", "ee"),
+        ("F", "eff"),
+        ("G", "jee"),
+        ("H", "aitch"),
+        ("I", "eye"),
+        ("J", "jay"),
+        ("K", "kay"),
+        ("L", "el"),
+        ("M", "em"),
+        ("N", "en"),
+        ("O", "oh"),
+        ("P", "pee"),
+        ("Q", "cue"),
+        ("R", "ar"),
+        ("S", "ess"),
+        ("T", "tee"),
+        ("U", "you"),
+        ("V", "vee"),
+        ("W", "double you"),
+        ("X", "ex"),
+        ("Y", "why"),
+        ("Z", "zee"),
+        ("0", "zero"),
+        ("1", "one"),
+        ("2", "two"),
+        ("3", "three"),
+        ("4", "four"),
+        ("5", "five"),
+        ("6", "six"),
+        ("7", "seven"),
+        ("8", "eight"),
+        ("9", "nine"),
+    ]
+    .into_iter()
+    .map(|(key, value)| (key.to_string(), value.to_string()))
+    .collect()
+}
+
+fn compile_literal_rules(
+    entries: &BTreeMap<String, String>,
+    case_sensitive: bool,
+) -> Vec<CompiledReplacementRule> {
+    let mut items = entries.iter().collect::<Vec<_>>();
+    items.sort_by_key(|(key, _)| std::cmp::Reverse(key.len()));
+    items
+        .into_iter()
+        .filter_map(|(key, replace)| {
+            compile_literal_rule(key, replace, case_sensitive)
+                .ok()
+                .map(|regex| CompiledReplacementRule {
+                    regex,
+                    replace: replace.clone(),
+                })
+        })
+        .collect()
+}
+
+fn compile_literal_rule(pattern: &str, replace: &str, case_sensitive: bool) -> Result<Regex> {
+    let escaped = regex::escape(pattern);
+    let bounded = if pattern.chars().all(|ch| ch.is_alphanumeric()) {
+        format!(r"\b{}\b", escaped)
+    } else {
+        escaped
+    };
+    RegexBuilder::new(&bounded)
+        .case_insensitive(!case_sensitive)
+        .build()
+        .with_context(|| {
+            format!("failed to compile literal replacement rule for {pattern:?} -> {replace:?}")
+        })
+}
+
+fn compile_regex_rules(rules: &[ExternalRegexRule]) -> Vec<CompiledRegexRule> {
+    rules
+        .iter()
+        .filter_map(|rule| {
+            RegexBuilder::new(&rule.pattern)
+                .case_insensitive(!rule.case_sensitive)
+                .build()
+                .ok()
+                .map(|regex| CompiledRegexRule {
+                    regex,
+                    replace: rule.replace.clone(),
+                })
+        })
+        .collect()
+}
+
+fn apply_compiled_rules(text: &str, rules: &[CompiledReplacementRule]) -> String {
+    let mut output = text.to_string();
+    for rule in rules {
+        output = rule
+            .regex
+            .replace_all(&output, rule.replace.as_str())
+            .into_owned();
+    }
+    output
+}
+
+fn apply_compiled_regex_rules(text: &str, rules: &[CompiledRegexRule]) -> String {
+    let mut output = text.to_string();
+    for rule in rules {
+        output = rule
+            .regex
+            .replace_all(&output, rule.replace.as_str())
+            .into_owned();
+    }
+    output
+}
+
+fn apply_pronunciation_map(text: &str, map: &BTreeMap<String, String>) -> String {
+    let mut output = text.to_string();
+    let mut entries = map.iter().collect::<Vec<_>>();
+    entries.sort_by_key(|(key, _)| std::cmp::Reverse(key.len()));
+    for (from, to) in entries {
+        let pattern = format!(r"\b{}\b", regex::escape(from));
+        if let Ok(regex) = Regex::new(&pattern) {
+            output = regex.replace_all(&output, to.as_str()).into_owned();
+        }
+    }
+    output
+}
+
+fn apply_acronym_expansion(text: &str, config: &ExternalAcronymConfig) -> String {
+    if !config.enabled || config.tokens.is_empty() {
+        return text.to_string();
+    }
+
+    let mut output = text.to_string();
+    for token in &config.tokens {
+        let pattern = format!(r"\b{}\b", regex::escape(token));
+        let Some(regex) = Regex::new(&pattern).ok() else {
+            continue;
+        };
+        let spoken = token
+            .chars()
+            .map(|ch| {
+                let key = ch.to_string();
+                config
+                    .letter_sounds
+                    .get(&key)
+                    .cloned()
+                    .unwrap_or_else(|| key.clone())
+            })
+            .collect::<Vec<_>>()
+            .join(config.letter_separator.as_str());
+        output = regex.replace_all(&output, spoken.as_str()).into_owned();
+    }
+    output
+}
+
+fn normalize_unicode_punctuation(text: &str) -> String {
+    text.replace(['\u{2018}', '\u{2019}', '\u{2032}'], "'")
+        .replace(['\u{201C}', '\u{201D}', '\u{2033}'], "\"")
+        .replace(['\u{2013}', '\u{2014}', '\u{2212}'], "-")
+        .replace('\u{00A0}', " ")
+}
+
+fn replace_markdown_links(text: &str) -> String {
+    let Some(regex) = Regex::new(r"\[([^\]]+)\]\([^)]*\)").ok() else {
+        return text.to_string();
+    };
+    regex.replace_all(text, "$1").into_owned()
+}
+
+fn strip_inline_code(text: &str) -> String {
+    let Some(regex) = Regex::new(r"`([^`]+)`").ok() else {
+        return text.to_string();
+    };
+    regex.replace_all(text, "$1").into_owned()
+}
+
+fn remove_numeric_bracket_citations(text: &str) -> String {
+    let Some(regex) = Regex::new(r"\[\s*\d+(?:\s*,\s*\d+)*\s*\]").ok() else {
+        return text.to_string();
+    };
+    regex.replace_all(text, " ").into_owned()
+}
+
+fn remove_parenthetical_numeric_citations(text: &str) -> String {
+    let Some(regex) = Regex::new(r"\(\s*\d+(?:\s*,\s*\d+)*\s*\)").ok() else {
+        return text.to_string();
+    };
+    regex.replace_all(text, " ").into_owned()
+}
+
+fn strip_superscript_citations(text: &str) -> String {
+    text.chars()
+        .map(|ch| {
+            if matches!(
+                ch,
+                '⁰' | '¹' | '²' | '³' | '⁴' | '⁵' | '⁶' | '⁷' | '⁸' | '⁹'
+            ) {
+                ' '
+            } else {
+                ch
+            }
+        })
+        .collect()
+}
+
+fn remove_word_suffix_numeric_footnotes(text: &str) -> String {
+    let Some(regex) = Regex::new(r"(?P<prefix>\p{L})\d{1,3}\b").ok() else {
+        return text.to_string();
+    };
+    regex.replace_all(text, "$prefix").into_owned()
+}
+
+fn strip_balanced_regions(text: &str, openers: &[char], closers: &[char]) -> String {
+    let mut depth = 0usize;
+    let mut out = String::with_capacity(text.len());
+    for ch in text.chars() {
+        if openers.contains(&ch) {
+            depth += 1;
+            if !out.ends_with(' ') {
+                out.push(' ');
+            }
+            continue;
+        }
+        if closers.contains(&ch) {
+            depth = depth.saturating_sub(1);
+            if !out.ends_with(' ') {
+                out.push(' ');
+            }
+            continue;
+        }
+        if depth == 0 {
+            out.push(ch);
+        }
+    }
+    out
+}
+
+fn collapse_horizontal_whitespace(text: &str) -> String {
+    let Some(regex) = Regex::new(r"[ \t\u{00A0}]+").ok() else {
+        return text.to_string();
+    };
+    regex.replace_all(text, " ").into_owned()
+}
+
+fn remove_space_before_punctuation(text: &str) -> String {
+    let Some(regex) = Regex::new(r"\s+([,.;:!?])").ok() else {
+        return text.to_string();
+    };
+    regex.replace_all(text, "$1").into_owned()
+}
+
 impl TtsEngine for DryRunEngine {
     fn kind(&self) -> TtsEngineKind {
         TtsEngineKind::DryRun
@@ -1521,6 +2136,7 @@ pub fn build_artifacts_from_document_with_scope(
         scoped_page_count,
         "starting PDF TTS analysis build"
     );
+    let normalizer = PdfTextNormalizer::load_from_app_config(config);
     let repeated_edge_lines =
         collect_repeated_edge_lines_for_scope(config, document, start_page, end_page)?;
     let mut stats = NormalizationStats::default();
@@ -1535,7 +2151,8 @@ pub fn build_artifacts_from_document_with_scope(
         let segments = document.text_segments_for_page(page_index)?;
         let segment_count = segments.len();
         let extracted = extract_page_text_for_tts(&segments, config);
-        let normalized = normalize_page_text(&extracted.text, &repeated_edge_lines, config);
+        let normalized =
+            normalize_page_text(&extracted.text, &repeated_edge_lines, config, &normalizer);
 
         stats.original_chars += extracted.text.chars().count();
         stats.normalized_chars += normalized.text.chars().count();
@@ -1620,7 +2237,7 @@ pub fn build_artifacts_from_document_with_scope(
         token_count,
     };
 
-    let sentences = build_sentence_plan(&canonical_text, &fingerprint, config);
+    let sentences = build_sentence_plan(&canonical_text, &fingerprint, config, &normalizer);
     stats.sentence_count = sentences.len();
     stats.block_fallback_units = sentences
         .iter()
@@ -1660,8 +2277,12 @@ pub fn build_artifacts_from_document_with_scope(
     {
         let (ocr_canonical_text, ocr_pages, ocr_stats) =
             ocr_artifacts_to_canonical_text(&ocr_artifacts, config, &artifacts.stats);
-        let ocr_sentences =
-            build_sentence_plan(&ocr_canonical_text, &artifacts.source_fingerprint, config);
+        let ocr_sentences = build_sentence_plan(
+            &ocr_canonical_text,
+            &artifacts.source_fingerprint,
+            config,
+            &normalizer,
+        );
         let ocr_mode = match ocr_artifacts.trust_class {
             OcrTrustClass::OcrHighTrust => PdfTtsMode::MixedTextTrust,
             OcrTrustClass::OcrMixedTrust => PdfTtsMode::MixedTextTrust,
@@ -1964,11 +2585,13 @@ fn build_sentence_plan(
     canonical_text: &CanonicalTtsTextArtifact,
     fingerprint: &str,
     config: &AppConfig,
+    normalizer: &PdfTextNormalizer,
 ) -> Vec<SentencePlan> {
-    let mut sentences = split_sentences(&canonical_text.text, config)
+    let mut sentences = split_sentences(&canonical_text.text, config, normalizer)
         .into_iter()
         .filter(|(range, sentence)| {
-            sentence.chars().count() >= config.tts.min_sentence_chars && range.end > range.start
+            sentence.chars().count() >= normalizer.min_sentence_chars(config.tts.min_sentence_chars)
+                && range.end > range.start
         })
         .map(|(range, sentence)| {
             sentence_plan_entry(
@@ -2378,14 +3001,13 @@ fn build_blocks_from_lines(lines: &[PositionedLine], config: &AppConfig) -> Vec<
     blocks
 }
 
-fn split_sentences(text: &str, config: &AppConfig) -> Vec<(TextRange, String)> {
+fn split_sentences(
+    text: &str,
+    config: &AppConfig,
+    normalizer: &PdfTextNormalizer,
+) -> Vec<(TextRange, String)> {
     let mut out = Vec::new();
-    let abbreviation_set: HashSet<String> = config
-        .tts
-        .abbreviations
-        .iter()
-        .map(|value| value.trim().to_ascii_lowercase())
-        .collect();
+    let abbreviation_set = &normalizer.abbreviation_guards;
     let boundary_markers = config
         .tts
         .sentence_boundary_markers
@@ -2539,6 +3161,7 @@ fn normalize_page_text(
     raw_text: &str,
     repeated_edge_lines: &HashSet<String>,
     config: &AppConfig,
+    normalizer: &PdfTextNormalizer,
 ) -> NormalizedPageText {
     let mut stats = PageNormalizationStats::default();
     let mut normalized = raw_text.replace("\r\n", "\n");
@@ -2579,12 +3202,16 @@ fn normalize_page_text(
             stats.repeated_edge_lines_removed += 1;
             continue;
         }
-        if compact == previous_normalized_line {
+        let cleaned = normalizer.clean_text_core(&compact);
+        if cleaned.is_empty() {
+            continue;
+        }
+        if cleaned == previous_normalized_line {
             stats.duplicate_lines_removed += 1;
             continue;
         }
-        previous_normalized_line = compact.clone();
-        filtered_lines.push(compact);
+        previous_normalized_line = cleaned.clone();
+        filtered_lines.push(cleaned);
     }
 
     let mut blocks = Vec::new();

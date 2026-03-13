@@ -210,14 +210,20 @@ mod tts {
         }
     }
 
+    fn sample_normalizer(config: &AppConfig) -> PdfTextNormalizer {
+        PdfTextNormalizer::load_from_app_config(config)
+    }
+
     #[test]
     fn normalization_replaces_ligatures_and_soft_hyphens() {
         let config = AppConfig::default();
         let repeated = HashSet::new();
+        let normalizer = sample_normalizer(&config);
         let normalized = normalize_page_text(
             "of\u{FB01}ce co\u{00AD}operate\n\nHeader",
             &repeated,
             &config,
+            &normalizer,
         );
 
         assert!(normalized.text.contains("office"));
@@ -230,7 +236,13 @@ mod tts {
     fn normalization_suppresses_repeated_edge_lines_and_duplicates() {
         let config = AppConfig::default();
         let repeated = HashSet::from([String::from("Header")]);
-        let normalized = normalize_page_text("Header\nAlpha\nAlpha\nBeta", &repeated, &config);
+        let normalizer = sample_normalizer(&config);
+        let normalized = normalize_page_text(
+            "Header\nAlpha\nAlpha\nBeta",
+            &repeated,
+            &config,
+            &normalizer,
+        );
 
         assert_eq!(normalized.text, "Alpha Beta");
         assert_eq!(normalized.stats.repeated_edge_lines_removed, 1);
@@ -241,11 +253,13 @@ mod tts {
     fn sentence_splitter_respects_abbreviations() {
         let mut config = AppConfig::default();
         config.tts.abbreviations = vec!["dr.".into()];
+        let normalizer = sample_normalizer(&config);
 
         let sentences = build_sentence_plan(
             &sample_canonical_text("Dr. Smith arrived. Then he left."),
             "fixture",
             &config,
+            &normalizer,
         );
 
         assert_eq!(sentences.len(), 2);
@@ -398,9 +412,10 @@ mod tts {
     fn sentence_ids_are_stable_for_same_canonical_text() {
         let config = AppConfig::default();
         let canonical = sample_canonical_text("Alpha. Beta.");
+        let normalizer = sample_normalizer(&config);
 
-        let first = build_sentence_plan(&canonical, "fixture", &config);
-        let second = build_sentence_plan(&canonical, "fixture", &config);
+        let first = build_sentence_plan(&canonical, "fixture", &config, &normalizer);
+        let second = build_sentence_plan(&canonical, "fixture", &config, &normalizer);
 
         assert_eq!(
             first.iter().map(|sentence| sentence.id).collect::<Vec<_>>(),
@@ -520,7 +535,12 @@ mod tts {
     #[test]
     fn sentence_splitter_respects_citations_and_lowercase_continuations() {
         let config = AppConfig::default();
-        let sentences = split_sentences("See Smith et al. for context. then continue.", &config);
+        let normalizer = sample_normalizer(&config);
+        let sentences = split_sentences(
+            "See Smith et al. for context. then continue.",
+            &config,
+            &normalizer,
+        );
 
         assert_eq!(sentences.len(), 1);
     }
@@ -530,6 +550,7 @@ mod tts {
         let mut config = AppConfig::default();
         config.tts.sentence_break_on_double_newline = false;
         config.tts.block_fallback_min_chars = 8;
+        let normalizer = sample_normalizer(&config);
         let canonical = CanonicalTtsTextArtifact {
             text: "alpha beta gamma delta epsilon\n\nzeta eta theta iota kappa".into(),
             pages: vec![CanonicalPageArtifact {
@@ -557,7 +578,7 @@ mod tts {
             token_count: 10,
         };
 
-        let planned = build_sentence_plan(&canonical, "fixture", &config);
+        let planned = build_sentence_plan(&canonical, "fixture", &config, &normalizer);
         assert_eq!(planned.len(), 2);
         assert!(
             planned
@@ -570,10 +591,12 @@ mod tts {
     fn normalization_marks_table_and_caption_like_blocks() {
         let config = AppConfig::default();
         let repeated = HashSet::new();
+        let normalizer = sample_normalizer(&config);
         let normalized = normalize_page_text(
             "Table 1 Revenue 2024 2025\n10 20 30 40\n\nFigure 1 Sample caption",
             &repeated,
             &config,
+            &normalizer,
         );
 
         assert!(normalized.stats.table_like_blocks >= 1);
@@ -584,10 +607,25 @@ mod tts {
     fn normalization_joins_hyphenated_line_wraps() {
         let config = AppConfig::default();
         let repeated = HashSet::new();
-        let normalized = normalize_page_text("coordi-\nnated text", &repeated, &config);
+        let normalizer = sample_normalizer(&config);
+        let normalized =
+            normalize_page_text("coordi-\nnated text", &repeated, &config, &normalizer);
 
         assert!(normalized.text.contains("coordinated text"));
         assert_eq!(normalized.stats.joined_hyphenations, 1);
+    }
+
+    #[test]
+    fn external_abbreviations_and_pronunciations_are_applied() {
+        let config = AppConfig::default();
+        let normalizer = sample_normalizer(&config);
+
+        let cleaned = normalizer.clean_text_core("Dr. Fauci used MySQL on p. 42.");
+
+        assert!(cleaned.contains("Doctor"));
+        assert!(cleaned.contains("Fau chi"));
+        assert!(cleaned.contains("My S Q L"));
+        assert!(cleaned.contains("page 42"));
     }
 
     #[test]

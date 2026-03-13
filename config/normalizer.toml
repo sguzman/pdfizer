@@ -1,0 +1,93 @@
+[normalization]
+enabled = true
+mode = "sentence"
+collapse_whitespace = true
+remove_space_before_punctuation = true
+strip_inline_code = true
+strip_markdown_links = true
+drop_numeric_bracket_citations = true
+drop_parenthetical_numeric_citations = true
+drop_superscript_citations = true
+drop_word_suffix_numeric_footnotes = true
+drop_square_bracket_text = true
+drop_curly_brace_text = true
+chunk_long_sentences = true
+max_audio_chars_per_chunk = 180
+max_audio_words_per_chunk = 32
+min_sentence_chars = 2
+require_alphanumeric = true
+drop_tokens = []
+
+[normalization.replacements]
+"#" = " "
+"*" = " "
+":" = " "
+"%" = " percent "
+
+[normalization.acronyms]
+enabled = true
+tokens = ["CSS", "HTML", "HTTP", "HTTPS", "URL", "API", "CPU", "GPU", "JSON", "SQL", "XML", "TTS", "XTTS", "LLM"]
+letter_separator = " "
+digit_separator = " point "
+
+[normalization.acronyms.letter_sounds]
+A = "ay"
+B = "bee"
+C = "see"
+D = "dee"
+E = "ee"
+F = "eff"
+G = "jee"
+H = "aitch"
+I = "eye"
+J = "jay"
+K = "kay"
+L = "el"
+M = "em"
+N = "en"
+O = "oh"
+P = "pee"
+Q = "cue"
+R = "ar"
+S = "ess"
+T = "tee"
+U = "you"
+V = "vee"
+W = "double you"
+X = "ex"
+Y = "why"
+Z = "zee"
+"0" = "zero"
+"1" = "one"
+"2" = "two"
+"3" = "three"
+"4" = "four"
+"5" = "five"
+"6" = "six"
+"7" = "seven"
+"8" = "eight"
+"9" = "nine"
+
+[normalization.pronunciation]
+year_mode = "american"
+number_separator = " "
+insert_and = false
+enable_brand_map = true
+
+[normalization.pronunciation.brand_map]
+MySQL = "My S Q L"
+Mysql = "My S Q L"
+SQLite = "S Q Lite"
+SQLITE = "S Q Lite"
+PostCSS = "Post C S S"
+
+[normalization.pronunciation.custom_pronunciations]
+Cato = "Kay toe"
+Plato = "Play toe"
+Calhoun = "Cahl Hoon"
+Byrd = "bird"
+fentanyl = "fenta nill"
+hippies = "hip peas"
+Fauci = "Fau chi"
+Chiapas = "Chi a paz"
+Oaxaca = "O a ha ka"

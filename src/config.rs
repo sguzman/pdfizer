@@ -154,6 +154,14 @@ impl AppConfig {
                 "tts.auto_analyze_on_open",
                 defaults.tts.auto_analyze_on_open,
             )?
+            .set_default(
+                "tts.normalizer_config_path",
+                defaults.tts.normalizer_config_path.clone(),
+            )?
+            .set_default(
+                "tts.abbreviations_config_path",
+                defaults.tts.abbreviations_config_path.clone(),
+            )?
             .set_default("tts.language", defaults.tts.language.clone())?
             .set_default("tts.engine", defaults.tts.engine.clone())?
             .set_default("tts.voice", defaults.tts.voice.clone())?
@@ -730,6 +738,8 @@ impl Default for StorageConfig {
 pub struct TtsConfig {
     pub enabled: bool,
     pub auto_analyze_on_open: bool,
+    pub normalizer_config_path: String,
+    pub abbreviations_config_path: String,
     pub language: String,
     pub engine: String,
     pub voice: String,
@@ -790,6 +800,8 @@ impl Default for TtsConfig {
         Self {
             enabled: true,
             auto_analyze_on_open: true,
+            normalizer_config_path: "config/normalizer.toml".into(),
+            abbreviations_config_path: "config/abbreviations.toml".into(),
             language: "en".into(),
             engine: "tone_preview".into(),
             voice: "default".into(),
