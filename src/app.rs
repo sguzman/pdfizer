@@ -1666,10 +1666,23 @@ impl PdfizerApp {
 
             if let Some(analysis) = &self.tts_analysis {
                 ui.label(format!(
-                    "Mode: {} ({:.0}% confidence)",
+                    "Mode: {} ({:.0}% confidence) | source {:?}",
                     analysis.mode.label(),
-                    analysis.confidence * 100.0
+                    analysis.confidence * 100.0,
+                    analysis.text_source
                 ));
+                if let Some(ocr_trust) = analysis.ocr_trust {
+                    ui.label(format!(
+                        "OCR: trust {} | confidence {:.0}%{}",
+                        ocr_trust.label(),
+                        analysis.ocr_confidence.unwrap_or_default() * 100.0,
+                        analysis
+                            .ocr_artifact_path
+                            .as_ref()
+                            .map(|path| format!(" | artifact {}", path.display()))
+                            .unwrap_or_default()
+                    ));
+                }
                 if let Some(policy) = self.active_tts_policy() {
                     ui.label(format!(
                         "Policy: playback {} | rect highlight {} | sync prefetch {} | max sync {}",
@@ -1745,6 +1758,17 @@ impl PdfizerApp {
                             target.score,
                             target.fallback_reason
                         ));
+                        ui.label(format!(
+                            "Sync breakdown: text {:.2} | order {:.2} | geometry {:.2} | page {:.2} | lineage {}",
+                            target.score_breakdown.text_similarity,
+                            target.score_breakdown.reading_order,
+                            target.score_breakdown.geometry_compactness,
+                            target.score_breakdown.page_continuity,
+                            target.lineage.len()
+                        ));
+                        if let Some(path) = &target.artifact_path {
+                            ui.label(format!("Sync artifact: {}", path.display()));
+                        }
                     }
                     ui.add(
                         egui::TextEdit::multiline(&mut sentence_text)

@@ -112,6 +112,81 @@ pub struct ClassificationSummary {
     pub reason: String,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TtsTextSourceKind {
+    Embedded,
+    Ocr,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum OcrTrustClass {
+    OcrHighTrust,
+    OcrMixedTrust,
+    OcrTextOnly,
+}
+
+impl OcrTrustClass {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::OcrHighTrust => "ocr_high_trust",
+            Self::OcrMixedTrust => "ocr_mixed_trust",
+            Self::OcrTextOnly => "ocr_text_only",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OcrTokenArtifact {
+    pub page_index: usize,
+    pub block_index: usize,
+    pub line_index: usize,
+    pub token_index: usize,
+    pub text: String,
+    pub bounds: PdfRectData,
+    pub confidence: f32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OcrLineArtifact {
+    pub page_index: usize,
+    pub block_index: usize,
+    pub line_index: usize,
+    pub text: String,
+    pub bounds: PdfRectData,
+    pub confidence: f32,
+    pub tokens: Vec<OcrTokenArtifact>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OcrBlockArtifact {
+    pub page_index: usize,
+    pub block_index: usize,
+    pub text: String,
+    pub bounds: PdfRectData,
+    pub confidence: f32,
+    pub lines: Vec<OcrLineArtifact>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OcrPageArtifact {
+    pub page_index: usize,
+    pub confidence: f32,
+    pub blocks: Vec<OcrBlockArtifact>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OcrArtifacts {
+    pub source_path: PathBuf,
+    pub source_fingerprint: String,
+    pub generated_at_unix_secs: u64,
+    pub confidence: f32,
+    pub trust_class: OcrTrustClass,
+    pub pages: Vec<OcrPageArtifact>,
+    pub artifact_path: Option<PathBuf>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SentencePlan {
     pub id: u64,
@@ -171,6 +246,10 @@ pub struct TtsAnalysisArtifacts {
     pub source_path: PathBuf,
     pub source_fingerprint: String,
     pub generated_at_unix_secs: u64,
+    pub text_source: TtsTextSourceKind,
+    pub ocr_trust: Option<OcrTrustClass>,
+    pub ocr_confidence: Option<f32>,
+    pub ocr_artifact_path: Option<PathBuf>,
     pub mode: PdfTtsMode,
     pub confidence: f32,
     pub classification: ClassificationSummary,
@@ -213,6 +292,28 @@ pub struct SentenceSyncTarget {
     pub rects: Vec<PdfRectData>,
     pub fallback_reason: String,
     pub score: f32,
+    pub score_breakdown: SyncScoreBreakdown,
+    pub lineage: Vec<SyncTokenLineage>,
+    pub artifact_path: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct SyncScoreBreakdown {
+    pub text_similarity: f32,
+    pub reading_order: f32,
+    pub geometry_compactness: f32,
+    pub page_continuity: f32,
+    pub total: f32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SyncTokenLineage {
+    pub token: String,
+    pub page_index: usize,
+    pub block_index: usize,
+    pub line_index: usize,
+    pub token_index: usize,
+    pub rect: PdfRectData,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -363,6 +464,19 @@ pub fn compute_sentence_sync(
     analysis: &TtsAnalysisArtifacts,
     sentence_index: usize,
 ) -> Result<SentenceSyncTarget> {
+    let sentence = analysis
+        .sentences
+        .get(sentence_index)
+        .with_context(|| format!("sentence index {sentence_index} is out of bounds"))?;
+    let sync_path = config.tts_sync_artifact_path(&analysis.source_path, sentence.id)?;
+    if sync_path.exists() {
+        let contents = fs::read_to_string(&sync_path)
+            .with_context(|| format!("failed to read {}", sync_path.display()))?;
+        let mut cached = toml::from_str::<SentenceSyncTarget>(&contents)
+            .with_context(|| format!("failed to parse {}", sync_path.display()))?;
+        cached.artifact_path = Some(sync_path);
+        return Ok(cached);
+    }
     let runtime =
         PdfRuntime::new(config).context("failed to initialize Pdfium for TTS sync analysis")?;
     let document = runtime
@@ -373,7 +487,10 @@ pub fn compute_sentence_sync(
                 analysis.source_path.display()
             )
         })?;
-    compute_sentence_sync_from_document(&document, analysis, sentence_index)
+    let mut target = compute_sentence_sync_from_document(&document, analysis, sentence_index)?;
+    let artifact_path = persist_sync_target(config, analysis, &target)?;
+    target.artifact_path = Some(artifact_path);
+    Ok(target)
 }
 
 pub fn persist_artifacts(config: &AppConfig, artifacts: &TtsAnalysisArtifacts) -> Result<PathBuf> {
@@ -387,6 +504,35 @@ pub fn persist_artifacts(config: &AppConfig, artifacts: &TtsAnalysisArtifacts) -
         toml::to_string_pretty(artifacts).context("failed to serialize TTS artifacts")?;
     fs::write(&path, contents)
         .with_context(|| format!("failed to write TTS artifacts to {}", path.display()))?;
+    Ok(path)
+}
+
+pub fn load_ocr_artifacts(config: &AppConfig, source_path: &Path) -> Result<Option<OcrArtifacts>> {
+    let path = config.tts_ocr_artifact_path(source_path)?;
+    if !path.exists() {
+        return Ok(None);
+    }
+
+    let contents = fs::read_to_string(&path)
+        .with_context(|| format!("failed to read OCR artifacts from {}", path.display()))?;
+    let mut artifacts = toml::from_str::<OcrArtifacts>(&contents)
+        .with_context(|| format!("failed to parse OCR artifacts from {}", path.display()))?;
+    artifacts.artifact_path = Some(path);
+    Ok(Some(artifacts))
+}
+
+pub fn persist_sync_target(
+    config: &AppConfig,
+    analysis: &TtsAnalysisArtifacts,
+    target: &SentenceSyncTarget,
+) -> Result<PathBuf> {
+    let path = config.tts_sync_artifact_path(&analysis.source_path, target.sentence_id)?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    fs::write(&path, toml::to_string_pretty(target)?)
+        .with_context(|| format!("failed to write sync artifact {}", path.display()))?;
     Ok(path)
 }
 
@@ -433,6 +579,44 @@ pub fn evaluate_runtime_policy(
     config: &AppConfig,
     analysis: &TtsAnalysisArtifacts,
 ) -> TtsRuntimePolicy {
+    if analysis.text_source == TtsTextSourceKind::Ocr {
+        let trust = analysis.ocr_trust.unwrap_or(OcrTrustClass::OcrTextOnly);
+        let policy = match trust {
+            OcrTrustClass::OcrHighTrust => TtsRuntimePolicy {
+                allow_playback: !analysis.sentences.is_empty(),
+                allow_rect_highlights: true,
+                allow_sync_prefetch: true,
+                max_sync_confidence: SentenceSyncConfidence::BlockFallback,
+                reason: "ocr_high_trust_block_precision_cap".into(),
+            },
+            OcrTrustClass::OcrMixedTrust => TtsRuntimePolicy {
+                allow_playback: !analysis.sentences.is_empty(),
+                allow_rect_highlights: true,
+                allow_sync_prefetch: true,
+                max_sync_confidence: SentenceSyncConfidence::BlockFallback,
+                reason: "ocr_mixed_trust_block_precision_cap".into(),
+            },
+            OcrTrustClass::OcrTextOnly => TtsRuntimePolicy {
+                allow_playback: !analysis.sentences.is_empty(),
+                allow_rect_highlights: false,
+                allow_sync_prefetch: false,
+                max_sync_confidence: SentenceSyncConfidence::PageFallback,
+                reason: "ocr_text_only_page_follow".into(),
+            },
+        };
+
+        info!(
+            ocr_trust = %trust.label(),
+            allow_playback = policy.allow_playback,
+            allow_rect_highlights = policy.allow_rect_highlights,
+            allow_sync_prefetch = policy.allow_sync_prefetch,
+            max_sync_confidence = %policy.max_sync_confidence.label(),
+            reason = %policy.reason,
+            "evaluated OCR-backed PDF TTS runtime policy"
+        );
+        return policy;
+    }
+
     let policy = match analysis.mode {
         PdfTtsMode::HighTextTrust | PdfTtsMode::MixedTextTrust => TtsRuntimePolicy {
             allow_playback: !analysis.sentences.is_empty(),
@@ -509,6 +693,9 @@ pub fn apply_runtime_policy(
             rects: Vec::new(),
             fallback_reason: policy.reason.clone(),
             score: target.score,
+            score_breakdown: target.score_breakdown.clone(),
+            lineage: Vec::new(),
+            artifact_path: target.artifact_path.clone(),
         };
     }
 
@@ -528,6 +715,13 @@ pub fn apply_runtime_policy(
         },
         fallback_reason: format!("{}; {}", target.fallback_reason, policy.reason),
         score: target.score,
+        score_breakdown: target.score_breakdown.clone(),
+        lineage: if policy.max_sync_confidence == SentenceSyncConfidence::PageFallback {
+            Vec::new()
+        } else {
+            target.lineage.clone()
+        },
+        artifact_path: target.artifact_path.clone(),
     }
 }
 
@@ -656,6 +850,9 @@ pub fn compute_sentence_sync_from_document(
         rects: Vec::new(),
         fallback_reason: "no_page_candidate".into(),
         score: 0.0,
+        score_breakdown: SyncScoreBreakdown::default(),
+        lineage: Vec::new(),
+        artifact_path: None,
     }))
 }
 
@@ -689,6 +886,8 @@ fn sync_target_for_page(
             let end = offset + normalized_sentence.len();
             let rects = collect_overlapping_rects(segments, &ranges, offset, end);
             if !rects.is_empty() {
+                let lineage =
+                    collect_overlapping_lineage(segments, &ranges, offset, end, page_index);
                 return SentenceSyncTarget {
                     sentence_index,
                     sentence_id,
@@ -697,12 +896,21 @@ fn sync_target_for_page(
                     rects,
                     fallback_reason: "exact_substring_match".into(),
                     score: 1.0,
+                    score_breakdown: SyncScoreBreakdown {
+                        text_similarity: 1.0,
+                        reading_order: 1.0,
+                        geometry_compactness: geometry_compactness_score(&lineage),
+                        page_continuity: 1.0,
+                        total: 1.0,
+                    },
+                    lineage,
+                    artifact_path: None,
                 };
             }
         }
     }
 
-    let mut best_window: Option<(usize, usize, f32)> = None;
+    let mut best_window: Option<(usize, usize, SyncScoreBreakdown)> = None;
     for start in 0..normalized_segments.len() {
         let mut window_text = String::new();
         for end in start
@@ -714,24 +922,65 @@ fn sync_target_for_page(
                 window_text.push(' ');
             }
             window_text.push_str(&normalized_segments[end]);
-            let score = token_coverage_score(sentence_tokens, &window_text);
+            let text_similarity = token_coverage_score(sentence_tokens, &window_text);
+            let reading_order = reading_order_continuity_score(start, end);
+            let lineage = segments[start..=end]
+                .iter()
+                .enumerate()
+                .map(|(offset, segment)| SyncTokenLineage {
+                    token: segment.text.clone(),
+                    page_index,
+                    block_index: 0,
+                    line_index: start + offset,
+                    token_index: 0,
+                    rect: segment.rect,
+                })
+                .collect::<Vec<_>>();
+            let geometry_compactness = geometry_compactness_score(&lineage);
+            let page_continuity = 1.0;
+            let total = text_similarity * 0.55
+                + reading_order * 0.15
+                + geometry_compactness * 0.20
+                + page_continuity * 0.10;
+            let breakdown = SyncScoreBreakdown {
+                text_similarity,
+                reading_order,
+                geometry_compactness,
+                page_continuity,
+                total,
+            };
             if best_window
                 .as_ref()
-                .is_none_or(|(_, _, current_score)| score > *current_score)
+                .is_none_or(|(_, _, current)| breakdown.total > current.total)
             {
-                best_window = Some((start, end, score));
+                best_window = Some((start, end, breakdown));
             }
         }
     }
 
-    if let Some((start, end, score)) = best_window {
+    if let Some((start, end, breakdown)) = best_window {
+        let lineage = segments[start..=end]
+            .iter()
+            .enumerate()
+            .map(|(offset, segment)| SyncTokenLineage {
+                token: segment.text.clone(),
+                page_index,
+                block_index: 0,
+                line_index: start + offset,
+                token_index: 0,
+                rect: segment.rect,
+            })
+            .collect::<Vec<_>>();
         let rects = segments[start..=end]
             .iter()
             .map(|segment| segment.rect)
             .collect::<Vec<_>>();
-        let confidence = if score >= 0.9 {
+        let implausible = breakdown.geometry_compactness < 0.12 || breakdown.reading_order < 0.25;
+        let confidence = if implausible {
+            SentenceSyncConfidence::PageFallback
+        } else if breakdown.total >= 0.88 {
             SentenceSyncConfidence::FuzzySentence
-        } else if score >= 0.45 {
+        } else if breakdown.total >= 0.42 {
             SentenceSyncConfidence::BlockFallback
         } else {
             SentenceSyncConfidence::PageFallback
@@ -749,10 +998,23 @@ fn sync_target_for_page(
             fallback_reason: match confidence {
                 SentenceSyncConfidence::FuzzySentence => "high_token_window_match".into(),
                 SentenceSyncConfidence::BlockFallback => "block_window_fallback".into(),
-                SentenceSyncConfidence::PageFallback => "page_location_only".into(),
+                SentenceSyncConfidence::PageFallback => {
+                    if implausible {
+                        "rejected_visually_implausible_match".into()
+                    } else {
+                        "page_location_only".into()
+                    }
+                }
                 _ => "unknown".into(),
             },
-            score,
+            score: breakdown.total,
+            score_breakdown: breakdown,
+            lineage: if confidence == SentenceSyncConfidence::PageFallback {
+                Vec::new()
+            } else {
+                lineage
+            },
+            artifact_path: None,
         };
     }
 
@@ -764,6 +1026,15 @@ fn sync_target_for_page(
         rects: Vec::new(),
         fallback_reason: "page_location_only".into(),
         score: 0.1,
+        score_breakdown: SyncScoreBreakdown {
+            text_similarity: 0.1,
+            reading_order: 0.0,
+            geometry_compactness: 0.0,
+            page_continuity: 1.0,
+            total: 0.1,
+        },
+        lineage: Vec::new(),
+        artifact_path: None,
     }
 }
 
@@ -786,6 +1057,33 @@ fn collect_overlapping_rects(
         .collect()
 }
 
+fn collect_overlapping_lineage(
+    segments: &[crate::pdf::TextSegmentData],
+    ranges: &[(usize, usize)],
+    start: usize,
+    end: usize,
+    page_index: usize,
+) -> Vec<SyncTokenLineage> {
+    ranges
+        .iter()
+        .enumerate()
+        .filter_map(|(index, (segment_start, segment_end))| {
+            if *segment_end <= start || *segment_start >= end {
+                None
+            } else {
+                segments.get(index).map(|segment| SyncTokenLineage {
+                    token: segment.text.clone(),
+                    page_index,
+                    block_index: 0,
+                    line_index: index,
+                    token_index: 0,
+                    rect: segment.rect,
+                })
+            }
+        })
+        .collect()
+}
+
 fn token_coverage_score(sentence_tokens: &[String], text: &str) -> f32 {
     if sentence_tokens.is_empty() {
         return 0.0;
@@ -796,6 +1094,44 @@ fn token_coverage_score(sentence_tokens: &[String], text: &str) -> f32 {
         .filter(|token| normalized_text.contains(token.as_str()))
         .count();
     hits as f32 / sentence_tokens.len() as f32
+}
+
+fn reading_order_continuity_score(start: usize, end: usize) -> f32 {
+    let span = end.saturating_sub(start) + 1;
+    (1.0 / span.max(1) as f32).clamp(0.0, 1.0).max(0.2)
+}
+
+fn geometry_compactness_score(lineage: &[SyncTokenLineage]) -> f32 {
+    if lineage.is_empty() {
+        return 0.0;
+    }
+    let left = lineage
+        .iter()
+        .map(|item| item.rect.left)
+        .fold(f32::MAX, f32::min);
+    let right = lineage
+        .iter()
+        .map(|item| item.rect.right)
+        .fold(f32::MIN, f32::max);
+    let top = lineage
+        .iter()
+        .map(|item| item.rect.top)
+        .fold(f32::MIN, f32::max);
+    let bottom = lineage
+        .iter()
+        .map(|item| item.rect.bottom)
+        .fold(f32::MAX, f32::min);
+    let total_area = lineage
+        .iter()
+        .map(|item| {
+            (item.rect.right - item.rect.left).abs() * (item.rect.top - item.rect.bottom).abs()
+        })
+        .sum::<f32>();
+    let bbox_area = (right - left).abs() * (top - bottom).abs();
+    if bbox_area <= 0.0 {
+        return 0.0;
+    }
+    (total_area / bbox_area).clamp(0.0, 1.0)
 }
 
 fn sync_confidence_rank(confidence: SentenceSyncConfidence) -> u8 {
@@ -994,6 +1330,10 @@ pub fn build_artifacts_from_document(
         source_path: source_path.to_path_buf(),
         source_fingerprint: fingerprint,
         generated_at_unix_secs: unix_timestamp_secs(),
+        text_source: TtsTextSourceKind::Embedded,
+        ocr_trust: None,
+        ocr_confidence: None,
+        ocr_artifact_path: None,
         mode: classification.mode,
         confidence: classification.confidence,
         classification: classification.summary,
@@ -1005,12 +1345,43 @@ pub fn build_artifacts_from_document(
         artifact_path: None,
     };
 
+    if artifacts.mode == PdfTtsMode::OcrRequired
+        && config.tts.ocr_policy != TtsOcrPolicy::Disabled
+        && let Some(ocr_artifacts) = load_ocr_artifacts(config, source_path)?
+        && ocr_artifacts.confidence >= config.tts.ocr_min_confidence
+    {
+        let (ocr_canonical_text, ocr_pages, ocr_stats) =
+            ocr_artifacts_to_canonical_text(&ocr_artifacts, config, &artifacts.stats);
+        let ocr_sentences =
+            build_sentence_plan(&ocr_canonical_text, &artifacts.source_fingerprint, config);
+        let ocr_mode = match ocr_artifacts.trust_class {
+            OcrTrustClass::OcrHighTrust => PdfTtsMode::MixedTextTrust,
+            OcrTrustClass::OcrMixedTrust => PdfTtsMode::MixedTextTrust,
+            OcrTrustClass::OcrTextOnly => PdfTtsMode::RenderOnlyNoSync,
+        };
+        artifacts.text_source = TtsTextSourceKind::Ocr;
+        artifacts.ocr_trust = Some(ocr_artifacts.trust_class);
+        artifacts.ocr_confidence = Some(ocr_artifacts.confidence);
+        artifacts.ocr_artifact_path = ocr_artifacts.artifact_path.clone();
+        artifacts.mode = ocr_mode;
+        artifacts.confidence = ocr_artifacts.confidence;
+        artifacts.classification.reason =
+            format!("ocr_artifact_loaded_{}", ocr_artifacts.trust_class.label());
+        artifacts.tts_text = ocr_canonical_text.text.clone();
+        artifacts.canonical_text = ocr_canonical_text;
+        artifacts.pages = ocr_pages;
+        artifacts.sentences = ocr_sentences;
+        artifacts.stats = ocr_stats;
+        artifacts.stats.sentence_count = artifacts.sentences.len();
+    }
+
     let artifact_path = persist_artifacts(config, &artifacts)?;
     artifacts.artifact_path = Some(artifact_path.clone());
 
     info!(
         path = %source_path.display(),
         mode = %artifacts.mode.label(),
+        text_source = ?artifacts.text_source,
         confidence = artifacts.confidence,
         sentences = artifacts.sentences.len(),
         chars = artifacts.stats.normalized_chars,
@@ -1121,6 +1492,146 @@ fn classify_pdf_for_tts(
             reason: "embedded_text_usable_but_below_high_trust_thresholds".into(),
         },
     }
+}
+
+fn ocr_artifacts_to_canonical_text(
+    ocr: &OcrArtifacts,
+    _config: &AppConfig,
+    baseline_stats: &NormalizationStats,
+) -> (
+    CanonicalTtsTextArtifact,
+    Vec<PageTtsArtifact>,
+    NormalizationStats,
+) {
+    let mut text = String::new();
+    let mut pages = Vec::new();
+    let mut canonical_pages = Vec::new();
+    let mut block_count = 0usize;
+    let mut line_count = 0usize;
+    let mut token_count = 0usize;
+
+    for page in &ocr.pages {
+        if !text.is_empty() {
+            text.push_str("\n\n");
+        }
+        let page_start = text.len();
+        let mut canonical_blocks = Vec::new();
+
+        for block in &page.blocks {
+            if !canonical_blocks.is_empty() {
+                text.push_str("\n\n");
+            }
+            let block_start = text.len();
+            let mut canonical_lines = Vec::new();
+
+            for line in &block.lines {
+                let line_start = text.len();
+                let mut canonical_tokens = Vec::new();
+                for token in &line.tokens {
+                    if text.len() > line_start {
+                        text.push(' ');
+                    }
+                    let token_start = text.len();
+                    text.push_str(&token.text);
+                    let token_end = text.len();
+                    canonical_tokens.push(CanonicalTokenArtifact {
+                        page_index: token.page_index,
+                        block_index: token.block_index,
+                        line_index: token.line_index,
+                        token_index: token.token_index,
+                        text: token.text.clone(),
+                        range: TextRange {
+                            start: token_start,
+                            end: token_end,
+                        },
+                    });
+                    token_count += 1;
+                }
+                let line_end = text.len();
+                canonical_lines.push(CanonicalLineArtifact {
+                    page_index: line.page_index,
+                    block_index: line.block_index,
+                    line_index: line.line_index,
+                    text: line.text.clone(),
+                    range: TextRange {
+                        start: line_start,
+                        end: line_end,
+                    },
+                    tokens: canonical_tokens,
+                });
+                line_count += 1;
+            }
+
+            let block_end = text.len();
+            canonical_blocks.push(CanonicalBlockArtifact {
+                page_index: block.page_index,
+                block_index: block.block_index,
+                text: block.text.clone(),
+                range: TextRange {
+                    start: block_start,
+                    end: block_end,
+                },
+                lines: canonical_lines,
+            });
+            block_count += 1;
+        }
+
+        let page_end = text.len();
+        pages.push(PageTtsArtifact {
+            page_index: page.page_index,
+            original_char_count: page_end.saturating_sub(page_start),
+            normalized_char_count: page_end.saturating_sub(page_start),
+            segment_count: page
+                .blocks
+                .iter()
+                .map(|block| {
+                    block
+                        .lines
+                        .iter()
+                        .map(|line| line.tokens.len())
+                        .sum::<usize>()
+                })
+                .sum(),
+            duplicate_lines_removed: 0,
+            repeated_edge_lines_removed: 0,
+            empty_after_normalization: canonical_blocks.is_empty(),
+            range: (!canonical_blocks.is_empty()).then_some(TextRange {
+                start: page_start,
+                end: page_end,
+            }),
+        });
+        canonical_pages.push(CanonicalPageArtifact {
+            page_index: page.page_index,
+            range: (!canonical_blocks.is_empty()).then_some(TextRange {
+                start: page_start,
+                end: page_end,
+            }),
+            blocks: canonical_blocks,
+        });
+    }
+
+    let mut stats = baseline_stats.clone();
+    stats.original_chars = text.chars().count();
+    stats.normalized_chars = text.chars().count();
+    stats.pages_with_text = pages
+        .iter()
+        .filter(|page| !page.empty_after_normalization)
+        .count();
+    stats.empty_pages = pages.len().saturating_sub(stats.pages_with_text);
+    stats.extracted_blocks = block_count;
+    stats.extracted_lines = line_count;
+
+    (
+        CanonicalTtsTextArtifact {
+            text,
+            pages: canonical_pages,
+            block_count,
+            line_count,
+            token_count,
+        },
+        pages,
+        stats,
+    )
 }
 
 fn build_sentence_plan(
@@ -2012,6 +2523,90 @@ mod tests {
         }
     }
 
+    fn sample_ocr_artifacts(path: PathBuf) -> OcrArtifacts {
+        OcrArtifacts {
+            source_path: PathBuf::from("fixture.pdf"),
+            source_fingerprint: "abc".into(),
+            generated_at_unix_secs: 0,
+            confidence: 0.91,
+            trust_class: OcrTrustClass::OcrMixedTrust,
+            pages: vec![OcrPageArtifact {
+                page_index: 0,
+                confidence: 0.91,
+                blocks: vec![OcrBlockArtifact {
+                    page_index: 0,
+                    block_index: 0,
+                    text: "Scanned text line".into(),
+                    bounds: PdfRectData {
+                        left: 10.0,
+                        right: 90.0,
+                        top: 100.0,
+                        bottom: 80.0,
+                    },
+                    confidence: 0.91,
+                    lines: vec![OcrLineArtifact {
+                        page_index: 0,
+                        block_index: 0,
+                        line_index: 0,
+                        text: "Scanned text line".into(),
+                        bounds: PdfRectData {
+                            left: 10.0,
+                            right: 90.0,
+                            top: 100.0,
+                            bottom: 80.0,
+                        },
+                        confidence: 0.91,
+                        tokens: vec![
+                            OcrTokenArtifact {
+                                page_index: 0,
+                                block_index: 0,
+                                line_index: 0,
+                                token_index: 0,
+                                text: "Scanned".into(),
+                                bounds: PdfRectData {
+                                    left: 10.0,
+                                    right: 42.0,
+                                    top: 100.0,
+                                    bottom: 80.0,
+                                },
+                                confidence: 0.9,
+                            },
+                            OcrTokenArtifact {
+                                page_index: 0,
+                                block_index: 0,
+                                line_index: 0,
+                                token_index: 1,
+                                text: "text".into(),
+                                bounds: PdfRectData {
+                                    left: 44.0,
+                                    right: 62.0,
+                                    top: 100.0,
+                                    bottom: 80.0,
+                                },
+                                confidence: 0.92,
+                            },
+                            OcrTokenArtifact {
+                                page_index: 0,
+                                block_index: 0,
+                                line_index: 0,
+                                token_index: 2,
+                                text: "line".into(),
+                                bounds: PdfRectData {
+                                    left: 64.0,
+                                    right: 90.0,
+                                    top: 100.0,
+                                    bottom: 80.0,
+                                },
+                                confidence: 0.91,
+                            },
+                        ],
+                    }],
+                }],
+            }],
+            artifact_path: Some(path),
+        }
+    }
+
     #[test]
     fn normalization_replaces_ligatures_and_soft_hyphens() {
         let config = AppConfig::default();
@@ -2118,6 +2713,10 @@ mod tests {
             source_path: PathBuf::from("fixture.pdf"),
             source_fingerprint: "abc".into(),
             generated_at_unix_secs: 0,
+            text_source: TtsTextSourceKind::Embedded,
+            ocr_trust: None,
+            ocr_confidence: None,
+            ocr_artifact_path: None,
             mode: PdfTtsMode::HighTextTrust,
             confidence: 0.9,
             classification: sample_classification(PdfTtsMode::HighTextTrust, 0.9),
@@ -2362,6 +2961,10 @@ mod tests {
             source_path,
             source_fingerprint: "abc".into(),
             generated_at_unix_secs: 0,
+            text_source: TtsTextSourceKind::Embedded,
+            ocr_trust: None,
+            ocr_confidence: None,
+            ocr_artifact_path: None,
             mode: PdfTtsMode::HighTextTrust,
             confidence: 0.9,
             tts_text: "Sentence zero.".into(),
@@ -2422,6 +3025,8 @@ mod tests {
 
         assert_eq!(target.confidence, SentenceSyncConfidence::ExactSentence);
         assert_eq!(target.rects.len(), 2);
+        assert_eq!(target.lineage.len(), 2);
+        assert!(target.score_breakdown.geometry_compactness > 0.0);
     }
 
     #[test]
@@ -2480,6 +3085,10 @@ mod tests {
             source_path: PathBuf::from("fixture.pdf"),
             source_fingerprint: "abc".into(),
             generated_at_unix_secs: 0,
+            text_source: TtsTextSourceKind::Embedded,
+            ocr_trust: None,
+            ocr_confidence: None,
+            ocr_artifact_path: None,
             mode: PdfTtsMode::OcrRequired,
             confidence: 0.2,
             tts_text: "Scanned fallback".into(),
@@ -2523,6 +3132,27 @@ mod tests {
                 }],
                 fallback_reason: "exact_substring_match".into(),
                 score: 1.0,
+                score_breakdown: SyncScoreBreakdown {
+                    text_similarity: 1.0,
+                    reading_order: 1.0,
+                    geometry_compactness: 1.0,
+                    page_continuity: 1.0,
+                    total: 1.0,
+                },
+                lineage: vec![SyncTokenLineage {
+                    token: "Scanned".into(),
+                    page_index: 0,
+                    block_index: 0,
+                    line_index: 0,
+                    token_index: 0,
+                    rect: PdfRectData {
+                        left: 1.0,
+                        right: 2.0,
+                        top: 3.0,
+                        bottom: 0.5,
+                    },
+                }],
+                artifact_path: None,
             },
             &policy,
         );
@@ -2538,6 +3168,10 @@ mod tests {
             source_path: PathBuf::from("fixture.pdf"),
             source_fingerprint: "abc".into(),
             generated_at_unix_secs: 0,
+            text_source: TtsTextSourceKind::Embedded,
+            ocr_trust: None,
+            ocr_confidence: None,
+            ocr_artifact_path: None,
             mode: PdfTtsMode::OcrRequired,
             confidence: 0.1,
             tts_text: String::new(),
@@ -2552,5 +3186,103 @@ mod tests {
         let policy = evaluate_runtime_policy(&config, &analysis);
         assert!(!policy.allow_playback);
         assert_eq!(policy.max_sync_confidence, SentenceSyncConfidence::Missing);
+    }
+
+    #[test]
+    fn load_ocr_artifacts_reads_separate_sidecar_contract() {
+        let temp = tempfile::tempdir().unwrap();
+        let source_path = temp.path().join("fixture.pdf");
+        fs::write(&source_path, b"%PDF-1.4").unwrap();
+        let mut config = AppConfig::default();
+        config.tts.ocr_artifacts_dir = temp.path().join("ocr").display().to_string();
+
+        let ocr_path = config.tts_ocr_artifact_path(&source_path).unwrap();
+        fs::create_dir_all(ocr_path.parent().unwrap()).unwrap();
+        fs::write(
+            &ocr_path,
+            toml::to_string_pretty(&sample_ocr_artifacts(ocr_path.clone())).unwrap(),
+        )
+        .unwrap();
+
+        let loaded = load_ocr_artifacts(&config, &source_path).unwrap().unwrap();
+        assert_eq!(loaded.trust_class, OcrTrustClass::OcrMixedTrust);
+        assert_eq!(loaded.pages[0].blocks[0].lines[0].tokens.len(), 3);
+    }
+
+    #[test]
+    fn persist_sync_target_writes_artifact_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let source_path = temp.path().join("fixture.pdf");
+        fs::write(&source_path, b"%PDF-1.4").unwrap();
+        let mut config = AppConfig::default();
+        config.tts.sync_artifacts_dir = temp.path().join("sync").display().to_string();
+        let analysis = TtsAnalysisArtifacts {
+            source_path: source_path.clone(),
+            source_fingerprint: "abc".into(),
+            generated_at_unix_secs: 0,
+            text_source: TtsTextSourceKind::Embedded,
+            ocr_trust: None,
+            ocr_confidence: None,
+            ocr_artifact_path: None,
+            mode: PdfTtsMode::HighTextTrust,
+            confidence: 0.9,
+            classification: sample_classification(PdfTtsMode::HighTextTrust, 0.9),
+            tts_text: "Hello world".into(),
+            canonical_text: sample_canonical_text("Hello world"),
+            sentences: vec![SentencePlan {
+                id: 42,
+                text: "Hello world".into(),
+                range: TextRange { start: 0, end: 11 },
+                page_range: PageRange {
+                    start_page: 0,
+                    end_page: 0,
+                },
+                unit_kind: SentenceUnitKind::Sentence,
+            }],
+            pages: Vec::new(),
+            stats: NormalizationStats::default(),
+            artifact_path: None,
+        };
+        let target = SentenceSyncTarget {
+            sentence_index: 0,
+            sentence_id: 42,
+            confidence: SentenceSyncConfidence::ExactSentence,
+            page_index: Some(0),
+            rects: vec![PdfRectData {
+                left: 1.0,
+                right: 2.0,
+                top: 3.0,
+                bottom: 0.5,
+            }],
+            fallback_reason: "exact_substring_match".into(),
+            score: 1.0,
+            score_breakdown: SyncScoreBreakdown {
+                text_similarity: 1.0,
+                reading_order: 1.0,
+                geometry_compactness: 1.0,
+                page_continuity: 1.0,
+                total: 1.0,
+            },
+            lineage: vec![SyncTokenLineage {
+                token: "Hello".into(),
+                page_index: 0,
+                block_index: 0,
+                line_index: 0,
+                token_index: 0,
+                rect: PdfRectData {
+                    left: 1.0,
+                    right: 2.0,
+                    top: 3.0,
+                    bottom: 0.5,
+                },
+            }],
+            artifact_path: None,
+        };
+
+        let path = persist_sync_target(&config, &analysis, &target).unwrap();
+        assert!(path.exists());
+        let contents = fs::read_to_string(path).unwrap();
+        assert!(contents.contains("score_breakdown"));
+        assert!(contents.contains("lineage"));
     }
 }

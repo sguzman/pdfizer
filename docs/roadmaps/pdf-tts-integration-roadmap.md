@@ -149,24 +149,24 @@ Checked items reflect capabilities already present in this repository that reduc
 
 ## Phase 5: Geometry Artifact And Sync Mapping
 
-- [ ] Define a persistent sync artifact: `sentence_id -> page_idx + rects[] + confidence + fallback_reason`.
-- [ ] Support one sentence mapping to multiple disjoint rectangles.
-- [ ] Support one sentence spanning multiple lines or blocks.
-- [ ] Keep mapping deterministic even when extraction required cleanup.
-- [ ] Score matches using text similarity, reading-order continuity, local geometry compactness, and page continuity.
-- [ ] Reject visually implausible matches even if text similarity looks high.
-- [ ] Persist token lineage so bad highlights can be debugged later.
-- [ ] Add a nearest-safe fallback when exact sentence geometry is unavailable.
+- [x] Define a persistent sync artifact: `sentence_id -> page_idx + rects[] + confidence + fallback_reason`.
+- [x] Support one sentence mapping to multiple disjoint rectangles.
+- [x] Support one sentence spanning multiple lines or blocks.
+- [x] Keep mapping deterministic even when extraction required cleanup.
+- [x] Score matches using text similarity, reading-order continuity, local geometry compactness, and page continuity.
+- [x] Reject visually implausible matches even if text similarity looks high.
+- [x] Persist token lineage so bad highlights can be debugged later.
+- [x] Add a nearest-safe fallback when exact sentence geometry is unavailable.
 
 ## Phase 6: OCR Strategy For PDFs
 
 - [x] Decide whether OCR is optional, deferred, or first-class in this project.
-- [ ] Define an OCR output contract with page, block, line, token, bounding box, and confidence fields.
-- [ ] Support OCR-derived `tts_text` for scanned PDFs only when confidence passes a minimum threshold.
-- [ ] Keep OCR text confidence distinct from embedded-text confidence.
-- [ ] Support OCR geometry classes such as `ocr_high_trust`, `ocr_mixed_trust`, and `ocr_text_only`.
+- [x] Define an OCR output contract with page, block, line, token, bounding box, and confidence fields.
+- [x] Support OCR-derived `tts_text` for scanned PDFs only when confidence passes a minimum threshold.
+- [x] Keep OCR text confidence distinct from embedded-text confidence.
+- [x] Support OCR geometry classes such as `ocr_high_trust`, `ocr_mixed_trust`, and `ocr_text_only`.
 - [x] Refuse sentence-precise overlay sync for OCR outputs that only justify block-level mapping.
-- [ ] Persist OCR artifacts separately from embedded-text artifacts.
+- [x] Persist OCR artifacts separately from embedded-text artifacts.
 
 ## Phase 7: TTS Engine Abstraction
 

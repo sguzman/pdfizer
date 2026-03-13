@@ -223,6 +223,14 @@ impl AppConfig {
             .set_default("tts.audio_cache_dir", defaults.tts.audio_cache_dir.clone())?
             .set_default("tts.artifacts_dir", defaults.tts.artifacts_dir.clone())?
             .set_default(
+                "tts.sync_artifacts_dir",
+                defaults.tts.sync_artifacts_dir.clone(),
+            )?
+            .set_default(
+                "tts.ocr_artifacts_dir",
+                defaults.tts.ocr_artifacts_dir.clone(),
+            )?
+            .set_default(
                 "tts.experimental_pdf_sync",
                 defaults.tts.experimental_pdf_sync,
             )?
@@ -371,8 +379,44 @@ impl AppConfig {
         Ok(path)
     }
 
+    pub fn tts_sync_artifacts_dir(&self) -> Result<PathBuf> {
+        let path = self.resolve_storage_dir(&self.tts.sync_artifacts_dir)?;
+        fs::create_dir_all(&path).with_context(|| {
+            format!(
+                "failed to create TTS sync artifact directory {}",
+                path.display()
+            )
+        })?;
+        Ok(path)
+    }
+
+    pub fn tts_ocr_artifacts_dir(&self) -> Result<PathBuf> {
+        let path = self.resolve_storage_dir(&self.tts.ocr_artifacts_dir)?;
+        fs::create_dir_all(&path).with_context(|| {
+            format!(
+                "failed to create TTS OCR artifact directory {}",
+                path.display()
+            )
+        })?;
+        Ok(path)
+    }
+
     pub fn tts_artifact_path(&self, source_path: &Path) -> Result<PathBuf> {
         let dir = self.tts_artifacts_dir()?;
+        Ok(dir.join(format!("{}.toml", stable_source_fingerprint(source_path)?)))
+    }
+
+    pub fn tts_sync_artifact_path(&self, source_path: &Path, sentence_id: u64) -> Result<PathBuf> {
+        let dir = self.tts_sync_artifacts_dir()?;
+        Ok(dir.join(format!(
+            "{}-{:016x}.toml",
+            stable_source_fingerprint(source_path)?,
+            sentence_id
+        )))
+    }
+
+    pub fn tts_ocr_artifact_path(&self, source_path: &Path) -> Result<PathBuf> {
+        let dir = self.tts_ocr_artifacts_dir()?;
         Ok(dir.join(format!("{}.toml", stable_source_fingerprint(source_path)?)))
     }
 
@@ -645,6 +689,8 @@ pub struct TtsConfig {
     pub active_latency_budget_ms: u64,
     pub audio_cache_dir: String,
     pub artifacts_dir: String,
+    pub sync_artifacts_dir: String,
+    pub ocr_artifacts_dir: String,
     pub experimental_pdf_sync: bool,
     pub verbose_degraded_logging: bool,
     pub min_chars_per_text_page: usize,
@@ -687,6 +733,8 @@ impl Default for TtsConfig {
             active_latency_budget_ms: 120,
             audio_cache_dir: "tts/audio".into(),
             artifacts_dir: "tts/artifacts".into(),
+            sync_artifacts_dir: "tts/sync".into(),
+            ocr_artifacts_dir: "tts/ocr".into(),
             experimental_pdf_sync: false,
             verbose_degraded_logging: true,
             min_chars_per_text_page: 80,
