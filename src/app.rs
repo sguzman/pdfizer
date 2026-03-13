@@ -1005,23 +1005,109 @@ impl PdfizerApp {
         };
 
         let page_count = document.metadata.page_count;
-        ScrollArea::vertical()
+        ScrollArea::both()
             .auto_shrink([false, false])
             .show(ui, |ui| {
+                let clip_rect = ui.clip_rect();
+                let preload_margin = 1200.0;
+
                 for page_index in 0..page_count {
-                    ui.group(|ui| {
-                        ui.label(format!("Page {}", page_index + 1));
+                    let Some(size) = self.page_image_size(page_index) else {
+                        continue;
+                    };
+
+                    let available_width = ui.available_width().max(size.x);
+                    let x_offset = ((available_width - size.x) * 0.5).max(0.0);
+                    let (full_row_rect, _) =
+                        ui.allocate_exact_size(Vec2::new(available_width, size.y), Sense::hover());
+                    let page_rect = Rect::from_min_size(
+                        Pos2::new(full_row_rect.left() + x_offset, full_row_rect.top()),
+                        size,
+                    );
+
+                    let should_render = page_rect.bottom() >= clip_rect.top() - preload_margin
+                        && page_rect.top() <= clip_rect.bottom() + preload_margin;
+
+                    ui.painter()
+                        .rect_filled(page_rect, 0.0, self.config.background_color());
+
+                    if should_render {
                         if let Some(view) =
                             self.ensure_page_view_cached(ctx, page_index, self.current_preset)
                         {
-                            self.render_view_panel(ctx, ui, "Continuous", page_index, &view, true);
+                            self.render_continuous_page(ctx, ui, page_index, &view, page_rect);
                         } else {
-                            ui.label("Rendering failed");
+                            ui.painter().text(
+                                page_rect.center(),
+                                egui::Align2::CENTER_CENTER,
+                                "Render failed",
+                                egui::TextStyle::Body.resolve(ui.style()),
+                                Color32::LIGHT_RED,
+                            );
                         }
-                    });
-                    ui.add_space(12.0);
+                    } else {
+                        ui.painter().text(
+                            page_rect.center_top() + Vec2::new(0.0, 12.0),
+                            egui::Align2::CENTER_TOP,
+                            format!("Page {}", page_index + 1),
+                            egui::TextStyle::Small.resolve(ui.style()),
+                            Color32::GRAY,
+                        );
+                    }
+
+                    ui.add_space(14.0);
                 }
             });
+    }
+
+    fn render_continuous_page(
+        &mut self,
+        ctx: &egui::Context,
+        ui: &mut Ui,
+        page_index: usize,
+        view: &RenderView,
+        page_rect: Rect,
+    ) {
+        let response = ui.put(
+            page_rect,
+            egui::Image::new(&view.texture)
+                .fit_to_exact_size(page_rect.size())
+                .sense(Sense::click_and_drag()),
+        );
+
+        if self.config.ui.enable_pixel_inspector {
+            self.update_inspector_from_response(&response, &view.image);
+
+            if response.drag_started() {
+                self.selection_anchor = response.interact_pointer_pos();
+                self.selected_text_page = Some(page_index);
+            }
+
+            if response.dragged() {
+                if let (Some(start), Some(current)) =
+                    (self.selection_anchor, response.interact_pointer_pos())
+                {
+                    self.selection_rect = Some(Rect::from_two_pos(start, current));
+                }
+            }
+
+            if response.drag_stopped() {
+                self.capture_selection_for_page(page_index, &response, &view.image);
+                self.selection_anchor = None;
+            }
+        }
+
+        self.paint_search_highlights(ui, page_index, &response, &view.image);
+        self.paint_selection_highlight(ui, page_index, &response, &view.image);
+
+        if response.clicked() {
+            self.current_page = page_index;
+            self.persist_session();
+        }
+
+        if response.hovered() && ctx.input(|input| input.raw_scroll_delta.y != 0.0) {
+            self.current_page = page_index;
+        }
     }
 
     fn render_view_panel(
@@ -1214,6 +1300,15 @@ impl PdfizerApp {
             top: page_size.height * (1.0 - top_ratio),
             bottom: page_size.height * (1.0 - bottom_ratio),
         })
+    }
+
+    fn page_image_size(&self, page_index: usize) -> Option<Vec2> {
+        let document = self.document.as_ref()?;
+        let size = document.page_size(page_index)?;
+        Some(Vec2::new(
+            scaled_page_width(size, self.zoom) as f32,
+            scaled_page_height(size, self.zoom) as f32,
+        ))
     }
 
     fn update_inspector_from_response(&mut self, response: &egui::Response, image: &ColorImage) {
