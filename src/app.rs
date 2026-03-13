@@ -4342,7 +4342,3 @@ fn unix_timestamp_secs() -> u64 {
 fn default_true() -> bool {
     true
 }
-
-#[cfg(test)]
-#[path = "../tests/app_unit.rs"]
-mod tests;

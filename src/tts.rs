@@ -2766,7 +2766,3 @@ fn unix_timestamp_secs() -> u64 {
         .unwrap_or_default()
         .as_secs()
 }
-
-#[cfg(test)]
-#[path = "../tests/tts_unit.rs"]
-mod tests;

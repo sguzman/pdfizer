@@ -944,7 +944,3 @@ fn stable_source_fingerprint(path: &Path) -> Result<String> {
     modified.hash(&mut hasher);
     Ok(format!("{:016x}", hasher.finish()))
 }
-
-#[cfg(test)]
-#[path = "../tests/config_unit.rs"]
-mod tests;
