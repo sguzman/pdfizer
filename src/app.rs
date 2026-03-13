@@ -2,9 +2,9 @@ use std::{
     collections::HashMap,
     fs,
     path::PathBuf,
-    sync::mpsc::{self, Receiver, TryRecvError},
+    sync::mpsc::{self, Receiver, Sender, TryRecvError},
     thread,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context as _, Result};
@@ -23,7 +23,10 @@ use crate::{
         RenderPreset, RenderRequest, RenderedPageImage, SearchHit, TextSegmentData,
         TileRenderRequest,
     },
-    tts::{self, PdfTtsMode, TtsAnalysisArtifacts, TtsWorkerMessage},
+    tts::{
+        self, PdfTtsMode, PreparedSentenceClip, TtsAnalysisArtifacts, TtsEngineKind,
+        TtsPlaybackState, TtsWorkerMessage,
+    },
 };
 
 pub struct PdfizerApp {
@@ -62,11 +65,34 @@ pub struct PdfizerApp {
     current_document_path: Option<PathBuf>,
     tts_analysis: Option<TtsAnalysisArtifacts>,
     tts_analysis_status: TtsAnalysisStatus,
+    tts_worker_tx: Option<Sender<TtsWorkerMessage>>,
     tts_worker_rx: Option<Receiver<TtsWorkerMessage>>,
     tts_request_id: u64,
+    tts_engine: TtsEngineKind,
+    tts_playback_state: TtsPlaybackState,
+    tts_active_sentence_index: usize,
+    tts_follow_mode: bool,
+    tts_prepared_clips: HashMap<usize, PreparedSentenceClip>,
+    tts_prefetch_queue: Vec<usize>,
+    tts_failed_prefetch: HashMap<usize, String>,
+    tts_prefetch_request_id: u64,
+    tts_prefetch_in_flight: usize,
+    tts_started_at: Option<Instant>,
+    tts_current_duration: Duration,
 }
 
 impl PdfizerApp {
+    fn ensure_tts_worker_channel(&mut self) -> Sender<TtsWorkerMessage> {
+        if let Some(sender) = &self.tts_worker_tx {
+            return sender.clone();
+        }
+
+        let (tx, rx) = mpsc::channel();
+        self.tts_worker_tx = Some(tx.clone());
+        self.tts_worker_rx = Some(rx);
+        tx
+    }
+
     pub fn new(cc: &eframe::CreationContext<'_>, config: AppConfig) -> Self {
         let tts_enabled = config.tts.enabled;
         let runtime = match PdfRuntime::new(&config) {
@@ -127,8 +153,20 @@ impl PdfizerApp {
             } else {
                 TtsAnalysisStatus::Disabled
             },
+            tts_worker_tx: None,
             tts_worker_rx: None,
             tts_request_id: 0,
+            tts_engine: TtsEngineKind::DryRun,
+            tts_playback_state: TtsPlaybackState::Stopped,
+            tts_active_sentence_index: 0,
+            tts_follow_mode: true,
+            tts_prepared_clips: HashMap::new(),
+            tts_prefetch_queue: Vec::new(),
+            tts_failed_prefetch: HashMap::new(),
+            tts_prefetch_request_id: 0,
+            tts_prefetch_in_flight: 0,
+            tts_started_at: None,
+            tts_current_duration: Duration::ZERO,
         };
 
         app.restore_session(&cc.egui_ctx);
@@ -169,6 +207,7 @@ impl PdfizerApp {
                 } else {
                     TtsAnalysisStatus::Disabled
                 };
+                self.reset_tts_runtime();
                 self.single_scroll_offset = Vec2::ZERO;
                 self.continuous_scroll_offset = Vec2::ZERO;
                 self.render_current_page(ctx);
@@ -183,8 +222,6 @@ impl PdfizerApp {
     }
 
     fn start_tts_analysis(&mut self, path: PathBuf) {
-        self.tts_worker_rx = None;
-
         if !self.config.tts.enabled {
             self.tts_analysis_status = TtsAnalysisStatus::Disabled;
             return;
@@ -198,8 +235,7 @@ impl PdfizerApp {
         self.tts_request_id = self.tts_request_id.wrapping_add(1);
         let request_id = self.tts_request_id;
         let config = self.config.clone();
-        let (tx, rx) = mpsc::channel();
-        self.tts_worker_rx = Some(rx);
+        let tx = self.ensure_tts_worker_channel();
         self.tts_analysis_status = TtsAnalysisStatus::Analyzing;
 
         thread::spawn(move || {
@@ -227,49 +263,260 @@ impl PdfizerApp {
     }
 
     fn poll_tts_analysis(&mut self) {
-        let Some(receiver) = &self.tts_worker_rx else {
+        let Some(receiver) = self.tts_worker_rx.take() else {
             return;
         };
 
-        match receiver.try_recv() {
-            Ok(TtsWorkerMessage::Completed {
-                request_id,
-                artifacts,
-            }) if request_id == self.tts_request_id => {
-                if artifacts.mode != PdfTtsMode::HighTextTrust
-                    && self.config.tts.verbose_degraded_logging
-                {
-                    warn!(
-                        path = %artifacts.source_path.display(),
-                        mode = %artifacts.mode.label(),
-                        confidence = artifacts.confidence,
-                        "PDF TTS analysis completed in degraded mode"
-                    );
+        loop {
+            match receiver.try_recv() {
+                Ok(TtsWorkerMessage::Completed {
+                    request_id,
+                    artifacts,
+                }) if request_id == self.tts_request_id => {
+                    if artifacts.mode != PdfTtsMode::HighTextTrust
+                        && self.config.tts.verbose_degraded_logging
+                    {
+                        warn!(
+                            path = %artifacts.source_path.display(),
+                            mode = %artifacts.mode.label(),
+                            confidence = artifacts.confidence,
+                            "PDF TTS analysis completed in degraded mode"
+                        );
+                    }
+                    self.status_message = Some(format!(
+                        "TTS analysis ready: {} sentences ({})",
+                        artifacts.sentences.len(),
+                        artifacts.mode.label()
+                    ));
+                    self.tts_analysis = Some(artifacts);
+                    self.tts_analysis_status = TtsAnalysisStatus::Ready;
+                    self.sync_tts_sentence_to_current_page();
                 }
-                self.status_message = Some(format!(
-                    "TTS analysis ready: {} sentences ({})",
-                    artifacts.sentences.len(),
-                    artifacts.mode.label()
-                ));
-                self.tts_analysis = Some(artifacts);
-                self.tts_analysis_status = TtsAnalysisStatus::Ready;
-                self.tts_worker_rx = None;
+                Ok(TtsWorkerMessage::Failed { request_id, error })
+                    if request_id == self.tts_request_id =>
+                {
+                    error!(error = %error, "TTS analysis failed");
+                    self.last_error = Some(format!("TTS analysis failed: {error}"));
+                    self.tts_analysis_status = TtsAnalysisStatus::Failed(error);
+                }
+                Ok(TtsWorkerMessage::PrefetchCompleted { request_id, clip })
+                    if request_id == self.tts_prefetch_request_id =>
+                {
+                    self.tts_prepared_clips.insert(clip.sentence_index, clip);
+                    self.tts_prefetch_queue
+                        .retain(|index| !self.tts_prepared_clips.contains_key(index));
+                    self.tts_prefetch_in_flight = self.tts_prefetch_in_flight.saturating_sub(1);
+                }
+                Ok(TtsWorkerMessage::PrefetchFailed {
+                    request_id,
+                    sentence_index,
+                    error,
+                }) if request_id == self.tts_prefetch_request_id => {
+                    self.tts_prefetch_queue
+                        .retain(|index| *index != sentence_index);
+                    self.tts_prefetch_in_flight = self.tts_prefetch_in_flight.saturating_sub(1);
+                    self.tts_failed_prefetch
+                        .insert(sentence_index, error.clone());
+                    warn!(sentence_index, error = %error, "TTS prefetch failed");
+                }
+                Ok(_) => {}
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    self.tts_analysis_status = TtsAnalysisStatus::Failed(
+                        "analysis worker disconnected unexpectedly".into(),
+                    );
+                    self.tts_worker_tx = None;
+                    break;
+                }
             }
-            Ok(TtsWorkerMessage::Failed { request_id, error })
-                if request_id == self.tts_request_id =>
-            {
-                error!(error = %error, "TTS analysis failed");
-                self.last_error = Some(format!("TTS analysis failed: {error}"));
-                self.tts_analysis_status = TtsAnalysisStatus::Failed(error);
-                self.tts_worker_rx = None;
-            }
-            Ok(_) => {}
-            Err(TryRecvError::Empty) => {}
-            Err(TryRecvError::Disconnected) => {
-                self.tts_analysis_status =
-                    TtsAnalysisStatus::Failed("analysis worker disconnected unexpectedly".into());
-                self.tts_worker_rx = None;
-            }
+        }
+
+        self.tts_worker_rx = Some(receiver);
+    }
+
+    fn reset_tts_runtime(&mut self) {
+        self.tts_playback_state = TtsPlaybackState::Stopped;
+        self.tts_active_sentence_index = 0;
+        self.tts_prepared_clips.clear();
+        self.tts_prefetch_queue.clear();
+        self.tts_failed_prefetch.clear();
+        self.tts_prefetch_in_flight = 0;
+        self.tts_started_at = None;
+        self.tts_current_duration = Duration::ZERO;
+        self.tts_prefetch_request_id = self.tts_prefetch_request_id.wrapping_add(1);
+    }
+
+    fn active_sentence(&self) -> Option<&crate::tts::SentencePlan> {
+        self.tts_analysis
+            .as_ref()
+            .and_then(|analysis| analysis.sentences.get(self.tts_active_sentence_index))
+    }
+
+    fn sync_tts_sentence_to_current_page(&mut self) {
+        let Some(analysis) = &self.tts_analysis else {
+            return;
+        };
+        if let Some((index, _)) = analysis.sentences.iter().enumerate().find(|(_, sentence)| {
+            sentence.page_range.start_page <= self.current_page
+                && sentence.page_range.end_page >= self.current_page
+        }) {
+            self.tts_active_sentence_index = index;
+        }
+    }
+
+    fn start_tts_prefetch(&mut self) {
+        let Some(analysis) = self.tts_analysis.clone() else {
+            return;
+        };
+
+        self.tts_prefetch_request_id = self.tts_prefetch_request_id.wrapping_add(1);
+        let request_id = self.tts_prefetch_request_id;
+        let plan = tts::build_prefetch_plan(
+            &analysis,
+            self.tts_active_sentence_index,
+            self.config.tts.sentence_prefetch,
+        );
+
+        self.tts_prefetch_queue = plan
+            .iter()
+            .copied()
+            .filter(|index| !self.tts_prepared_clips.contains_key(index))
+            .collect();
+        self.tts_failed_prefetch.clear();
+        self.tts_prefetch_in_flight = self.tts_prefetch_queue.len();
+
+        if self.tts_prefetch_queue.is_empty() {
+            return;
+        }
+
+        let sender = self.ensure_tts_worker_channel();
+        for sentence_index in self.tts_prefetch_queue.clone() {
+            let config = self.config.clone();
+            let analysis = analysis.clone();
+            let sender = sender.clone();
+            let engine = self.tts_engine;
+            thread::spawn(move || {
+                let message =
+                    match tts::prepare_sentence_clip(&config, &analysis, sentence_index, engine) {
+                        Ok(clip) => TtsWorkerMessage::PrefetchCompleted { request_id, clip },
+                        Err(err) => TtsWorkerMessage::PrefetchFailed {
+                            request_id,
+                            sentence_index,
+                            error: err.to_string(),
+                        },
+                    };
+                let _ = sender.send(message);
+            });
+        }
+    }
+
+    fn start_tts_playback(&mut self, ctx: &egui::Context) {
+        if !self.config.tts.enabled {
+            self.last_error = Some("TTS is disabled in config".into());
+            return;
+        }
+        if self.tts_analysis.is_none() {
+            self.last_error = Some("TTS analysis is not ready yet".into());
+            return;
+        }
+
+        self.tts_playback_state = TtsPlaybackState::Preparing;
+        self.start_tts_prefetch();
+        self.try_activate_current_sentence(ctx);
+    }
+
+    fn pause_tts_playback(&mut self) {
+        if self.tts_playback_state == TtsPlaybackState::Playing {
+            self.tts_playback_state = TtsPlaybackState::Paused;
+        }
+    }
+
+    fn resume_tts_playback(&mut self, ctx: &egui::Context) {
+        if self.tts_playback_state == TtsPlaybackState::Paused {
+            self.tts_playback_state = TtsPlaybackState::Preparing;
+            self.try_activate_current_sentence(ctx);
+        }
+    }
+
+    fn stop_tts_playback(&mut self) {
+        self.reset_tts_runtime();
+        if self.config.tts.enabled {
+            self.tts_analysis_status = if self.tts_analysis.is_some() {
+                TtsAnalysisStatus::Ready
+            } else {
+                TtsAnalysisStatus::Idle
+            };
+        }
+    }
+
+    fn next_tts_sentence(&mut self, ctx: &egui::Context) {
+        let Some(analysis) = &self.tts_analysis else {
+            return;
+        };
+        if self.tts_active_sentence_index + 1 < analysis.sentences.len() {
+            self.tts_active_sentence_index += 1;
+            self.tts_started_at = None;
+            self.start_tts_prefetch();
+            self.try_activate_current_sentence(ctx);
+        } else {
+            self.stop_tts_playback();
+        }
+    }
+
+    fn previous_tts_sentence(&mut self, ctx: &egui::Context) {
+        if self.tts_active_sentence_index > 0 {
+            self.tts_active_sentence_index -= 1;
+            self.tts_started_at = None;
+            self.start_tts_prefetch();
+            self.try_activate_current_sentence(ctx);
+        }
+    }
+
+    fn try_activate_current_sentence(&mut self, ctx: &egui::Context) {
+        if let Some(clip) = self.tts_prepared_clips.get(&self.tts_active_sentence_index) {
+            self.tts_current_duration = Duration::from_millis(clip.estimated_duration_ms);
+            self.tts_started_at = Some(Instant::now());
+            self.tts_playback_state = TtsPlaybackState::Playing;
+            self.focus_active_sentence(ctx);
+            self.status_message = Some(format!(
+                "TTS playing sentence {}/{} using {} backend",
+                self.tts_active_sentence_index + 1,
+                self.tts_analysis
+                    .as_ref()
+                    .map(|analysis| analysis.sentences.len())
+                    .unwrap_or(0),
+                self.tts_engine.label()
+            ));
+            ctx.request_repaint_after(Duration::from_millis(40));
+        } else if self.tts_prefetch_in_flight > 0 {
+            self.tts_playback_state = TtsPlaybackState::Preparing;
+            ctx.request_repaint_after(Duration::from_millis(40));
+        }
+    }
+
+    fn focus_active_sentence(&mut self, ctx: &egui::Context) {
+        if !self.tts_follow_mode {
+            return;
+        }
+        let Some(sentence) = self.active_sentence() else {
+            return;
+        };
+        self.navigate_to_page(sentence.page_range.start_page, None, ctx);
+    }
+
+    fn advance_tts_clock(&mut self, ctx: &egui::Context) {
+        if self.tts_playback_state != TtsPlaybackState::Playing {
+            return;
+        }
+
+        let Some(started_at) = self.tts_started_at else {
+            return;
+        };
+
+        if started_at.elapsed() >= self.tts_current_duration {
+            self.next_tts_sentence(ctx);
+        } else {
+            ctx.request_repaint_after(Duration::from_millis(40));
         }
     }
 
@@ -527,6 +774,9 @@ impl PdfizerApp {
         ctx: &egui::Context,
     ) {
         self.current_page = page_index;
+        if self.tts_playback_state == TtsPlaybackState::Stopped {
+            self.sync_tts_sentence_to_current_page();
+        }
 
         match self.view_mode {
             ViewMode::SinglePage => {
@@ -614,6 +864,22 @@ impl PdfizerApp {
 
         if ctx.input(|input| input.key_pressed(Key::Num0)) {
             self.apply_zoom(ctx, self.config.rendering.initial_zoom);
+        }
+
+        if ctx.input(|input| input.key_pressed(Key::Space)) {
+            match self.tts_playback_state {
+                TtsPlaybackState::Playing => self.pause_tts_playback(),
+                TtsPlaybackState::Paused => self.resume_tts_playback(ctx),
+                _ => self.start_tts_playback(ctx),
+            }
+        }
+
+        if ctx.input(|input| input.key_pressed(Key::Period)) {
+            self.next_tts_sentence(ctx);
+        }
+
+        if ctx.input(|input| input.key_pressed(Key::Comma)) {
+            self.previous_tts_sentence(ctx);
         }
 
         let ctrl_scroll = ctx.input(|input| {
@@ -803,6 +1069,56 @@ impl PdfizerApp {
         ui.checkbox(&mut self.search_whole_word, "Word");
         ui.checkbox(&mut self.highlight_text, "Highlight text");
 
+        ui.separator();
+        ui.label("TTS");
+        if ui
+            .add_enabled(
+                self.tts_analysis.is_some(),
+                egui::Button::new(match self.tts_playback_state {
+                    TtsPlaybackState::Playing => "Pause",
+                    TtsPlaybackState::Paused => "Resume",
+                    _ => "Play",
+                }),
+            )
+            .clicked()
+        {
+            match self.tts_playback_state {
+                TtsPlaybackState::Playing => self.pause_tts_playback(),
+                TtsPlaybackState::Paused => self.resume_tts_playback(ctx),
+                _ => self.start_tts_playback(ctx),
+            }
+        }
+        if ui
+            .add_enabled(
+                self.tts_analysis.is_some() && self.tts_playback_state != TtsPlaybackState::Stopped,
+                egui::Button::new("Stop"),
+            )
+            .clicked()
+        {
+            self.stop_tts_playback();
+        }
+        if ui
+            .add_enabled(
+                self.tts_analysis.is_some() && self.tts_active_sentence_index > 0,
+                egui::Button::new("Prev sentence"),
+            )
+            .clicked()
+        {
+            self.previous_tts_sentence(ctx);
+        }
+        if ui
+            .add_enabled(
+                self.tts_analysis.as_ref().is_some_and(|analysis| {
+                    self.tts_active_sentence_index + 1 < analysis.sentences.len()
+                }),
+                egui::Button::new("Next sentence"),
+            )
+            .clicked()
+        {
+            self.next_tts_sentence(ctx);
+        }
+        ui.checkbox(&mut self.tts_follow_mode, "Follow");
+
         if let Some(document) = &self.document {
             ui.separator();
             ui.label(format!(
@@ -962,6 +1278,13 @@ impl PdfizerApp {
 
         ui.collapsing("TTS diagnostics", |ui| {
             ui.label(format!("Status: {}", self.tts_analysis_status.label()));
+            ui.label(format!(
+                "Playback: {} | engine: {} | active sentence: {} | follow: {}",
+                self.tts_playback_state.label(),
+                self.tts_engine.label(),
+                self.tts_active_sentence_index + 1,
+                self.tts_follow_mode
+            ));
 
             if let Some(analysis) = &self.tts_analysis {
                 ui.label(format!(
@@ -986,6 +1309,20 @@ impl PdfizerApp {
                 if let Some(path) = &analysis.artifact_path {
                     ui.label(format!("Artifact: {}", path.display()));
                 }
+                if let Some(sentence) = self.active_sentence() {
+                    let mut sentence_text = sentence.text.clone();
+                    ui.label(format!(
+                        "Sentence page range: {}-{}",
+                        sentence.page_range.start_page + 1,
+                        sentence.page_range.end_page + 1
+                    ));
+                    ui.add(
+                        egui::TextEdit::multiline(&mut sentence_text)
+                            .desired_rows(3)
+                            .font(egui::TextStyle::Monospace)
+                            .interactive(false),
+                    );
+                }
             } else if matches!(self.tts_analysis_status, TtsAnalysisStatus::Idle) {
                 ui.label("No TTS analysis has been built for the current document yet.");
             }
@@ -993,6 +1330,30 @@ impl PdfizerApp {
             if let Ok(audio_cache_dir) = self.config.tts_audio_cache_dir() {
                 ui.label(format!("Audio cache dir: {}", audio_cache_dir.display()));
             }
+            let snapshot = tts::prefetch_snapshot(
+                self.tts_active_sentence_index,
+                {
+                    let mut indexes = self.tts_prepared_clips.keys().copied().collect::<Vec<_>>();
+                    indexes.sort_unstable();
+                    indexes
+                },
+                self.tts_prefetch_queue.clone(),
+                {
+                    let mut indexes = self.tts_failed_prefetch.keys().copied().collect::<Vec<_>>();
+                    indexes.sort_unstable();
+                    indexes
+                },
+                self.tts_prefetch_request_id,
+                self.tts_engine,
+            );
+            ui.label(format!(
+                "Prepared clips: {} | queued: {} | failed: {} | in flight: {} | prefetch request: {}",
+                snapshot.prepared_sentence_indexes.len(),
+                snapshot.queued_sentence_indexes.len(),
+                snapshot.failed_sentence_indexes.len(),
+                self.tts_prefetch_in_flight,
+                snapshot.request_id
+            ));
 
             if ui
                 .add_enabled(self.document.is_some() && self.config.tts.enabled, egui::Button::new("Rebuild TTS analysis"))
@@ -1707,6 +2068,7 @@ impl eframe::App for PdfizerApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         ctx.set_pixels_per_point(1.0);
         self.poll_tts_analysis();
+        self.advance_tts_clock(ctx);
         self.handle_shortcuts(ctx);
         self.process_tiled_jobs(ctx);
 

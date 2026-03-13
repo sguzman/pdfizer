@@ -33,12 +33,24 @@ Checked items reflect capabilities already present in this repository that reduc
 
 ### Tranche 2: Playback Runtime And Prefetch
 
-- [ ] Introduce the TTS engine abstraction.
-- [ ] Add play/pause/stop/seek controls.
+- [x] Introduce the TTS engine abstraction.
+- [x] Ship a dry-run backend that exercises runtime behavior without pretending real speech exists yet.
+- [x] Add play/pause controls.
+- [x] Add stop control.
+- [x] Add previous/next sentence controls.
+- [x] Add keyboard shortcuts for play/pause and sentence stepping.
+- [x] Track active sentence state independently from viewport state.
+- [x] Add a follow mode toggle for sentence-driven page navigation.
+- [x] Add bounded prefetch planning from the current sentence.
+- [x] Run sentence preparation on background worker threads.
+- [x] Cache prepared clip manifests under the TTS audio cache directory.
+- [x] Reuse prepared clip manifests if they already exist in cache.
+- [x] Add cancellation-by-request-id semantics so stale prefetch results are ignored.
+- [x] Keep playback state changes isolated from viewer rerender churn.
+- [x] Surface runtime diagnostics for playback state, prepared clips, queue depth, and failed preparation.
 - [ ] Add ahead-of-time sentence audio generation.
-- [ ] Add clip caching and invalidation.
-- [ ] Add cancellation-aware playback and prefetch workers.
-- [ ] Keep playback state changes isolated from viewer rerender churn.
+- [ ] Add real audio clip caching and invalidation.
+- [ ] Add true seek semantics beyond sentence-step navigation.
 
 ### Tranche 3: Geometry Sync And Highlighting
 

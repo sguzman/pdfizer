@@ -107,6 +107,83 @@ pub struct TtsAnalysisArtifacts {
     pub artifact_path: Option<PathBuf>,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TtsEngineKind {
+    DryRun,
+}
+
+impl TtsEngineKind {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::DryRun => "dry_run",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TtsPlaybackState {
+    Stopped,
+    Preparing,
+    Playing,
+    Paused,
+    Failed,
+}
+
+impl TtsPlaybackState {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Stopped => "stopped",
+            Self::Preparing => "preparing",
+            Self::Playing => "playing",
+            Self::Paused => "paused",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PreparedSentenceClip {
+    pub source_fingerprint: String,
+    pub sentence_id: u64,
+    pub sentence_index: usize,
+    pub engine: TtsEngineKind,
+    pub text: String,
+    pub cache_path: PathBuf,
+    pub estimated_duration_ms: u64,
+    pub word_count: usize,
+    pub generated_at_unix_secs: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TtsPrefetchSnapshot {
+    pub active_sentence_index: usize,
+    pub prepared_sentence_indexes: Vec<usize>,
+    pub queued_sentence_indexes: Vec<usize>,
+    pub failed_sentence_indexes: Vec<usize>,
+    pub request_id: u64,
+    pub engine: TtsEngineKind,
+}
+
+pub fn prefetch_snapshot(
+    active_sentence_index: usize,
+    prepared_sentence_indexes: Vec<usize>,
+    queued_sentence_indexes: Vec<usize>,
+    failed_sentence_indexes: Vec<usize>,
+    request_id: u64,
+    engine: TtsEngineKind,
+) -> TtsPrefetchSnapshot {
+    TtsPrefetchSnapshot {
+        active_sentence_index,
+        prepared_sentence_indexes,
+        queued_sentence_indexes,
+        failed_sentence_indexes,
+        request_id,
+        engine,
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum TtsWorkerMessage {
     Completed {
@@ -115,6 +192,15 @@ pub enum TtsWorkerMessage {
     },
     Failed {
         request_id: u64,
+        error: String,
+    },
+    PrefetchCompleted {
+        request_id: u64,
+        clip: PreparedSentenceClip,
+    },
+    PrefetchFailed {
+        request_id: u64,
+        sentence_index: usize,
         error: String,
     },
 }
@@ -141,6 +227,72 @@ pub fn persist_artifacts(config: &AppConfig, artifacts: &TtsAnalysisArtifacts) -
     fs::write(&path, contents)
         .with_context(|| format!("failed to write TTS artifacts to {}", path.display()))?;
     Ok(path)
+}
+
+pub fn build_prefetch_plan(
+    analysis: &TtsAnalysisArtifacts,
+    start_sentence_index: usize,
+    sentence_count: usize,
+) -> Vec<usize> {
+    let end = (start_sentence_index + sentence_count).min(analysis.sentences.len());
+    (start_sentence_index..end).collect()
+}
+
+pub fn prepare_sentence_clip(
+    config: &AppConfig,
+    analysis: &TtsAnalysisArtifacts,
+    sentence_index: usize,
+    engine: TtsEngineKind,
+) -> Result<PreparedSentenceClip> {
+    let sentence = analysis
+        .sentences
+        .get(sentence_index)
+        .with_context(|| format!("sentence index {sentence_index} is out of bounds"))?;
+    let cache_path = config.tts_audio_cache_dir()?.join(format!(
+        "{}-{}-{}.toml",
+        analysis.source_fingerprint,
+        sentence.id,
+        engine.label()
+    ));
+
+    if cache_path.exists() {
+        let contents = fs::read_to_string(&cache_path)
+            .with_context(|| format!("failed to read {}", cache_path.display()))?;
+        let cached = toml::from_str::<PreparedSentenceClip>(&contents)
+            .with_context(|| format!("failed to parse {}", cache_path.display()))?;
+        return Ok(cached);
+    }
+
+    let clip = PreparedSentenceClip {
+        source_fingerprint: analysis.source_fingerprint.clone(),
+        sentence_id: sentence.id,
+        sentence_index,
+        engine,
+        text: sentence.text.clone(),
+        cache_path: cache_path.clone(),
+        estimated_duration_ms: estimate_sentence_duration_ms(&sentence.text),
+        word_count: sentence.text.split_whitespace().count(),
+        generated_at_unix_secs: unix_timestamp_secs(),
+    };
+
+    if let Some(parent) = cache_path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    fs::write(&cache_path, toml::to_string_pretty(&clip)?)
+        .with_context(|| format!("failed to write {}", cache_path.display()))?;
+
+    Ok(clip)
+}
+
+pub fn estimate_sentence_duration_ms(text: &str) -> u64 {
+    let word_count = text.split_whitespace().count().max(1) as u64;
+    let punctuation_pause = text
+        .chars()
+        .filter(|ch| matches!(ch, '.' | ',' | ';' | ':' | '?' | '!'))
+        .count() as u64
+        * 120;
+    (word_count * 360 + punctuation_pause).clamp(900, 12_000)
 }
 
 #[instrument(skip(config, document))]
@@ -731,5 +883,43 @@ mod tests {
         let (mode, confidence) = classify_pdf_for_tts(2, &pages, &stats, &config);
         assert_eq!(mode, PdfTtsMode::HighTextTrust);
         assert!(confidence > 0.7);
+    }
+
+    #[test]
+    fn prefetch_plan_respects_window() {
+        let analysis = TtsAnalysisArtifacts {
+            source_path: PathBuf::from("fixture.pdf"),
+            source_fingerprint: "abc".into(),
+            generated_at_unix_secs: 0,
+            mode: PdfTtsMode::HighTextTrust,
+            confidence: 0.9,
+            tts_text: "a b c".into(),
+            sentences: (0..5)
+                .map(|index| SentencePlan {
+                    id: index as u64,
+                    text: format!("Sentence {index}."),
+                    range: TextRange {
+                        start: index,
+                        end: index + 1,
+                    },
+                    page_range: PageRange {
+                        start_page: 0,
+                        end_page: 0,
+                    },
+                })
+                .collect(),
+            pages: Vec::new(),
+            stats: NormalizationStats::default(),
+            artifact_path: None,
+        };
+
+        assert_eq!(build_prefetch_plan(&analysis, 2, 2), vec![2, 3]);
+        assert_eq!(build_prefetch_plan(&analysis, 4, 8), vec![4]);
+    }
+
+    #[test]
+    fn sentence_duration_estimate_has_reasonable_floor() {
+        assert!(estimate_sentence_duration_ms("Hi.") >= 900);
+        assert!(estimate_sentence_duration_ms("This is a somewhat longer sentence.") > 900);
     }
 }
