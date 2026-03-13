@@ -1,4 +1,4 @@
-mode = "prod"
+mode = "dev"
 
 [window]
 title = "Pdfizer"
@@ -14,7 +14,7 @@ preferred_config_name = "config/pdfizer.toml"
 reopen_last_document_on_launch = true
 
 [pdfium]
-library_path = ""
+library_path = "/win/linux/Code/rust/pdfizer/lib/pdfium/lib/libpdfium.so"
 library_env_var = "PDFIUM_DYNAMIC_LIB_PATH"
 
 [rendering]
