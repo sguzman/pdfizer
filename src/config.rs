@@ -240,6 +240,18 @@ impl AppConfig {
                 "tts.follow_center_on_target",
                 defaults.tts.follow_center_on_target,
             )?
+            .set_default(
+                "tts.exact_sync_min_score",
+                f64::from(defaults.tts.exact_sync_min_score),
+            )?
+            .set_default(
+                "tts.fuzzy_sync_min_score",
+                f64::from(defaults.tts.fuzzy_sync_min_score),
+            )?
+            .set_default(
+                "tts.block_sync_min_score",
+                f64::from(defaults.tts.block_sync_min_score),
+            )?
             .set_default("tts.audio_cache_dir", defaults.tts.audio_cache_dir.clone())?
             .set_default("tts.artifacts_dir", defaults.tts.artifacts_dir.clone())?
             .set_default(
@@ -736,6 +748,9 @@ pub struct TtsConfig {
     pub follow_visible_margin_ratio: f32,
     pub follow_preload_page_radius: usize,
     pub follow_center_on_target: bool,
+    pub exact_sync_min_score: f32,
+    pub fuzzy_sync_min_score: f32,
+    pub block_sync_min_score: f32,
     pub audio_cache_dir: String,
     pub artifacts_dir: String,
     pub sync_artifacts_dir: String,
@@ -791,6 +806,9 @@ impl Default for TtsConfig {
             follow_visible_margin_ratio: 0.18,
             follow_preload_page_radius: 1,
             follow_center_on_target: true,
+            exact_sync_min_score: 0.82,
+            fuzzy_sync_min_score: 0.58,
+            block_sync_min_score: 0.28,
             audio_cache_dir: "tts/audio".into(),
             artifacts_dir: "tts/artifacts".into(),
             sync_artifacts_dir: "tts/sync".into(),

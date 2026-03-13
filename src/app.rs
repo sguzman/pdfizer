@@ -76,6 +76,9 @@ pub struct PdfizerApp {
     tts_active_sentence_index: usize,
     tts_follow_mode: bool,
     tts_follow_pin_to_center: bool,
+    tts_highlights_enabled: bool,
+    tts_experimental_sync_enabled: bool,
+    tts_verbose_degraded_logging_enabled: bool,
     tts_prepared_clips: HashMap<usize, PreparedSentenceClip>,
     tts_sync_targets: HashMap<usize, SentenceSyncTarget>,
     tts_prefetch_queue: Vec<usize>,
@@ -209,6 +212,8 @@ impl PdfizerApp {
         let tts_enabled = config.tts.enabled;
         let tts_engine = TtsEngineKind::from_name(&config.tts.engine);
         let tts_follow_pin_to_center = config.tts.follow_center_on_target;
+        let tts_experimental_sync_enabled = config.tts.experimental_pdf_sync;
+        let tts_verbose_degraded_logging_enabled = config.tts.verbose_degraded_logging;
         let runtime = match PdfRuntime::new(&config) {
             Ok(runtime) => Some(runtime),
             Err(err) => {
@@ -277,6 +282,9 @@ impl PdfizerApp {
             tts_active_sentence_index: 0,
             tts_follow_mode: true,
             tts_follow_pin_to_center,
+            tts_highlights_enabled: true,
+            tts_experimental_sync_enabled,
+            tts_verbose_degraded_logging_enabled,
             tts_prepared_clips: HashMap::new(),
             tts_sync_targets: HashMap::new(),
             tts_prefetch_queue: Vec::new(),
@@ -407,7 +415,7 @@ impl PdfizerApp {
                 }) if request_id == self.tts_request_id => {
                     let policy = tts::evaluate_runtime_policy(&self.config, &artifacts);
                     if artifacts.mode != PdfTtsMode::HighTextTrust
-                        && self.config.tts.verbose_degraded_logging
+                        && self.tts_verbose_degraded_logging_enabled
                     {
                         warn!(
                             path = %artifacts.source_path.display(),
@@ -489,6 +497,20 @@ impl PdfizerApp {
                 {
                     self.tts_profile.sync.record(elapsed_ms as f64);
                     self.tts_profile.record_sync_confidence(target.confidence);
+                    self.record_sync_failure_counters(&target);
+                    debug!(
+                        sentence_index = target.sentence_index,
+                        sentence_id = target.sentence_id,
+                        confidence = %target.confidence.label(),
+                        score = target.score,
+                        text_similarity = target.score_breakdown.text_similarity,
+                        reading_order = target.score_breakdown.reading_order,
+                        geometry_compactness = target.score_breakdown.geometry_compactness,
+                        page_continuity = target.score_breakdown.page_continuity,
+                        rects = target.rects.len(),
+                        fallback_reason = %target.fallback_reason,
+                        "computed TTS sync mapping summary"
+                    );
                     self.tts_sync_targets.insert(target.sentence_index, target);
                     self.tts_sync_queue
                         .retain(|index| !self.tts_sync_targets.contains_key(index));
@@ -596,6 +618,27 @@ impl PdfizerApp {
         self.tts_playback_rx = Some(receiver);
     }
 
+    fn record_sync_failure_counters(&mut self, target: &SentenceSyncTarget) {
+        let wrong_page = self
+            .tts_analysis
+            .as_ref()
+            .and_then(|analysis| analysis.sentences.get(target.sentence_index))
+            .and_then(|sentence| {
+                target.page_index.map(|page_index| {
+                    page_index < sentence.page_range.start_page || page_index > sentence.page_range.end_page
+                })
+            })
+            .unwrap_or(false);
+        let distant_geometry = target.fallback_reason.contains("visually_implausible")
+            || target.fallback_reason.contains("rejected_visually_implausible_match");
+        let unmappable = target.confidence == SentenceSyncConfidence::Missing
+            || target.fallback_reason.contains("no_page_candidate")
+            || target.fallback_reason.contains("page_location_only");
+
+        self.tts_profile
+            .record_sync_failure(wrong_page, distant_geometry, unmappable);
+    }
+
     fn active_sentence(&self) -> Option<&crate::tts::SentencePlan> {
         self.tts_analysis
             .as_ref()
@@ -624,6 +667,56 @@ impl PdfizerApp {
         }
         self.tts_active_sentence_index = sentence_index;
         self.persist_session();
+    }
+
+    fn set_tts_cursor_to_nearest_sentence(
+        &mut self,
+        page_index: usize,
+        focus_rect: Option<PdfRectData>,
+    ) -> Option<usize> {
+        let sentence_index = self
+            .sentence_index_for_location(page_index, focus_rect)
+            .or_else(|| self.sentence_index_for_page(page_index))?;
+        self.set_tts_cursor_to_sentence_index(sentence_index);
+        Some(sentence_index)
+    }
+
+    fn sentence_index_for_location(
+        &self,
+        page_index: usize,
+        focus_rect: Option<PdfRectData>,
+    ) -> Option<usize> {
+        let analysis = self.tts_analysis.as_ref()?;
+        let focus_rect = focus_rect?;
+
+        let mut best: Option<(usize, f32)> = None;
+        for (sentence_index, sentence) in analysis.sentences.iter().enumerate() {
+            if sentence.page_range.start_page > page_index
+                || sentence.page_range.end_page < page_index
+            {
+                continue;
+            }
+
+            let Some(target) = self.effective_sync_target(sentence_index) else {
+                continue;
+            };
+            if target.page_index != Some(page_index) || target.rects.is_empty() {
+                continue;
+            }
+
+            let distance = target
+                .rects
+                .iter()
+                .map(|rect| rect_distance_score(*rect, focus_rect))
+                .fold(f32::INFINITY, f32::min);
+
+            match best {
+                Some((_, best_distance)) if distance >= best_distance => {}
+                _ => best = Some((sentence_index, distance)),
+            }
+        }
+
+        best.map(|(sentence_index, _)| sentence_index)
     }
 
     fn trace_active_sentence_origin(&self, action: &str) {
@@ -656,7 +749,61 @@ impl PdfizerApp {
     fn effective_sync_target(&self, sentence_index: usize) -> Option<SentenceSyncTarget> {
         let target = self.tts_sync_targets.get(&sentence_index)?;
         let policy = self.active_tts_policy()?;
-        Some(tts::apply_runtime_policy(target, policy))
+        let adapted = tts::apply_runtime_policy(target, policy);
+        Some(self.apply_local_sync_controls(adapted))
+    }
+
+    fn apply_local_sync_controls(&self, target: SentenceSyncTarget) -> SentenceSyncTarget {
+        let mut adapted = target;
+
+        if !self.tts_experimental_sync_enabled
+            && adapted.confidence == SentenceSyncConfidence::FuzzySentence
+        {
+            adapted.confidence = SentenceSyncConfidence::BlockFallback;
+            adapted.fallback_reason = format!(
+                "{}; experimental_fuzzy_sentence_sync_disabled",
+                adapted.fallback_reason
+            );
+        }
+
+        loop {
+            let threshold = match adapted.confidence {
+                SentenceSyncConfidence::ExactSentence => self.config.tts.exact_sync_min_score,
+                SentenceSyncConfidence::FuzzySentence => self.config.tts.fuzzy_sync_min_score,
+                SentenceSyncConfidence::BlockFallback => self.config.tts.block_sync_min_score,
+                SentenceSyncConfidence::PageFallback | SentenceSyncConfidence::Missing => 0.0,
+            };
+
+            if adapted.score >= threshold {
+                break;
+            }
+
+            let prior = adapted.confidence;
+            match adapted.confidence {
+                SentenceSyncConfidence::ExactSentence => {
+                    adapted.confidence = SentenceSyncConfidence::FuzzySentence;
+                }
+                SentenceSyncConfidence::FuzzySentence => {
+                    adapted.confidence = SentenceSyncConfidence::BlockFallback;
+                }
+                SentenceSyncConfidence::BlockFallback => {
+                    adapted.confidence = SentenceSyncConfidence::PageFallback;
+                    adapted.rects.clear();
+                    adapted.lineage.clear();
+                }
+                SentenceSyncConfidence::PageFallback | SentenceSyncConfidence::Missing => break,
+            }
+
+            adapted.fallback_reason = format!(
+                "{}; {} score_{:.2}_below_threshold_{:.2}",
+                adapted.fallback_reason,
+                prior.label(),
+                adapted.score,
+                threshold
+            );
+        }
+
+        adapted
     }
 
     fn sync_tts_sentence_to_current_page(&mut self) {
@@ -1059,6 +1206,14 @@ impl PdfizerApp {
             ctx.request_repaint_after(Duration::from_millis(40));
         } else if self.tts_prefetch_in_flight > 0 {
             self.tts_playback_state = TtsPlaybackState::Preparing;
+            self.tts_profile.playback_underruns += 1;
+            debug!(
+                sentence_index = self.tts_active_sentence_index,
+                prefetch_in_flight = self.tts_prefetch_in_flight,
+                prepared_clips = self.tts_prepared_clips.len(),
+                queued_clips = self.tts_prefetch_queue.len(),
+                "TTS playback waiting for prepared clip"
+            );
             ctx.request_repaint_after(Duration::from_millis(40));
         }
     }
@@ -1598,6 +1753,29 @@ impl PdfizerApp {
         ctx.request_repaint();
     }
 
+    fn navigate_to_sentence(
+        &mut self,
+        sentence_index: usize,
+        focus_rect: Option<PdfRectData>,
+        ctx: &egui::Context,
+    ) {
+        self.set_tts_cursor_to_sentence_index(sentence_index);
+        if let Some(target) = self.effective_sync_target(sentence_index) {
+            let page_index = target.page_index.unwrap_or(self.current_page);
+            let rect = focus_rect.or_else(|| target.rects.first().copied());
+            self.navigate_to_page(page_index, rect, ctx);
+            return;
+        }
+
+        if let Some(sentence) = self
+            .tts_analysis
+            .as_ref()
+            .and_then(|analysis| analysis.sentences.get(sentence_index))
+        {
+            self.navigate_to_page(sentence.page_range.start_page, focus_rect, ctx);
+        }
+    }
+
     fn page_focus_offset(&self, page_index: usize, rect: PdfRectData) -> Option<Vec2> {
         let size = self.page_image_size(page_index)?;
         let document = self.document.as_ref()?;
@@ -1945,6 +2123,12 @@ impl PdfizerApp {
             ui.add_enabled_ui(self.tts_follow_mode, |ui| {
                 ui.checkbox(&mut self.tts_follow_pin_to_center, "Pin");
             });
+            ui.checkbox(&mut self.tts_highlights_enabled, "Highlight");
+            ui.checkbox(&mut self.tts_experimental_sync_enabled, "Experimental sync");
+            ui.checkbox(
+                &mut self.tts_verbose_degraded_logging_enabled,
+                "Verbose degraded",
+            );
 
             if let Some(analysis) = self
                 .tts_analysis
@@ -1993,7 +2177,9 @@ impl PdfizerApp {
                 ));
 
                 if let Some(policy) = self.active_tts_policy() {
-                    if !policy.allow_rect_highlights || !policy.allow_sync_prefetch {
+                    if self.tts_verbose_degraded_logging_enabled
+                        && (!policy.allow_rect_highlights || !policy.allow_sync_prefetch)
+                    {
                         ui.colored_label(
                             Color32::YELLOW,
                             format!("Degraded mode: {}", policy.reason),
@@ -2156,12 +2342,14 @@ impl PdfizerApp {
         ui.collapsing("TTS diagnostics", |ui| {
             ui.label(format!("Status: {}", self.tts_analysis_status.label()));
             ui.label(format!(
-                "Playback: {} | engine: {} | active sentence: {} | follow: {} | pin: {}",
+                "Playback: {} | engine: {} | active sentence: {} | follow: {} | pin: {} | highlight: {} | experimental sync: {}",
                 self.tts_playback_state.label(),
                 self.tts_engine.label(),
                 self.tts_active_sentence_index + 1,
                 self.tts_follow_mode,
-                self.tts_follow_pin_to_center
+                self.tts_follow_pin_to_center,
+                self.tts_highlights_enabled,
+                self.tts_experimental_sync_enabled
             ));
 
             if let Some(analysis) = &self.tts_analysis {
@@ -2184,14 +2372,21 @@ impl PdfizerApp {
                     ));
                 }
                 if let Some(policy) = self.active_tts_policy() {
-                    ui.label(format!(
-                        "Policy: playback {} | rect highlight {} | sync prefetch {} | max sync {}",
+                ui.label(format!(
+                    "Policy: playback {} | rect highlight {} | sync prefetch {} | max sync {}",
                         policy.allow_playback,
                         policy.allow_rect_highlights,
                         policy.allow_sync_prefetch,
                         policy.max_sync_confidence.label()
                     ));
                     ui.label(format!("Policy reason: {}", policy.reason));
+                    ui.label(format!(
+                        "Local thresholds: exact {:.2} | fuzzy {:.2} | block {:.2} | verbose degraded {}",
+                        self.config.tts.exact_sync_min_score,
+                        self.config.tts.fuzzy_sync_min_score,
+                        self.config.tts.block_sync_min_score,
+                        self.tts_verbose_degraded_logging_enabled
+                    ));
                 }
                 ui.label(format!(
                     "Sentences: {} | chars: {} | text pages: {} / {}",
@@ -2468,6 +2663,8 @@ impl PdfizerApp {
         self.config = new_config.clone();
         self.tts_engine = TtsEngineKind::from_name(&new_config.tts.engine);
         self.tts_follow_pin_to_center = new_config.tts.follow_center_on_target;
+        self.tts_experimental_sync_enabled = new_config.tts.experimental_pdf_sync;
+        self.tts_verbose_degraded_logging_enabled = new_config.tts.verbose_degraded_logging;
         self.config_preview = new_config.config_preview();
         self.config_editor = self.config_preview.clone();
         self.status_message = Some(format!("Saved config to {}", path.display()));
@@ -2540,12 +2737,12 @@ impl PdfizerApp {
         self.search_results = results;
         self.active_search_result = (!self.search_results.is_empty()).then_some(0);
         if let Some(index) = self.active_search_result {
-            self.current_page = self.search_results[index].page_index;
-            if let Some(sentence_index) =
-                self.sentence_index_for_page(self.search_results[index].page_index)
-            {
-                self.set_tts_cursor_to_sentence_index(sentence_index);
-            }
+            let result = &self.search_results[index];
+            self.current_page = result.page_index;
+            self.set_tts_cursor_to_nearest_sentence(
+                result.page_index,
+                result.rects.first().copied(),
+            );
         }
         self.status_message = Some(format!("Found {} result(s)", self.search_results.len()));
     }
@@ -2557,10 +2754,13 @@ impl PdfizerApp {
             .map(|result| (result.page_index, result.rects.first().copied()))
         {
             self.active_search_result = Some(index);
-            if let Some(sentence_index) = self.sentence_index_for_page(page_index) {
-                self.set_tts_cursor_to_sentence_index(sentence_index);
+            if let Some(sentence_index) =
+                self.set_tts_cursor_to_nearest_sentence(page_index, focus_rect)
+            {
+                self.navigate_to_sentence(sentence_index, focus_rect, ctx);
+            } else {
+                self.navigate_to_page(page_index, focus_rect, ctx);
             }
-            self.navigate_to_page(page_index, focus_rect, ctx);
         }
     }
 
@@ -2739,6 +2939,18 @@ impl PdfizerApp {
 
         if response.clicked() {
             self.current_page = page_index;
+            let focus_rect = response.interact_pointer_pos().map(|pos| {
+                screen_pos_to_pdf_rect(
+                    pos,
+                    response.rect,
+                    &view.image,
+                    self.document
+                        .as_ref()
+                        .and_then(|document| document.page_size(page_index)),
+                )
+            });
+            let focus_rect = focus_rect.flatten();
+            self.set_tts_cursor_to_nearest_sentence(page_index, focus_rect);
             self.persist_session();
         }
 
@@ -2787,6 +2999,20 @@ impl PdfizerApp {
 
                         if response.clicked() {
                             self.current_page = page_index;
+                            let focus_rect = response
+                                .interact_pointer_pos()
+                                .map(|pos| {
+                                    screen_pos_to_pdf_rect(
+                                        pos,
+                                        response.rect,
+                                        &view.image,
+                                        self.document
+                                            .as_ref()
+                                            .and_then(|document| document.page_size(page_index)),
+                                    )
+                                })
+                                .flatten();
+                            self.set_tts_cursor_to_nearest_sentence(page_index, focus_rect);
                             self.persist_session();
                         }
 
@@ -2846,6 +3072,9 @@ impl PdfizerApp {
         response: &egui::Response,
         image: &ColorImage,
     ) {
+        if !self.tts_highlights_enabled {
+            return;
+        }
         let Some(target) = self.effective_sync_target(self.tts_active_sentence_index) else {
             return;
         };
@@ -3081,6 +3310,12 @@ impl PdfizerApp {
             compare_enabled: self.compare_enabled,
             compare_preset: self.compare_preset.as_str().into(),
             tts_sentence_id: self.active_sentence().map(|sentence| sentence.id),
+            focus_rect: self
+                .effective_sync_target(self.tts_active_sentence_index)
+                .and_then(|target| target.rects.first().copied()),
+            follow_mode: self.tts_follow_mode,
+            follow_pin_to_center: self.tts_follow_pin_to_center,
+            highlights_enabled: self.tts_highlights_enabled,
         };
 
         match self.config.session_path() {
@@ -3125,12 +3360,15 @@ impl PdfizerApp {
         self.compare_enabled = session.compare_enabled;
         self.compare_preset = RenderPreset::from_name(&session.compare_preset);
         self.pending_tts_sentence_id = session.tts_sentence_id;
+        self.tts_follow_mode = session.follow_mode;
+        self.tts_follow_pin_to_center = session.follow_pin_to_center;
+        self.tts_highlights_enabled = session.highlights_enabled;
 
         if let Some(document_path) = session.last_document {
             if document_path.exists() {
                 self.open_pdf(ctx, document_path);
                 self.current_page = session.last_page;
-                self.render_current_page(ctx);
+                self.navigate_to_page(session.last_page, session.focus_rect, ctx);
             }
         }
     }
@@ -3464,12 +3702,16 @@ struct TtsPerformanceProfile {
     sync: RollingStat,
     activation: RollingStat,
     prepare_cache_hits: u64,
+    playback_underruns: u64,
     stale_worker_results: u64,
     cancelled_worker_results: u64,
     cancelled_playback_events: u64,
     scheduler_queue_peak: u64,
     starvation_signals: u64,
     playback_worker_failures: u64,
+    wrong_page_rejects: u64,
+    distant_geometry_rejects: u64,
+    unmappable_sentences: u64,
     exact_sync_count: u64,
     fuzzy_sync_count: u64,
     block_sync_count: u64,
@@ -3485,6 +3727,18 @@ impl TtsPerformanceProfile {
             SentenceSyncConfidence::BlockFallback => self.block_sync_count += 1,
             SentenceSyncConfidence::PageFallback => self.page_sync_count += 1,
             SentenceSyncConfidence::Missing => self.missing_sync_count += 1,
+        }
+    }
+
+    fn record_sync_failure(&mut self, wrong_page: bool, distant_geometry: bool, unmappable: bool) {
+        if wrong_page {
+            self.wrong_page_rejects += 1;
+        }
+        if distant_geometry {
+            self.distant_geometry_rejects += 1;
+        }
+        if unmappable {
+            self.unmappable_sentences += 1;
         }
     }
 }
@@ -3558,6 +3812,14 @@ struct SessionState {
     compare_enabled: bool,
     compare_preset: String,
     tts_sentence_id: Option<u64>,
+    #[serde(default)]
+    focus_rect: Option<PdfRectData>,
+    #[serde(default = "default_true")]
+    follow_mode: bool,
+    #[serde(default = "default_true")]
+    follow_pin_to_center: bool,
+    #[serde(default = "default_true")]
+    highlights_enabled: bool,
 }
 
 fn render_metadata(ui: &mut Ui, metadata: &PdfMetadata) {
@@ -3703,6 +3965,42 @@ fn coalesce_line_rects(rects: &[Rect]) -> Vec<Rect> {
     lines
 }
 
+fn rect_distance_score(left: PdfRectData, right: PdfRectData) -> f32 {
+    let left_center_x = (left.left + left.right) * 0.5;
+    let left_center_y = (left.top + left.bottom) * 0.5;
+    let right_center_x = (right.left + right.right) * 0.5;
+    let right_center_y = (right.top + right.bottom) * 0.5;
+    let dx = left_center_x - right_center_x;
+    let dy = left_center_y - right_center_y;
+    (dx * dx + dy * dy).sqrt()
+}
+
+fn screen_pos_to_pdf_rect(
+    pos: Pos2,
+    response_rect: Rect,
+    _image: &ColorImage,
+    page_size: Option<PageSizePoints>,
+) -> Option<PdfRectData> {
+    let page_size = page_size?;
+    if response_rect.width() <= 0.0 || response_rect.height() <= 0.0 {
+        return None;
+    }
+
+    let u = ((pos.x - response_rect.left()) / response_rect.width()).clamp(0.0, 1.0);
+    let v = ((pos.y - response_rect.top()) / response_rect.height()).clamp(0.0, 1.0);
+    let x = page_size.width * u;
+    let y = page_size.height * (1.0 - v);
+    let pad_x = page_size.width * 0.01;
+    let pad_y = page_size.height * 0.01;
+
+    Some(PdfRectData {
+        left: (x - pad_x).max(0.0),
+        right: (x + pad_x).min(page_size.width),
+        top: (y + pad_y).min(page_size.height),
+        bottom: (y - pad_y).max(0.0),
+    })
+}
+
 fn pdf_rect_to_screen_rect(
     rect: PdfRectData,
     page_size: PageSizePoints,
@@ -3782,6 +4080,10 @@ fn unix_timestamp_secs() -> u64 {
         .as_secs()
 }
 
+fn default_true() -> bool {
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3819,5 +4121,29 @@ mod tests {
     fn centered_offset_clamps_at_zero() {
         assert_eq!(centered_offset(40.0, 200.0), 0.0);
         assert_eq!(centered_offset(400.0, 200.0), 300.0);
+    }
+
+    #[test]
+    fn rect_distance_score_prefers_nearby_rects() {
+        let anchor = PdfRectData {
+            left: 10.0,
+            right: 20.0,
+            top: 20.0,
+            bottom: 10.0,
+        };
+        let near = PdfRectData {
+            left: 12.0,
+            right: 22.0,
+            top: 22.0,
+            bottom: 12.0,
+        };
+        let far = PdfRectData {
+            left: 120.0,
+            right: 140.0,
+            top: 140.0,
+            bottom: 120.0,
+        };
+
+        assert!(rect_distance_score(anchor, near) < rect_distance_score(anchor, far));
     }
 }

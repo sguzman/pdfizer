@@ -241,20 +241,20 @@ Checked items reflect capabilities already present in this repository that reduc
 
 ## Phase 14: Search, Resume, And Navigation Semantics
 
-- [ ] Make TTS sentence ids, search hits, and resume positions interoperable.
-- [ ] Allow search result activation to update the TTS cursor.
-- [ ] Allow TTS cursor changes to update the visible PDF page and highlight region.
-- [ ] Persist resume state as canonical sentence id plus best-known PDF location metadata.
-- [ ] Support reverse navigation from PDF interaction to nearest sentence id.
-- [ ] Keep reopen deterministic after cache reuse or rebuild.
+- [x] Make TTS sentence ids, search hits, and resume positions interoperable.
+- [x] Allow search result activation to update the TTS cursor.
+- [x] Allow TTS cursor changes to update the visible PDF page and highlight region.
+- [x] Persist resume state as canonical sentence id plus best-known PDF location metadata.
+- [x] Support reverse navigation from PDF interaction to nearest sentence id.
+- [x] Keep reopen deterministic after cache reuse or rebuild.
 
 ## Phase 15: Config And Runtime Controls
 
-- [ ] Add a dedicated `[tts]` config section with engine, voice, rate, volume, prefetch, and cache settings.
-- [ ] Add feature gates for experimental PDF sync modes.
-- [ ] Add explicit thresholds for geometry confidence and fallback transitions.
+- [x] Add a dedicated `[tts]` config section with engine, voice, rate, volume, prefetch, and cache settings.
+- [x] Add feature gates for experimental PDF sync modes.
+- [x] Add explicit thresholds for geometry confidence and fallback transitions.
 - [x] Add separate config for OCR behavior and quality thresholds if OCR is enabled.
-- [ ] Expose runtime toggles for follow mode, highlight mode, and degraded-mode verbosity.
+- [x] Expose runtime toggles for follow mode, highlight mode, and degraded-mode verbosity.
 
 ## Phase 16: Observability And Diagnostics
 
