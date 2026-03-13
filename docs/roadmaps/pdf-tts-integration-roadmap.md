@@ -210,24 +210,24 @@ Checked items reflect capabilities already present in this repository that reduc
 
 ## Phase 11: Sentence Highlight Overlay
 
-- [ ] Render the active spoken sentence as a PDF overlay on top of the page image.
-- [ ] Support multi-rect sentence highlights.
-- [ ] Support line-level fallback highlight.
-- [ ] Support block-level fallback highlight.
-- [ ] Support page-active fallback when geometry is too weak for local highlights.
-- [ ] Keep highlight alignment stable through zoom, scroll, DPI changes, and rerender cycles.
-- [ ] Remove stale highlights immediately on seek, page jump, zoom change, or cache invalidation.
-- [ ] Allow highlight styling to be configured separately from search highlights.
+- [x] Render the active spoken sentence as a PDF overlay on top of the page image.
+- [x] Support multi-rect sentence highlights.
+- [x] Support line-level fallback highlight.
+- [x] Support block-level fallback highlight.
+- [x] Support page-active fallback when geometry is too weak for local highlights.
+- [x] Keep highlight alignment stable through zoom, scroll, DPI changes, and rerender cycles.
+- [x] Remove stale highlights immediately on seek, page jump, zoom change, or cache invalidation.
+- [x] Allow highlight styling to be configured separately from search highlights.
 
 ## Phase 12: Scroll Following And Viewport Stability
 
-- [ ] Auto-scroll only when playback moves outside a stable visible region.
-- [ ] Keep playback from fighting manual user scroll unless follow mode is enabled.
-- [ ] Support a pinned follow mode centered on the active sentence region.
-- [ ] Keep continuous view smooth while playback advances across pages.
-- [ ] Preload nearby page text layers and highlight artifacts around the active playback region.
-- [ ] Avoid full-document relayout or full-cache invalidation on each sentence advance.
-- [ ] Emit tracing for scroll trigger reason, old viewport, new viewport, and skipped auto-scroll decisions.
+- [x] Auto-scroll only when playback moves outside a stable visible region.
+- [x] Keep playback from fighting manual user scroll unless follow mode is enabled.
+- [x] Support a pinned follow mode centered on the active sentence region.
+- [x] Keep continuous view smooth while playback advances across pages.
+- [x] Preload nearby page text layers and highlight artifacts around the active playback region.
+- [x] Avoid full-document relayout or full-cache invalidation on each sentence advance.
+- [x] Emit tracing for scroll trigger reason, old viewport, new viewport, and skipped auto-scroll decisions.
 
 ## Phase 13: Rendering Performance Protection
 

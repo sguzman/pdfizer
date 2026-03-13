@@ -75,6 +75,7 @@ pub struct PdfizerApp {
     tts_playback_state: TtsPlaybackState,
     tts_active_sentence_index: usize,
     tts_follow_mode: bool,
+    tts_follow_pin_to_center: bool,
     tts_prepared_clips: HashMap<usize, PreparedSentenceClip>,
     tts_sync_targets: HashMap<usize, SentenceSyncTarget>,
     tts_prefetch_queue: Vec<usize>,
@@ -91,6 +92,8 @@ pub struct PdfizerApp {
     tts_playback_tx: Option<Sender<PlaybackCommand>>,
     tts_playback_rx: Option<Receiver<PlaybackEvent>>,
     tts_playback_command_id: u64,
+    single_viewport: ScrollViewport,
+    continuous_viewport: ScrollViewport,
     tts_profile: TtsPerformanceProfile,
 }
 
@@ -137,6 +140,21 @@ enum PlaybackEvent {
         cancel_token: u64,
         error: String,
     },
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct ScrollViewport {
+    offset: Vec2,
+    size: Vec2,
+    content_size: Vec2,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TtsHighlightKind {
+    ExactRects,
+    LineFallback,
+    BlockFallback,
+    PageFallback,
 }
 
 impl PdfizerApp {
@@ -190,6 +208,7 @@ impl PdfizerApp {
     pub fn new(cc: &eframe::CreationContext<'_>, config: AppConfig) -> Self {
         let tts_enabled = config.tts.enabled;
         let tts_engine = TtsEngineKind::from_name(&config.tts.engine);
+        let tts_follow_pin_to_center = config.tts.follow_center_on_target;
         let runtime = match PdfRuntime::new(&config) {
             Ok(runtime) => Some(runtime),
             Err(err) => {
@@ -257,6 +276,7 @@ impl PdfizerApp {
             tts_playback_state: TtsPlaybackState::Stopped,
             tts_active_sentence_index: 0,
             tts_follow_mode: true,
+            tts_follow_pin_to_center,
             tts_prepared_clips: HashMap::new(),
             tts_sync_targets: HashMap::new(),
             tts_prefetch_queue: Vec::new(),
@@ -273,6 +293,8 @@ impl PdfizerApp {
             tts_playback_tx: None,
             tts_playback_rx: None,
             tts_playback_command_id: 0,
+            single_viewport: ScrollViewport::default(),
+            continuous_viewport: ScrollViewport::default(),
             tts_profile: TtsPerformanceProfile::default(),
         };
 
@@ -1045,17 +1067,212 @@ impl PdfizerApp {
         if !self.tts_follow_mode {
             return;
         }
+        self.preload_tts_viewport_assets();
+
+        let Some((page_index, focus_rect, scroll_reason)) = self.active_sentence_focus_target()
+        else {
+            return;
+        };
+
+        match self.view_mode {
+            ViewMode::SinglePage => {
+                self.follow_single_page_target(page_index, focus_rect, scroll_reason, ctx)
+            }
+            ViewMode::Continuous => {
+                self.follow_continuous_target(page_index, focus_rect, scroll_reason, ctx)
+            }
+        }
+    }
+
+    fn active_sentence_focus_target(&self) -> Option<(usize, Option<PdfRectData>, &'static str)> {
         if let Some(target) = self.effective_sync_target(self.tts_active_sentence_index) {
-            self.navigate_to_page(
-                target.page_index.unwrap_or(self.current_page),
-                target.rects.first().copied(),
-                ctx,
+            let page_index = target.page_index.unwrap_or(self.current_page);
+            let focus_rect = target.rects.first().copied();
+            let reason = match target.confidence {
+                SentenceSyncConfidence::ExactSentence => "exact_sentence_sync",
+                SentenceSyncConfidence::FuzzySentence => "fuzzy_sentence_sync",
+                SentenceSyncConfidence::BlockFallback => "block_fallback_sync",
+                SentenceSyncConfidence::PageFallback => "page_fallback_sync",
+                SentenceSyncConfidence::Missing => "missing_sync_page_range",
+            };
+            return Some((page_index, focus_rect, reason));
+        }
+
+        self.active_sentence()
+            .map(|sentence| (sentence.page_range.start_page, None, "page_range_follow"))
+    }
+
+    fn preload_tts_viewport_assets(&mut self) {
+        let Some(document) = &self.document else {
+            return;
+        };
+        let Some(sentence) = self.active_sentence() else {
+            return;
+        };
+
+        let radius = self.config.tts.follow_preload_page_radius;
+        let start_page = sentence.page_range.start_page.saturating_sub(radius);
+        let end_page = (sentence.page_range.end_page + radius)
+            .min(document.metadata.page_count.saturating_sub(1));
+
+        for page_index in start_page..=end_page {
+            if !self.text_segment_cache.contains_key(&page_index) {
+                if let Ok(segments) = document.text_segments_for_page(page_index) {
+                    self.text_segment_cache.insert(page_index, segments);
+                }
+            }
+
+            if !self.text_rect_cache.contains_key(&page_index) {
+                if let Ok(rects) = document.text_rects_for_page(page_index) {
+                    self.text_rect_cache.insert(page_index, rects);
+                }
+            }
+        }
+    }
+
+    fn follow_single_page_target(
+        &mut self,
+        page_index: usize,
+        focus_rect: Option<PdfRectData>,
+        reason: &'static str,
+        ctx: &egui::Context,
+    ) {
+        if self.current_page != page_index {
+            self.navigate_to_page(page_index, focus_rect, ctx);
+            return;
+        }
+
+        let old_offset = self.single_scroll_offset;
+        let viewport_size = self.single_viewport.size;
+        let Some(target_offset) = focus_rect
+            .and_then(|rect| self.page_focus_offset(page_index, rect))
+            .or(Some(Vec2::ZERO))
+        else {
+            return;
+        };
+
+        if self.viewport_contains_target(
+            old_offset,
+            viewport_size,
+            target_offset,
+            self.config.tts.follow_visible_margin_ratio,
+        ) {
+            debug!(
+                reason,
+                page_index,
+                old_x = old_offset.x,
+                old_y = old_offset.y,
+                target_x = target_offset.x,
+                target_y = target_offset.y,
+                "skipped TTS auto-scroll because target is already in the stable single-page region"
             );
             return;
         }
-        if let Some(sentence) = self.active_sentence() {
-            self.navigate_to_page(sentence.page_range.start_page, None, ctx);
+
+        let new_offset = if self.tts_follow_pin_to_center {
+            Vec2::new(
+                centered_offset(target_offset.x, viewport_size.x),
+                centered_offset(target_offset.y, viewport_size.y),
+            )
+        } else {
+            target_offset
+        };
+        let max_x = (self.single_viewport.content_size.x - viewport_size.x).max(0.0);
+        let max_y = (self.single_viewport.content_size.y - viewport_size.y).max(0.0);
+        let new_offset = Vec2::new(
+            new_offset.x.clamp(0.0, max_x),
+            new_offset.y.clamp(0.0, max_y),
+        );
+        debug!(
+            reason,
+            page_index,
+            old_x = old_offset.x,
+            old_y = old_offset.y,
+            new_x = new_offset.x,
+            new_y = new_offset.y,
+            "applied TTS auto-scroll in single-page view"
+        );
+        self.single_scroll_offset = new_offset;
+        self.persist_session();
+        ctx.request_repaint();
+    }
+
+    fn follow_continuous_target(
+        &mut self,
+        page_index: usize,
+        focus_rect: Option<PdfRectData>,
+        reason: &'static str,
+        ctx: &egui::Context,
+    ) {
+        self.current_page = page_index;
+        let old_offset = self.continuous_scroll_offset;
+        let viewport_size = self.continuous_viewport.size;
+        let target_y = focus_rect
+            .and_then(|rect| self.continuous_focus_offset(page_index, rect))
+            .unwrap_or_else(|| self.continuous_page_top(page_index));
+
+        if self.axis_contains_target(
+            old_offset.y,
+            viewport_size.y,
+            target_y,
+            self.config.tts.follow_visible_margin_ratio,
+        ) {
+            debug!(
+                reason,
+                page_index,
+                old_y = old_offset.y,
+                target_y,
+                "skipped TTS auto-scroll because target is already in the stable continuous region"
+            );
+            self.persist_session();
+            return;
         }
+
+        let new_y = if self.tts_follow_pin_to_center {
+            centered_offset(target_y, viewport_size.y)
+        } else {
+            target_y.max(0.0)
+        };
+        let max_y = (self.continuous_viewport.content_size.y - viewport_size.y).max(0.0);
+        let new_y = new_y.clamp(0.0, max_y);
+        debug!(
+            reason,
+            page_index,
+            old_y = old_offset.y,
+            new_y,
+            target_y,
+            "applied TTS auto-scroll in continuous view"
+        );
+        self.continuous_scroll_offset = Vec2::new(0.0, new_y.max(0.0));
+        self.persist_session();
+        ctx.request_repaint();
+    }
+
+    fn viewport_contains_target(
+        &self,
+        offset: Vec2,
+        viewport_size: Vec2,
+        target: Vec2,
+        margin_ratio: f32,
+    ) -> bool {
+        self.axis_contains_target(offset.x, viewport_size.x, target.x, margin_ratio)
+            && self.axis_contains_target(offset.y, viewport_size.y, target.y, margin_ratio)
+    }
+
+    fn axis_contains_target(
+        &self,
+        offset: f32,
+        viewport_size: f32,
+        target: f32,
+        margin_ratio: f32,
+    ) -> bool {
+        if viewport_size <= 0.0 {
+            return false;
+        }
+        let margin = (viewport_size * margin_ratio).clamp(24.0, viewport_size * 0.45);
+        let min = offset + margin;
+        let max = offset + viewport_size - margin;
+        target >= min && target <= max
     }
 
     fn advance_tts_clock(&mut self, ctx: &egui::Context) {
@@ -1725,6 +1942,9 @@ impl PdfizerApp {
 
             ui.separator();
             ui.checkbox(&mut self.tts_follow_mode, "Follow");
+            ui.add_enabled_ui(self.tts_follow_mode, |ui| {
+                ui.checkbox(&mut self.tts_follow_pin_to_center, "Pin");
+            });
 
             if let Some(analysis) = self
                 .tts_analysis
@@ -1936,11 +2156,12 @@ impl PdfizerApp {
         ui.collapsing("TTS diagnostics", |ui| {
             ui.label(format!("Status: {}", self.tts_analysis_status.label()));
             ui.label(format!(
-                "Playback: {} | engine: {} | active sentence: {} | follow: {}",
+                "Playback: {} | engine: {} | active sentence: {} | follow: {} | pin: {}",
                 self.tts_playback_state.label(),
                 self.tts_engine.label(),
                 self.tts_active_sentence_index + 1,
-                self.tts_follow_mode
+                self.tts_follow_mode,
+                self.tts_follow_pin_to_center
             ));
 
             if let Some(analysis) = &self.tts_analysis {
@@ -2115,6 +2336,17 @@ impl PdfizerApp {
                 self.tts_profile.page_sync_count,
                 self.tts_profile.missing_sync_count
             ));
+            ui.label(format!(
+                "Viewports: single {:.0}x{:.0} @ ({:.0}, {:.0}) | continuous {:.0}x{:.0} @ ({:.0}, {:.0})",
+                self.single_viewport.size.x,
+                self.single_viewport.size.y,
+                self.single_viewport.offset.x,
+                self.single_viewport.offset.y,
+                self.continuous_viewport.size.x,
+                self.continuous_viewport.size.y,
+                self.continuous_viewport.offset.x,
+                self.continuous_viewport.offset.y
+            ));
 
             if ui
                 .add_enabled(self.document.is_some() && self.config.tts.enabled, egui::Button::new("Rebuild TTS analysis"))
@@ -2235,6 +2467,7 @@ impl PdfizerApp {
 
         self.config = new_config.clone();
         self.tts_engine = TtsEngineKind::from_name(&new_config.tts.engine);
+        self.tts_follow_pin_to_center = new_config.tts.follow_center_on_target;
         self.config_preview = new_config.config_preview();
         self.config_editor = self.config_preview.clone();
         self.status_message = Some(format!("Saved config to {}", path.display()));
@@ -2472,6 +2705,11 @@ impl PdfizerApp {
                     ui.add_space(14.0);
                 }
             });
+        self.continuous_viewport = ScrollViewport {
+            offset: output.state.offset,
+            size: output.inner_rect.size(),
+            content_size: output.content_size,
+        };
         self.continuous_scroll_offset = output.state.offset;
     }
 
@@ -2558,6 +2796,11 @@ impl PdfizerApp {
                         }
                     });
                 self.single_scroll_offset = output.state.offset;
+                self.single_viewport = ScrollViewport {
+                    offset: output.state.offset,
+                    size: output.inner_rect.size(),
+                    content_size: output.content_size,
+                };
             });
     }
 
@@ -2606,61 +2849,84 @@ impl PdfizerApp {
         let Some(target) = self.effective_sync_target(self.tts_active_sentence_index) else {
             return;
         };
-        if target.page_index != Some(page_index)
-            || target.confidence == SentenceSyncConfidence::Missing
+        if target.page_index != Some(page_index) {
+            return;
+        }
+
+        let kind = self.tts_highlight_kind(&target);
+        let (fill, stroke) = self.tts_highlight_palette(kind);
+        let stroke_width = self.config.tts.highlight_stroke_width;
+
+        for highlight in self.tts_highlight_screen_rects(kind, &target, page_index, response, image)
         {
-            return;
-        }
-
-        let Some(document) = &self.document else {
-            return;
-        };
-        let Some(page_size) = document.page_size(page_index) else {
-            return;
-        };
-
-        let fill = match target.confidence {
-            SentenceSyncConfidence::ExactSentence => {
-                Color32::from_rgba_premultiplied(255, 120, 80, 56)
-            }
-            SentenceSyncConfidence::FuzzySentence => {
-                Color32::from_rgba_premultiplied(255, 176, 80, 48)
-            }
-            SentenceSyncConfidence::BlockFallback => {
-                Color32::from_rgba_premultiplied(255, 220, 80, 40)
-            }
-            SentenceSyncConfidence::PageFallback | SentenceSyncConfidence::Missing => {
-                Color32::from_rgba_premultiplied(160, 160, 160, 24)
-            }
-        };
-        let stroke = match target.confidence {
-            SentenceSyncConfidence::ExactSentence => Color32::from_rgb(255, 120, 80),
-            SentenceSyncConfidence::FuzzySentence => Color32::from_rgb(255, 176, 80),
-            SentenceSyncConfidence::BlockFallback => Color32::from_rgb(255, 220, 80),
-            SentenceSyncConfidence::PageFallback | SentenceSyncConfidence::Missing => {
-                Color32::from_rgb(180, 180, 180)
-            }
-        };
-
-        if target.rects.is_empty() {
-            ui.painter().rect_stroke(
-                response.rect.shrink2(Vec2::splat(6.0)),
-                0.0,
-                egui::Stroke::new(2.0, stroke),
-                egui::StrokeKind::Outside,
-            );
-            return;
-        }
-
-        for rect in &target.rects {
-            let highlight = pdf_rect_to_screen_rect(*rect, page_size, response.rect, image);
-            ui.painter().rect_filled(highlight, 0.0, fill);
+            ui.painter().rect_filled(highlight, 2.0, fill);
             ui.painter().rect_stroke(
                 highlight,
-                0.0,
-                egui::Stroke::new(2.0, stroke),
+                2.0,
+                egui::Stroke::new(stroke_width, stroke),
                 egui::StrokeKind::Outside,
             );
+        }
+    }
+
+    fn tts_highlight_kind(&self, target: &SentenceSyncTarget) -> TtsHighlightKind {
+        match target.confidence {
+            SentenceSyncConfidence::ExactSentence => TtsHighlightKind::ExactRects,
+            SentenceSyncConfidence::FuzzySentence => TtsHighlightKind::LineFallback,
+            SentenceSyncConfidence::BlockFallback => TtsHighlightKind::BlockFallback,
+            SentenceSyncConfidence::PageFallback | SentenceSyncConfidence::Missing => {
+                TtsHighlightKind::PageFallback
+            }
+        }
+    }
+
+    fn tts_highlight_palette(&self, kind: TtsHighlightKind) -> (Color32, Color32) {
+        let fill = match kind {
+            TtsHighlightKind::ExactRects => &self.config.tts.highlight_exact_rgba,
+            TtsHighlightKind::LineFallback => &self.config.tts.highlight_fuzzy_rgba,
+            TtsHighlightKind::BlockFallback => &self.config.tts.highlight_block_rgba,
+            TtsHighlightKind::PageFallback => &self.config.tts.highlight_page_rgba,
+        };
+        let fill = parse_rgba_hex(fill).unwrap_or(match kind {
+            TtsHighlightKind::ExactRects => Color32::from_rgba_premultiplied(255, 120, 80, 56),
+            TtsHighlightKind::LineFallback => Color32::from_rgba_premultiplied(255, 176, 80, 48),
+            TtsHighlightKind::BlockFallback => Color32::from_rgba_premultiplied(255, 220, 80, 44),
+            TtsHighlightKind::PageFallback => Color32::from_rgba_premultiplied(180, 180, 180, 32),
+        });
+        let stroke = Color32::from_rgba_premultiplied(fill.r(), fill.g(), fill.b(), 255);
+        (fill, stroke)
+    }
+
+    fn tts_highlight_screen_rects(
+        &self,
+        kind: TtsHighlightKind,
+        target: &SentenceSyncTarget,
+        page_index: usize,
+        response: &egui::Response,
+        image: &ColorImage,
+    ) -> Vec<Rect> {
+        let Some(document) = &self.document else {
+            return Vec::new();
+        };
+        let Some(page_size) = document.page_size(page_index) else {
+            return Vec::new();
+        };
+
+        let rects = target
+            .rects
+            .iter()
+            .map(|rect| pdf_rect_to_screen_rect(*rect, page_size, response.rect, image))
+            .collect::<Vec<_>>();
+
+        match kind {
+            TtsHighlightKind::ExactRects => rects,
+            TtsHighlightKind::LineFallback => coalesce_line_rects(&rects),
+            TtsHighlightKind::BlockFallback => bounding_rects(&rects).into_iter().collect(),
+            TtsHighlightKind::PageFallback => vec![
+                response
+                    .rect
+                    .shrink2(Vec2::splat(self.config.tts.highlight_page_margin)),
+            ],
         }
     }
 
@@ -3355,6 +3621,88 @@ fn scaled_page_height(size: PageSizePoints, zoom: f32) -> i32 {
     ((size.height * zoom).round() as i32).max(1)
 }
 
+fn centered_offset(target: f32, viewport_size: f32) -> f32 {
+    if viewport_size <= 0.0 {
+        return target.max(0.0);
+    }
+    (target - viewport_size * 0.5).max(0.0)
+}
+
+fn parse_rgba_hex(value: &str) -> Option<Color32> {
+    let hex = value.trim().trim_start_matches('#');
+    let bytes = match hex.len() {
+        6 => u32::from_str_radix(hex, 16).ok().map(|value| {
+            [
+                ((value >> 16) & 0xff) as u8,
+                ((value >> 8) & 0xff) as u8,
+                (value & 0xff) as u8,
+                0xff,
+            ]
+        }),
+        8 => u32::from_str_radix(hex, 16).ok().map(|value| {
+            [
+                ((value >> 24) & 0xff) as u8,
+                ((value >> 16) & 0xff) as u8,
+                ((value >> 8) & 0xff) as u8,
+                (value & 0xff) as u8,
+            ]
+        }),
+        _ => None,
+    }?;
+    Some(Color32::from_rgba_premultiplied(
+        bytes[0], bytes[1], bytes[2], bytes[3],
+    ))
+}
+
+fn bounding_rects(rects: &[Rect]) -> Option<Rect> {
+    let first = *rects.first()?;
+    Some(rects.iter().skip(1).fold(first, |acc, rect| {
+        Rect::from_min_max(
+            Pos2::new(acc.left().min(rect.left()), acc.top().min(rect.top())),
+            Pos2::new(
+                acc.right().max(rect.right()),
+                acc.bottom().max(rect.bottom()),
+            ),
+        )
+    }))
+}
+
+fn coalesce_line_rects(rects: &[Rect]) -> Vec<Rect> {
+    if rects.is_empty() {
+        return Vec::new();
+    }
+
+    let mut sorted = rects.to_vec();
+    sorted.sort_by(|left, right| {
+        left.center()
+            .y
+            .partial_cmp(&right.center().y)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    let mut lines: Vec<Rect> = Vec::new();
+    for rect in sorted {
+        if let Some(existing) = lines.last_mut() {
+            let tolerance = existing.height().max(rect.height()) * 0.6;
+            if (existing.center().y - rect.center().y).abs() <= tolerance {
+                *existing = Rect::from_min_max(
+                    Pos2::new(
+                        existing.left().min(rect.left()),
+                        existing.top().min(rect.top()),
+                    ),
+                    Pos2::new(
+                        existing.right().max(rect.right()),
+                        existing.bottom().max(rect.bottom()),
+                    ),
+                );
+                continue;
+            }
+        }
+        lines.push(rect);
+    }
+    lines
+}
+
 fn pdf_rect_to_screen_rect(
     rect: PdfRectData,
     page_size: PageSizePoints,
@@ -3432,4 +3780,44 @@ fn unix_timestamp_secs() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_rgba_hex_supports_rgb_and_rgba() {
+        let rgb = parse_rgba_hex("#112233").expect("rgb color should parse");
+        assert_eq!(
+            [rgb.r(), rgb.g(), rgb.b(), rgb.a()],
+            [0x11, 0x22, 0x33, 0xff]
+        );
+
+        let rgba = parse_rgba_hex("#44556677").expect("rgba color should parse");
+        assert_eq!(
+            [rgba.r(), rgba.g(), rgba.b(), rgba.a()],
+            [0x44, 0x55, 0x66, 0x77]
+        );
+    }
+
+    #[test]
+    fn coalesce_line_rects_merges_adjacent_rows() {
+        let rects = vec![
+            Rect::from_min_max(Pos2::new(10.0, 10.0), Pos2::new(30.0, 20.0)),
+            Rect::from_min_max(Pos2::new(32.0, 11.0), Pos2::new(60.0, 19.0)),
+            Rect::from_min_max(Pos2::new(12.0, 40.0), Pos2::new(42.0, 50.0)),
+        ];
+
+        let lines = coalesce_line_rects(&rects);
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].left() <= 10.0);
+        assert!(lines[0].right() >= 60.0);
+    }
+
+    #[test]
+    fn centered_offset_clamps_at_zero() {
+        assert_eq!(centered_offset(40.0, 200.0), 0.0);
+        assert_eq!(centered_offset(400.0, 200.0), 300.0);
+    }
 }

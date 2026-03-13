@@ -228,6 +228,18 @@ impl AppConfig {
                 "tts.sentence_pause_ms",
                 defaults.tts.sentence_pause_ms as i64,
             )?
+            .set_default(
+                "tts.follow_visible_margin_ratio",
+                f64::from(defaults.tts.follow_visible_margin_ratio),
+            )?
+            .set_default(
+                "tts.follow_preload_page_radius",
+                defaults.tts.follow_preload_page_radius as i64,
+            )?
+            .set_default(
+                "tts.follow_center_on_target",
+                defaults.tts.follow_center_on_target,
+            )?
             .set_default("tts.audio_cache_dir", defaults.tts.audio_cache_dir.clone())?
             .set_default("tts.artifacts_dir", defaults.tts.artifacts_dir.clone())?
             .set_default(
@@ -237,6 +249,30 @@ impl AppConfig {
             .set_default(
                 "tts.ocr_artifacts_dir",
                 defaults.tts.ocr_artifacts_dir.clone(),
+            )?
+            .set_default(
+                "tts.highlight_exact_rgba",
+                defaults.tts.highlight_exact_rgba.clone(),
+            )?
+            .set_default(
+                "tts.highlight_fuzzy_rgba",
+                defaults.tts.highlight_fuzzy_rgba.clone(),
+            )?
+            .set_default(
+                "tts.highlight_block_rgba",
+                defaults.tts.highlight_block_rgba.clone(),
+            )?
+            .set_default(
+                "tts.highlight_page_rgba",
+                defaults.tts.highlight_page_rgba.clone(),
+            )?
+            .set_default(
+                "tts.highlight_stroke_width",
+                f64::from(defaults.tts.highlight_stroke_width),
+            )?
+            .set_default(
+                "tts.highlight_page_margin",
+                f64::from(defaults.tts.highlight_page_margin),
             )?
             .set_default(
                 "tts.experimental_pdf_sync",
@@ -697,10 +733,19 @@ pub struct TtsConfig {
     pub active_latency_budget_ms: u64,
     pub prefetch_duration_budget_ms: u64,
     pub sentence_pause_ms: u64,
+    pub follow_visible_margin_ratio: f32,
+    pub follow_preload_page_radius: usize,
+    pub follow_center_on_target: bool,
     pub audio_cache_dir: String,
     pub artifacts_dir: String,
     pub sync_artifacts_dir: String,
     pub ocr_artifacts_dir: String,
+    pub highlight_exact_rgba: String,
+    pub highlight_fuzzy_rgba: String,
+    pub highlight_block_rgba: String,
+    pub highlight_page_rgba: String,
+    pub highlight_stroke_width: f32,
+    pub highlight_page_margin: f32,
     pub experimental_pdf_sync: bool,
     pub verbose_degraded_logging: bool,
     pub min_chars_per_text_page: usize,
@@ -743,10 +788,19 @@ impl Default for TtsConfig {
             active_latency_budget_ms: 120,
             prefetch_duration_budget_ms: 30_000,
             sentence_pause_ms: 140,
+            follow_visible_margin_ratio: 0.18,
+            follow_preload_page_radius: 1,
+            follow_center_on_target: true,
             audio_cache_dir: "tts/audio".into(),
             artifacts_dir: "tts/artifacts".into(),
             sync_artifacts_dir: "tts/sync".into(),
             ocr_artifacts_dir: "tts/ocr".into(),
+            highlight_exact_rgba: "#FF785038".into(),
+            highlight_fuzzy_rgba: "#FFB05030".into(),
+            highlight_block_rgba: "#FFDC502C".into(),
+            highlight_page_rgba: "#B4B4B420".into(),
+            highlight_stroke_width: 2.0,
+            highlight_page_margin: 6.0,
             experimental_pdf_sync: false,
             verbose_degraded_logging: true,
             min_chars_per_text_page: 80,
