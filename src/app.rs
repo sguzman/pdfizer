@@ -1,20 +1,27 @@
 use std::{
     collections::HashMap,
     fs,
+    num::{NonZeroU16, NonZeroU32},
     path::PathBuf,
     sync::mpsc::{self, Receiver, Sender, TryRecvError},
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use anyhow::{Context as _, Result};
+use anyhow::{Context as _, Result, anyhow};
 use eframe::egui::{
     self, Color32, ColorImage, Key, Label, Pos2, Rect, RichText, ScrollArea, Sense, Slider,
     TextureHandle, TextureOptions, Ui, UiBuilder, Vec2,
 };
 use rfd::FileDialog;
-use rodio::{Decoder, DeviceSinkBuilder, MixerDeviceSink, Player};
+use rodio::{
+    DeviceSinkBuilder, MixerDeviceSink, Player, Source, buffer::SamplesBuffer, source::Zero,
+};
 use serde::{Deserialize, Serialize};
+use sonic_rs_sys::{
+    sonicCreateStream, sonicDestroyStream, sonicFlushStream, sonicReadShortFromStream,
+    sonicSetChordPitch, sonicSetPitch, sonicSetSpeed, sonicWriteShortToStream,
+};
 use tracing::{debug, error, info, instrument, warn};
 
 use crate::{
@@ -113,7 +120,8 @@ enum PlaybackCommand {
         cancel_token: u64,
         audio_path: Option<PathBuf>,
         volume: f32,
-        rate: f32,
+        playback_speed: f32,
+        pause_after: Duration,
     },
     Pause {
         command_id: u64,
@@ -1254,6 +1262,37 @@ impl PdfizerApp {
         Some(self.apply_local_sync_controls(adapted))
     }
 
+    fn ensure_active_sentence_sync_target(&mut self) {
+        let Some(analysis) = self.tts_analysis.clone() else {
+            return;
+        };
+        if self
+            .tts_sync_targets
+            .contains_key(&self.tts_active_sentence_index)
+        {
+            return;
+        }
+        let Some(policy) = self.active_tts_policy() else {
+            return;
+        };
+        if !policy.allow_sync_prefetch {
+            return;
+        }
+
+        match tts::compute_sentence_sync(&self.config, &analysis, self.tts_active_sentence_index) {
+            Ok(target) => {
+                self.tts_profile.record_sync_confidence(target.confidence);
+                self.record_sync_failure_counters(&target);
+                self.tts_sync_targets
+                    .insert(self.tts_active_sentence_index, target);
+            }
+            Err(err) => {
+                self.tts_failed_sync
+                    .insert(self.tts_active_sentence_index, err.to_string());
+            }
+        }
+    }
+
     fn apply_local_sync_controls(&self, target: SentenceSyncTarget) -> SentenceSyncTarget {
         let mut adapted = target;
 
@@ -1392,7 +1431,7 @@ impl PdfizerApp {
         }
     }
 
-    fn start_tts_prefetch(&mut self) {
+    fn start_tts_prefetch(&mut self, force_restart: bool) {
         let Some(analysis) = self.tts_analysis.clone() else {
             return;
         };
@@ -1400,8 +1439,14 @@ impl PdfizerApp {
             return;
         };
 
-        let cancel_token = self.cancel_tts_work("prefetch_restart");
-        self.tts_prefetch_request_id = self.tts_prefetch_request_id.wrapping_add(1);
+        let cancel_token = if force_restart {
+            self.cancel_tts_work("prefetch_restart")
+        } else {
+            self.tts_cancel_token
+        };
+        if force_restart || self.tts_prefetch_request_id == 0 {
+            self.tts_prefetch_request_id = self.tts_prefetch_request_id.wrapping_add(1);
+        }
         let request_id = self.tts_prefetch_request_id;
         let settings = tts::TtsSynthesisSettings::from_config(&self.config);
         let plan = tts::build_prefetch_plan_with_budget(
@@ -1412,14 +1457,22 @@ impl PdfizerApp {
             &settings,
         );
 
-        self.tts_prefetch_queue = plan
+        let new_prefetch: Vec<_> = plan
             .sentence_indexes
             .iter()
             .copied()
-            .filter(|index| !self.tts_prepared_clips.contains_key(index))
+            .filter(|index| {
+                !self.tts_prepared_clips.contains_key(index)
+                    && !self.tts_prefetch_queue.contains(index)
+            })
             .collect();
-        self.tts_failed_prefetch.clear();
-        self.tts_prefetch_in_flight = self.tts_prefetch_queue.len();
+        if force_restart {
+            self.tts_failed_prefetch.clear();
+            self.tts_prefetch_queue.clear();
+            self.tts_prefetch_in_flight = 0;
+        }
+        self.tts_prefetch_queue.extend(new_prefetch.iter().copied());
+        self.tts_prefetch_in_flight += new_prefetch.len();
         self.enforce_tts_runtime_budget();
         self.tts_profile.scheduler_queue_peak = self
             .tts_profile
@@ -1452,7 +1505,7 @@ impl PdfizerApp {
         }
 
         let sender = self.ensure_tts_worker_channel();
-        for sentence_index in self.tts_prefetch_queue.clone() {
+        for sentence_index in new_prefetch {
             let config = self.config.clone();
             let analysis = analysis.clone();
             let sender = sender.clone();
@@ -1484,20 +1537,27 @@ impl PdfizerApp {
             return;
         }
 
-        self.tts_sync_queue = tts::build_sync_prefetch_plan(
+        let new_sync: Vec<_> = tts::build_sync_prefetch_plan(
             &analysis,
             self.tts_active_sentence_index,
             self.config.tts.sentence_prefetch,
         )
         .into_iter()
-        .filter(|index| !self.tts_sync_targets.contains_key(index))
+        .filter(|index| {
+            !self.tts_sync_targets.contains_key(index) && !self.tts_sync_queue.contains(index)
+        })
         .collect();
+        if force_restart {
+            self.tts_sync_queue.clear();
+            self.tts_failed_sync.clear();
+        }
+        self.tts_sync_queue.extend(new_sync.iter().copied());
         self.tts_profile.scheduler_queue_peak = self
             .tts_profile
             .scheduler_queue_peak
             .max((self.tts_prefetch_queue.len() + self.tts_sync_queue.len()) as u64);
 
-        for sentence_index in self.tts_sync_queue.clone() {
+        for sentence_index in new_sync {
             let config = self.config.clone();
             let analysis = analysis.clone();
             let sender = sender.clone();
@@ -1562,7 +1622,7 @@ impl PdfizerApp {
         );
         self.tts_playback_state = TtsPlaybackState::Preparing;
         self.tts_activation_requested_at = Some(Instant::now());
-        self.start_tts_prefetch();
+        self.start_tts_prefetch(true);
         self.try_activate_current_sentence(ctx);
     }
 
@@ -1652,11 +1712,10 @@ impl PdfizerApp {
                 sentence_index = self.tts_active_sentence_index + 1,
                 "received TTS runtime command"
             );
-            self.cancel_tts_work("next_sentence");
             self.set_tts_cursor_to_sentence_index(self.tts_active_sentence_index + 1);
             self.tts_started_at = None;
             self.tts_activation_requested_at = Some(Instant::now());
-            self.start_tts_prefetch();
+            self.start_tts_prefetch(false);
             self.try_activate_current_sentence(ctx);
         } else {
             self.stop_tts_playback();
@@ -1674,18 +1733,24 @@ impl PdfizerApp {
             self.set_tts_cursor_to_sentence_index(self.tts_active_sentence_index - 1);
             self.tts_started_at = None;
             self.tts_activation_requested_at = Some(Instant::now());
-            self.start_tts_prefetch();
+            self.start_tts_prefetch(true);
             self.try_activate_current_sentence(ctx);
         }
     }
 
     fn try_activate_current_sentence(&mut self, ctx: &egui::Context) {
+        self.ensure_active_sentence_sync_target();
         if let Some(clip) = self
             .tts_prepared_clips
             .get(&self.tts_active_sentence_index)
             .cloned()
         {
-            self.tts_current_duration = Duration::from_millis(clip.estimated_duration_ms);
+            let playback_speed = self.config.tts.playback_speed.max(0.5);
+            let audio_duration_ms = (clip.audio_duration_ms as f32 / playback_speed)
+                .round()
+                .max(1.0) as u64;
+            self.tts_current_duration =
+                Duration::from_millis(audio_duration_ms + self.config.tts.sentence_pause_ms);
             self.tts_started_at = Some(Instant::now());
             self.tts_elapsed_before_pause = Duration::ZERO;
             self.tts_playback_state = TtsPlaybackState::Playing;
@@ -1695,7 +1760,8 @@ impl PdfizerApp {
                 cancel_token: self.tts_cancel_token,
                 audio_path: clip.audio_path.clone(),
                 volume: self.config.tts.volume,
-                rate: self.config.tts.rate,
+                playback_speed,
+                pause_after: Duration::from_millis(self.config.tts.sentence_pause_ms),
             });
             self.trace_active_sentence_origin("activate_sentence");
             if let Some(requested_at) = self.tts_activation_requested_at.take() {
@@ -1955,7 +2021,7 @@ impl PdfizerApp {
         self.tts_started_at = None;
         self.tts_activation_requested_at = Some(Instant::now());
         self.tts_elapsed_before_pause = Duration::ZERO;
-        self.start_tts_prefetch();
+        self.start_tts_prefetch(true);
         self.try_activate_current_sentence(ctx);
     }
 
@@ -2655,6 +2721,11 @@ impl PdfizerApp {
                 &mut self.tts_verbose_degraded_logging_enabled,
                 "Verbose degraded",
             );
+            ui.add(
+                Slider::new(&mut self.config.tts.playback_speed, 0.75..=1.5)
+                    .text("Speed")
+                    .clamping(egui::SliderClamping::Always),
+            );
 
             if let Some(analysis) = self
                 .tts_analysis
@@ -3219,10 +3290,13 @@ impl PdfizerApp {
     fn write_config_and_apply(&mut self, new_config: AppConfig, ctx: &egui::Context) -> Result<()> {
         let tts_reconfigured = self.tts_engine != TtsEngineKind::from_name(&new_config.tts.engine)
             || (self.config.tts.rate - new_config.tts.rate).abs() > f32::EPSILON
+            || (self.config.tts.playback_speed - new_config.tts.playback_speed).abs()
+                > f32::EPSILON
             || (self.config.tts.volume - new_config.tts.volume).abs() > f32::EPSILON
             || self.config.tts.voice != new_config.tts.voice
             || self.config.tts.model_path != new_config.tts.model_path
-            || self.config.tts.espeak_data_path != new_config.tts.espeak_data_path;
+            || self.config.tts.espeak_data_path != new_config.tts.espeak_data_path
+            || self.config.tts.sentence_pause_ms != new_config.tts.sentence_pause_ms;
         let path = new_config.preferred_config_path()?;
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)
@@ -4131,7 +4205,8 @@ fn playback_worker_loop(command_rx: Receiver<PlaybackCommand>, event_tx: Sender<
                 cancel_token,
                 audio_path,
                 volume,
-                rate,
+                playback_speed,
+                pause_after,
             } => {
                 let result = (|| -> Result<()> {
                     if output.is_none() || player.is_none() {
@@ -4148,15 +4223,17 @@ fn playback_worker_loop(command_rx: Receiver<PlaybackCommand>, event_tx: Sender<
                     player.clear();
                     player.stop();
                     player.set_volume(volume);
-                    player.set_speed(rate);
 
                     if let Some(audio_path) = &audio_path {
-                        let file = fs::File::open(audio_path)
-                            .with_context(|| format!("failed to open {}", audio_path.display()))?;
-                        let decoder = Decoder::try_from(file).with_context(|| {
-                            format!("failed to decode {}", audio_path.display())
-                        })?;
-                        player.append(decoder);
+                        let source = load_playback_source(audio_path, playback_speed)?;
+                        let channels = source.channels();
+                        let sample_rate = source.sample_rate();
+                        player.append(source);
+                        if !pause_after.is_zero() {
+                            player.append(
+                                Zero::new(channels, sample_rate).take_duration(pause_after),
+                            );
+                        }
                     }
 
                     player.play();
@@ -4224,6 +4301,72 @@ fn playback_worker_loop(command_rx: Receiver<PlaybackCommand>, event_tx: Sender<
                 break;
             }
         }
+    }
+}
+
+fn load_playback_source(audio_path: &PathBuf, playback_speed: f32) -> Result<SamplesBuffer> {
+    let mut reader = hound::WavReader::open(audio_path)
+        .with_context(|| format!("failed to open {}", audio_path.display()))?;
+    let spec = reader.spec();
+    let channels = spec.channels.max(1);
+    let sample_rate = spec.sample_rate.max(1);
+    let samples: Vec<i16> = reader
+        .samples::<i16>()
+        .collect::<Result<Vec<_>, _>>()
+        .with_context(|| format!("failed to read {}", audio_path.display()))?;
+    let processed = if (playback_speed - 1.0).abs() > f32::EPSILON {
+        time_stretch_samples(&samples, sample_rate, channels, playback_speed)?
+    } else {
+        samples
+    };
+    let data = processed
+        .into_iter()
+        .map(|sample| sample as f32 / i16::MAX as f32)
+        .collect::<Vec<_>>();
+    Ok(SamplesBuffer::new(
+        NonZeroU16::new(channels).unwrap_or(NonZeroU16::MIN),
+        NonZeroU32::new(sample_rate).unwrap_or(NonZeroU32::MIN),
+        data,
+    ))
+}
+
+fn time_stretch_samples(
+    samples: &[i16],
+    sample_rate: u32,
+    channels: u16,
+    playback_speed: f32,
+) -> Result<Vec<i16>> {
+    let speed = playback_speed.clamp(0.5, 2.5);
+    unsafe {
+        let stream = sonicCreateStream(sample_rate as i32, channels as i32);
+        if stream.is_null() {
+            return Err(anyhow!("failed to create Sonic playback stream"));
+        }
+        sonicSetSpeed(stream, speed);
+        sonicSetPitch(stream, 1.0);
+        sonicSetChordPitch(stream, 1);
+        if sonicWriteShortToStream(stream, samples.as_ptr(), samples.len() as i32) == 0 {
+            sonicDestroyStream(stream);
+            return Err(anyhow!(
+                "failed to write samples into Sonic playback stream"
+            ));
+        }
+        if sonicFlushStream(stream) == 0 {
+            sonicDestroyStream(stream);
+            return Err(anyhow!("failed to flush Sonic playback stream"));
+        }
+
+        let mut output = Vec::new();
+        let mut scratch = vec![0i16; samples.len().max(4096)];
+        loop {
+            let read = sonicReadShortFromStream(stream, scratch.as_mut_ptr(), scratch.len() as i32);
+            if read <= 0 {
+                break;
+            }
+            output.extend_from_slice(&scratch[..read as usize]);
+        }
+        sonicDestroyStream(stream);
+        Ok(output)
     }
 }
 

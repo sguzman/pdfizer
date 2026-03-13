@@ -175,6 +175,7 @@ impl AppConfig {
                 defaults.tts.espeak_data_path.clone(),
             )?
             .set_default("tts.rate", f64::from(defaults.tts.rate))?
+            .set_default("tts.playback_speed", f64::from(defaults.tts.playback_speed))?
             .set_default("tts.volume", f64::from(defaults.tts.volume))?
             .set_default(
                 "tts.analysis_progress_log_interval_secs",
@@ -805,6 +806,7 @@ pub struct TtsConfig {
     pub model_path: String,
     pub espeak_data_path: String,
     pub rate: f32,
+    pub playback_speed: f32,
     pub volume: f32,
     pub analysis_progress_log_interval_secs: f32,
     pub sentence_boundary_markers: Vec<String>,
@@ -872,6 +874,7 @@ impl Default for TtsConfig {
             model_path: "/home/admin/Music/models/piper/en-US/female/en_US-amy-medium.onnx".into(),
             espeak_data_path: "/usr/share".into(),
             rate: 1.0,
+            playback_speed: 1.0,
             volume: 1.0,
             analysis_progress_log_interval_secs: 5.0,
             sentence_boundary_markers: vec![".".into(), "!".into(), "?".into()],
@@ -891,7 +894,7 @@ impl Default for TtsConfig {
             sync_budget_sentences: 12,
             active_latency_budget_ms: 120,
             prefetch_duration_budget_ms: 30_000,
-            sentence_pause_ms: 140,
+            sentence_pause_ms: 60,
             analysis_max_pages: 96,
             analysis_window_radius: 32,
             startup_analysis_pages: 4,

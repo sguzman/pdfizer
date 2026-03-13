@@ -585,6 +585,7 @@ pub struct PreparedSentenceClip {
     pub text: String,
     pub manifest_path: PathBuf,
     pub audio_path: Option<PathBuf>,
+    pub audio_duration_ms: u64,
     pub estimated_duration_ms: u64,
     pub word_count: usize,
     pub rate: f32,
@@ -628,6 +629,7 @@ pub struct TtsSynthesisSettings {
     pub model_path: String,
     pub espeak_data_path: String,
     pub rate: f32,
+    pub playback_speed: f32,
     pub volume: f32,
     pub sentence_pause_ms: u64,
 }
@@ -640,6 +642,7 @@ impl TtsSynthesisSettings {
             model_path: config.tts.model_path.clone(),
             espeak_data_path: config.tts.espeak_data_path.clone(),
             rate: config.tts.rate,
+            playback_speed: config.tts.playback_speed,
             volume: config.tts.volume,
             sentence_pause_ms: config.tts.sentence_pause_ms,
         }
@@ -1201,9 +1204,17 @@ pub fn prepare_sentence_clip(
     }
 
     let estimated_duration_ms = estimate_sentence_duration_ms(&sentence.text, &settings);
+    let audio_duration_ms = audio_path
+        .as_ref()
+        .and_then(|path| measure_wav_duration_ms(path).ok())
+        .unwrap_or(estimated_duration_ms.saturating_sub(settings.sentence_pause_ms));
     if let Some(audio_path) = &audio_path {
         backend.synthesize_clip(audio_path, sentence, &settings)?;
     }
+    let audio_duration_ms = audio_path
+        .as_ref()
+        .and_then(|path| measure_wav_duration_ms(path).ok())
+        .unwrap_or(audio_duration_ms);
 
     let clip = PreparedSentenceClip {
         source_fingerprint: analysis.source_fingerprint.clone(),
@@ -1213,6 +1224,7 @@ pub fn prepare_sentence_clip(
         text: sentence.text.clone(),
         manifest_path: manifest_path.clone(),
         audio_path,
+        audio_duration_ms,
         estimated_duration_ms,
         word_count: sentence.text.split_whitespace().count(),
         rate: settings.rate,
@@ -2276,6 +2288,18 @@ fn write_wav_samples(path: &Path, sample_rate: u32, channels: u16, samples: &[f3
     }
     writer.finalize()?;
     Ok(())
+}
+
+fn measure_wav_duration_ms(path: &Path) -> Result<u64> {
+    let reader = hound::WavReader::open(path)
+        .with_context(|| format!("failed to open {}", path.display()))?;
+    let spec = reader.spec();
+    if spec.sample_rate == 0 || spec.channels == 0 {
+        return Ok(0);
+    }
+    let total_samples = reader.duration() as u64;
+    let frames = total_samples / spec.channels as u64;
+    Ok((frames * 1_000) / spec.sample_rate as u64)
 }
 
 fn sanitize_cache_component(value: &str) -> String {
