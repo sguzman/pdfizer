@@ -761,31 +761,6 @@ pub enum TtsWorkerMessage {
     },
 }
 
-#[instrument(skip(config))]
-pub fn analyze_pdf_for_tts(config: &AppConfig, source_path: &Path) -> Result<TtsAnalysisArtifacts> {
-    let runtime =
-        PdfRuntime::new(config).context("failed to initialize Pdfium for TTS analysis")?;
-    let document = runtime
-        .open_document(source_path)
-        .with_context(|| format!("failed to open {} for TTS analysis", source_path.display()))?;
-    build_artifacts_from_document(config, source_path, &document)
-}
-
-#[instrument(skip(config))]
-pub fn analyze_pdf_for_tts_in_scope(
-    config: &AppConfig,
-    source_path: &Path,
-    start_page: usize,
-    end_page: usize,
-) -> Result<TtsAnalysisArtifacts> {
-    let runtime =
-        PdfRuntime::new(config).context("failed to initialize Pdfium for TTS analysis")?;
-    let document = runtime
-        .open_document(source_path)
-        .with_context(|| format!("failed to open {} for TTS analysis", source_path.display()))?;
-    build_artifacts_from_document_with_scope(config, source_path, &document, start_page, end_page)
-}
-
 pub fn analyze_pdf_for_tts_with_progress<F>(
     config: &AppConfig,
     source_path: &Path,
@@ -2154,39 +2129,6 @@ fn stable_text_hash(text: &str) -> u64 {
     let mut hasher = DefaultHasher::new();
     text.hash(&mut hasher);
     hasher.finish()
-}
-
-#[instrument(skip(config, document))]
-pub fn build_artifacts_from_document(
-    config: &AppConfig,
-    source_path: &Path,
-    document: &PdfDocument<'_>,
-) -> Result<TtsAnalysisArtifacts> {
-    build_artifacts_from_document_with_scope(
-        config,
-        source_path,
-        document,
-        0,
-        document.metadata.page_count.saturating_sub(1),
-    )
-}
-
-#[instrument(skip(config, document))]
-pub fn build_artifacts_from_document_with_scope(
-    config: &AppConfig,
-    source_path: &Path,
-    document: &PdfDocument<'_>,
-    start_page: usize,
-    end_page: usize,
-) -> Result<TtsAnalysisArtifacts> {
-    build_artifacts_from_document_with_scope_and_progress(
-        config,
-        source_path,
-        document,
-        start_page,
-        end_page,
-        &mut |_, _, _, _| {},
-    )
 }
 
 #[instrument(skip(config, document, progress))]
