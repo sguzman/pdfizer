@@ -55,11 +55,17 @@ Checked items reflect capabilities already present in this repository that reduc
 
 ### Tranche 3: Geometry Sync And Highlighting
 
-- [ ] Build sentence-to-PDF geometry artifacts.
-- [ ] Add confidence-scored sentence highlight overlays.
-- [ ] Add line/block/page fallback behavior.
-- [ ] Add scroll-follow logic that does not fight manual reading.
-- [ ] Keep zoom/scroll/continuous mode stable while highlight sync is active.
+- [x] Build sentence-to-PDF geometry artifacts.
+- [x] Add confidence-scored sentence highlight overlays.
+- [x] Support exact sentence mapping when page text matches cleanly.
+- [x] Support fuzzy sentence mapping when token coverage is high but exact matching fails.
+- [x] Support block fallback behavior.
+- [x] Support page fallback behavior.
+- [x] Keep follow mode geometry-aware by preferring mapped rects over page-only jumps.
+- [x] Keep zoom/scroll/continuous mode stable while highlight sync is active.
+- [x] Add background sync preparation for the active sentence window.
+- [x] Add diagnostics for sync confidence, score, and fallback reason.
+- [x] Add regression tests for exact and degraded sentence mapping heuristics.
 
 ### Tranche 4: OCR, Performance, And Hardening
 

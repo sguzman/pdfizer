@@ -4,7 +4,7 @@
 
 The current build is no longer just a minimal viewer. It includes thumbnail navigation, cached page renders, large-page tiled rendering, comparison presets, a pixel inspector, benchmark export, persisted session state, layered TOML config, and file-backed tracing.
 
-It also now includes the first PDF TTS groundwork tranche plus a completed playback/runtime tranche: canonical PDF text analysis, normalization, sentence planning, trust classification, persisted TTS-sidecar artifacts, a tone-preview playback backend, ahead-of-time clip preparation, cache reuse, and in-app diagnostics. Real speech synthesis and sentence-accurate PDF sync are still future work.
+It also now includes the first PDF TTS groundwork tranche, a completed playback/runtime tranche, and a first geometry-sync tranche: canonical PDF text analysis, normalization, sentence planning, trust classification, persisted TTS-sidecar artifacts, a tone-preview playback backend, ahead-of-time clip preparation, cached sentence-to-PDF sync targets, confidence-scored overlays, and in-app diagnostics. OCR-backed sync and stronger alignment remain future work.
 
 ## Stack
 
@@ -29,6 +29,7 @@ It also now includes the first PDF TTS groundwork tranche plus a completed playb
 - Write logs to stdout and a file sink
 - Build and inspect canonical PDF TTS analysis artifacts in the background when a document opens
 - Exercise a tone-preview TTS runtime with play/pause, sentence stepping, direct sentence seek, follow mode, and cached prepared clips
+- Highlight the active spoken sentence on the PDF with exact, fuzzy, block, or page-level fallback behavior
 
 ## Pdfium Runtime
 

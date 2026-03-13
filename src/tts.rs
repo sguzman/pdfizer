@@ -12,7 +12,7 @@ use tracing::{info, instrument};
 
 use crate::{
     config::AppConfig,
-    pdf::{PdfDocument, PdfRuntime},
+    pdf::{PdfDocument, PdfRectData, PdfRuntime},
 };
 
 const PDF_LIGATURES: [(&str, &str); 7] = [
@@ -105,6 +105,39 @@ pub struct TtsAnalysisArtifacts {
     pub pages: Vec<PageTtsArtifact>,
     pub stats: NormalizationStats,
     pub artifact_path: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SentenceSyncConfidence {
+    ExactSentence,
+    FuzzySentence,
+    BlockFallback,
+    PageFallback,
+    Missing,
+}
+
+impl SentenceSyncConfidence {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::ExactSentence => "exact_sentence",
+            Self::FuzzySentence => "fuzzy_sentence",
+            Self::BlockFallback => "block_fallback",
+            Self::PageFallback => "page_fallback",
+            Self::Missing => "missing",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SentenceSyncTarget {
+    pub sentence_index: usize,
+    pub sentence_id: u64,
+    pub confidence: SentenceSyncConfidence,
+    pub page_index: Option<usize>,
+    pub rects: Vec<PdfRectData>,
+    pub fallback_reason: String,
+    pub score: f32,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -214,6 +247,15 @@ pub enum TtsWorkerMessage {
         sentence_index: usize,
         error: String,
     },
+    SyncCompleted {
+        request_id: u64,
+        target: SentenceSyncTarget,
+    },
+    SyncFailed {
+        request_id: u64,
+        sentence_index: usize,
+        error: String,
+    },
 }
 
 #[instrument(skip(config))]
@@ -224,6 +266,24 @@ pub fn analyze_pdf_for_tts(config: &AppConfig, source_path: &Path) -> Result<Tts
         .open_document(source_path)
         .with_context(|| format!("failed to open {} for TTS analysis", source_path.display()))?;
     build_artifacts_from_document(config, source_path, &document)
+}
+
+pub fn compute_sentence_sync(
+    config: &AppConfig,
+    analysis: &TtsAnalysisArtifacts,
+    sentence_index: usize,
+) -> Result<SentenceSyncTarget> {
+    let runtime =
+        PdfRuntime::new(config).context("failed to initialize Pdfium for TTS sync analysis")?;
+    let document = runtime
+        .open_document(&analysis.source_path)
+        .with_context(|| {
+            format!(
+                "failed to open {} for TTS sync",
+                analysis.source_path.display()
+            )
+        })?;
+    compute_sentence_sync_from_document(&document, analysis, sentence_index)
 }
 
 pub fn persist_artifacts(config: &AppConfig, artifacts: &TtsAnalysisArtifacts) -> Result<PathBuf> {
@@ -247,6 +307,14 @@ pub fn build_prefetch_plan(
 ) -> Vec<usize> {
     let end = (start_sentence_index + sentence_count).min(analysis.sentences.len());
     (start_sentence_index..end).collect()
+}
+
+pub fn build_sync_prefetch_plan(
+    analysis: &TtsAnalysisArtifacts,
+    start_sentence_index: usize,
+    sentence_count: usize,
+) -> Vec<usize> {
+    build_prefetch_plan(analysis, start_sentence_index, sentence_count)
 }
 
 pub fn prepare_sentence_clip(
@@ -324,6 +392,224 @@ pub fn estimate_sentence_duration_ms(text: &str, rate: f32) -> u64 {
         * 120;
     let base = (word_count * 360 + punctuation_pause).clamp(900, 12_000) as f32;
     (base / rate.max(0.25)).round() as u64
+}
+
+pub fn compute_sentence_sync_from_document(
+    document: &PdfDocument<'_>,
+    analysis: &TtsAnalysisArtifacts,
+    sentence_index: usize,
+) -> Result<SentenceSyncTarget> {
+    let sentence = analysis
+        .sentences
+        .get(sentence_index)
+        .with_context(|| format!("sentence index {sentence_index} is out of bounds"))?;
+    let normalized_sentence = normalize_text_for_sync(&sentence.text);
+    let sentence_tokens = build_sync_tokens(&normalized_sentence);
+    let mut best: Option<SentenceSyncTarget> = None;
+
+    for page_index in sentence.page_range.start_page..=sentence.page_range.end_page {
+        let segments = document.text_segments_for_page(page_index)?;
+        let candidate = sync_target_for_page(
+            page_index,
+            sentence_index,
+            sentence.id,
+            &sentence_tokens,
+            &normalized_sentence,
+            &segments,
+        );
+        if best
+            .as_ref()
+            .is_none_or(|current| candidate.score > current.score)
+        {
+            best = Some(candidate);
+        }
+    }
+
+    Ok(best.unwrap_or(SentenceSyncTarget {
+        sentence_index,
+        sentence_id: sentence.id,
+        confidence: SentenceSyncConfidence::Missing,
+        page_index: None,
+        rects: Vec::new(),
+        fallback_reason: "no_page_candidate".into(),
+        score: 0.0,
+    }))
+}
+
+fn sync_target_for_page(
+    page_index: usize,
+    sentence_index: usize,
+    sentence_id: u64,
+    sentence_tokens: &[String],
+    normalized_sentence: &str,
+    segments: &[crate::pdf::TextSegmentData],
+) -> SentenceSyncTarget {
+    let normalized_segments = segments
+        .iter()
+        .map(|segment| normalize_text_for_sync(&segment.text))
+        .collect::<Vec<_>>();
+
+    let mut page_text = String::new();
+    let mut ranges = Vec::with_capacity(normalized_segments.len());
+    for segment_text in &normalized_segments {
+        if !page_text.is_empty() && !segment_text.is_empty() {
+            page_text.push(' ');
+        }
+        let start = page_text.len();
+        page_text.push_str(segment_text);
+        let end = page_text.len();
+        ranges.push((start, end));
+    }
+
+    if !normalized_sentence.is_empty() {
+        if let Some(offset) = page_text.find(normalized_sentence) {
+            let end = offset + normalized_sentence.len();
+            let rects = collect_overlapping_rects(segments, &ranges, offset, end);
+            if !rects.is_empty() {
+                return SentenceSyncTarget {
+                    sentence_index,
+                    sentence_id,
+                    confidence: SentenceSyncConfidence::ExactSentence,
+                    page_index: Some(page_index),
+                    rects,
+                    fallback_reason: "exact_substring_match".into(),
+                    score: 1.0,
+                };
+            }
+        }
+    }
+
+    let mut best_window: Option<(usize, usize, f32)> = None;
+    for start in 0..normalized_segments.len() {
+        let mut window_text = String::new();
+        for end in start
+            ..normalized_segments
+                .len()
+                .min(start + sentence_tokens.len().max(1) + 8)
+        {
+            if !window_text.is_empty() {
+                window_text.push(' ');
+            }
+            window_text.push_str(&normalized_segments[end]);
+            let score = token_coverage_score(sentence_tokens, &window_text);
+            if best_window
+                .as_ref()
+                .is_none_or(|(_, _, current_score)| score > *current_score)
+            {
+                best_window = Some((start, end, score));
+            }
+        }
+    }
+
+    if let Some((start, end, score)) = best_window {
+        let rects = segments[start..=end]
+            .iter()
+            .map(|segment| segment.rect)
+            .collect::<Vec<_>>();
+        let confidence = if score >= 0.9 {
+            SentenceSyncConfidence::FuzzySentence
+        } else if score >= 0.45 {
+            SentenceSyncConfidence::BlockFallback
+        } else {
+            SentenceSyncConfidence::PageFallback
+        };
+        return SentenceSyncTarget {
+            sentence_index,
+            sentence_id,
+            confidence,
+            page_index: Some(page_index),
+            rects: if confidence == SentenceSyncConfidence::PageFallback {
+                Vec::new()
+            } else {
+                rects
+            },
+            fallback_reason: match confidence {
+                SentenceSyncConfidence::FuzzySentence => "high_token_window_match".into(),
+                SentenceSyncConfidence::BlockFallback => "block_window_fallback".into(),
+                SentenceSyncConfidence::PageFallback => "page_location_only".into(),
+                _ => "unknown".into(),
+            },
+            score,
+        };
+    }
+
+    SentenceSyncTarget {
+        sentence_index,
+        sentence_id,
+        confidence: SentenceSyncConfidence::PageFallback,
+        page_index: Some(page_index),
+        rects: Vec::new(),
+        fallback_reason: "page_location_only".into(),
+        score: 0.1,
+    }
+}
+
+fn collect_overlapping_rects(
+    segments: &[crate::pdf::TextSegmentData],
+    ranges: &[(usize, usize)],
+    start: usize,
+    end: usize,
+) -> Vec<PdfRectData> {
+    ranges
+        .iter()
+        .enumerate()
+        .filter_map(|(index, (segment_start, segment_end))| {
+            if *segment_end <= start || *segment_start >= end {
+                None
+            } else {
+                segments.get(index).map(|segment| segment.rect)
+            }
+        })
+        .collect()
+}
+
+fn token_coverage_score(sentence_tokens: &[String], text: &str) -> f32 {
+    if sentence_tokens.is_empty() {
+        return 0.0;
+    }
+    let normalized_text = normalize_text_for_sync(text);
+    let hits = sentence_tokens
+        .iter()
+        .filter(|token| normalized_text.contains(token.as_str()))
+        .count();
+    hits as f32 / sentence_tokens.len() as f32
+}
+
+fn build_sync_tokens(text: &str) -> Vec<String> {
+    normalize_text_for_sync(text)
+        .split(' ')
+        .filter(|token| !token.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+fn normalize_text_for_sync(value: &str) -> String {
+    let mut normalized = value.to_string();
+    for (ligature, replacement) in PDF_LIGATURES {
+        normalized = normalized.replace(ligature, replacement);
+    }
+    normalized = normalized
+        .replace('\u{00AD}', "")
+        .replace(
+            ['\u{200B}', '\u{200C}', '\u{200D}', '\u{2060}', '\u{FEFF}'],
+            "",
+        )
+        .replace(['\n', '\r', '\t'], " ");
+
+    let mut collapsed = String::with_capacity(normalized.len());
+    let mut last_was_space = false;
+    for ch in normalized.chars() {
+        let lower = ch.to_ascii_lowercase();
+        if lower.is_alphanumeric() {
+            collapsed.push(lower);
+            last_was_space = false;
+        } else if !last_was_space {
+            collapsed.push(' ');
+            last_was_space = true;
+        }
+    }
+
+    collapsed.trim().to_string()
 }
 
 fn generate_tone_preview_clip(path: &Path, sentence_index: usize, duration_ms: u64) -> Result<()> {
@@ -841,6 +1127,7 @@ fn unix_timestamp_secs() -> u64 {
 mod tests {
     use super::*;
     use crate::config::AppConfig;
+    use crate::pdf::TextSegmentData;
 
     #[test]
     fn normalization_replaces_ligatures_and_soft_hyphens() {
@@ -1019,5 +1306,80 @@ mod tests {
             prepare_sentence_clip(&config, &analysis, 0, TtsEngineKind::TonePreview).unwrap();
         assert!(clip.manifest_path.exists());
         assert!(clip.audio_path.as_ref().is_some_and(|path| path.exists()));
+    }
+
+    #[test]
+    fn sync_target_exact_match_collects_rects() {
+        let segments = vec![
+            TextSegmentData {
+                text: "Hello".into(),
+                rect: PdfRectData {
+                    bottom: 10.0,
+                    left: 10.0,
+                    top: 20.0,
+                    right: 40.0,
+                },
+            },
+            TextSegmentData {
+                text: "world".into(),
+                rect: PdfRectData {
+                    bottom: 10.0,
+                    left: 42.0,
+                    top: 20.0,
+                    right: 70.0,
+                },
+            },
+        ];
+
+        let target = sync_target_for_page(
+            0,
+            0,
+            42,
+            &build_sync_tokens("hello world"),
+            "hello world",
+            &segments,
+        );
+
+        assert_eq!(target.confidence, SentenceSyncConfidence::ExactSentence);
+        assert_eq!(target.rects.len(), 2);
+    }
+
+    #[test]
+    fn sync_target_degrades_to_block_fallback() {
+        let segments = vec![
+            TextSegmentData {
+                text: "The quick brown".into(),
+                rect: PdfRectData {
+                    bottom: 10.0,
+                    left: 10.0,
+                    top: 20.0,
+                    right: 80.0,
+                },
+            },
+            TextSegmentData {
+                text: "fox jumps".into(),
+                rect: PdfRectData {
+                    bottom: 24.0,
+                    left: 10.0,
+                    top: 34.0,
+                    right: 65.0,
+                },
+            },
+        ];
+
+        let target = sync_target_for_page(
+            0,
+            0,
+            42,
+            &build_sync_tokens("quick fox leaps"),
+            "quick fox leaps",
+            &segments,
+        );
+
+        assert!(matches!(
+            target.confidence,
+            SentenceSyncConfidence::BlockFallback | SentenceSyncConfidence::FuzzySentence
+        ));
+        assert_eq!(target.page_index, Some(0));
     }
 }

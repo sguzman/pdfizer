@@ -7,6 +7,7 @@ use std::{
 use anyhow::{Context, Result, anyhow};
 use eframe::egui::ColorImage;
 use pdfium_render::prelude::*;
+use serde::{Deserialize, Serialize};
 use tracing::{debug, info, instrument};
 
 use crate::config::{AppConfig, library_path_from_config_or_env};
@@ -479,7 +480,7 @@ pub struct TextSegmentData {
     pub rect: PdfRectData,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct PdfRectData {
     pub bottom: f32,
     pub left: f32,

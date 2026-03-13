@@ -25,8 +25,8 @@ use crate::{
         TileRenderRequest,
     },
     tts::{
-        self, PdfTtsMode, PreparedSentenceClip, TtsAnalysisArtifacts, TtsEngineKind,
-        TtsPlaybackState, TtsWorkerMessage,
+        self, PdfTtsMode, PreparedSentenceClip, SentenceSyncConfidence, SentenceSyncTarget,
+        TtsAnalysisArtifacts, TtsEngineKind, TtsPlaybackState, TtsWorkerMessage,
     },
 };
 
@@ -74,8 +74,11 @@ pub struct PdfizerApp {
     tts_active_sentence_index: usize,
     tts_follow_mode: bool,
     tts_prepared_clips: HashMap<usize, PreparedSentenceClip>,
+    tts_sync_targets: HashMap<usize, SentenceSyncTarget>,
     tts_prefetch_queue: Vec<usize>,
+    tts_sync_queue: Vec<usize>,
     tts_failed_prefetch: HashMap<usize, String>,
+    tts_failed_sync: HashMap<usize, String>,
     tts_prefetch_request_id: u64,
     tts_prefetch_in_flight: usize,
     tts_started_at: Option<Instant>,
@@ -166,8 +169,11 @@ impl PdfizerApp {
             tts_active_sentence_index: 0,
             tts_follow_mode: true,
             tts_prepared_clips: HashMap::new(),
+            tts_sync_targets: HashMap::new(),
             tts_prefetch_queue: Vec::new(),
+            tts_sync_queue: Vec::new(),
             tts_failed_prefetch: HashMap::new(),
+            tts_failed_sync: HashMap::new(),
             tts_prefetch_request_id: 0,
             tts_prefetch_in_flight: 0,
             tts_started_at: None,
@@ -327,6 +333,22 @@ impl PdfizerApp {
                         .insert(sentence_index, error.clone());
                     warn!(sentence_index, error = %error, "TTS prefetch failed");
                 }
+                Ok(TtsWorkerMessage::SyncCompleted { request_id, target })
+                    if request_id == self.tts_prefetch_request_id =>
+                {
+                    self.tts_sync_targets.insert(target.sentence_index, target);
+                    self.tts_sync_queue
+                        .retain(|index| !self.tts_sync_targets.contains_key(index));
+                }
+                Ok(TtsWorkerMessage::SyncFailed {
+                    request_id,
+                    sentence_index,
+                    error,
+                }) if request_id == self.tts_prefetch_request_id => {
+                    self.tts_sync_queue.retain(|index| *index != sentence_index);
+                    self.tts_failed_sync.insert(sentence_index, error.clone());
+                    warn!(sentence_index, error = %error, "TTS sync computation failed");
+                }
                 Ok(_) => {}
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
@@ -346,8 +368,11 @@ impl PdfizerApp {
         self.tts_playback_state = TtsPlaybackState::Stopped;
         self.tts_active_sentence_index = 0;
         self.tts_prepared_clips.clear();
+        self.tts_sync_targets.clear();
         self.tts_prefetch_queue.clear();
+        self.tts_sync_queue.clear();
         self.tts_failed_prefetch.clear();
+        self.tts_failed_sync.clear();
         self.tts_prefetch_in_flight = 0;
         self.tts_started_at = None;
         self.tts_elapsed_before_pause = Duration::ZERO;
@@ -418,6 +443,32 @@ impl PdfizerApp {
                             error: err.to_string(),
                         },
                     };
+                let _ = sender.send(message);
+            });
+        }
+
+        self.tts_sync_queue = tts::build_sync_prefetch_plan(
+            &analysis,
+            self.tts_active_sentence_index,
+            self.config.tts.sentence_prefetch,
+        )
+        .into_iter()
+        .filter(|index| !self.tts_sync_targets.contains_key(index))
+        .collect();
+
+        for sentence_index in self.tts_sync_queue.clone() {
+            let config = self.config.clone();
+            let analysis = analysis.clone();
+            let sender = sender.clone();
+            thread::spawn(move || {
+                let message = match tts::compute_sentence_sync(&config, &analysis, sentence_index) {
+                    Ok(target) => TtsWorkerMessage::SyncCompleted { request_id, target },
+                    Err(err) => TtsWorkerMessage::SyncFailed {
+                        request_id,
+                        sentence_index,
+                        error: err.to_string(),
+                    },
+                };
                 let _ = sender.send(message);
             });
         }
@@ -532,10 +583,17 @@ impl PdfizerApp {
         if !self.tts_follow_mode {
             return;
         }
-        let Some(sentence) = self.active_sentence() else {
+        if let Some(target) = self.tts_sync_targets.get(&self.tts_active_sentence_index) {
+            self.navigate_to_page(
+                target.page_index.unwrap_or(self.current_page),
+                target.rects.first().copied(),
+                ctx,
+            );
             return;
-        };
-        self.navigate_to_page(sentence.page_range.start_page, None, ctx);
+        }
+        if let Some(sentence) = self.active_sentence() {
+            self.navigate_to_page(sentence.page_range.start_page, None, ctx);
+        }
     }
 
     fn advance_tts_clock(&mut self, ctx: &egui::Context) {
@@ -1413,6 +1471,14 @@ impl PdfizerApp {
                         sentence.page_range.start_page + 1,
                         sentence.page_range.end_page + 1
                     ));
+                    if let Some(target) = self.tts_sync_targets.get(&self.tts_active_sentence_index) {
+                        ui.label(format!(
+                            "Sync: {} | score {:.2} | reason {}",
+                            target.confidence.label(),
+                            target.score,
+                            target.fallback_reason
+                        ));
+                    }
                     ui.add(
                         egui::TextEdit::multiline(&mut sentence_text)
                             .desired_rows(3)
@@ -1444,10 +1510,12 @@ impl PdfizerApp {
                 self.tts_engine,
             );
             ui.label(format!(
-                "Prepared clips: {} | queued: {} | failed: {} | in flight: {} | prefetch request: {}",
+                "Prepared clips: {} | queued: {} | sync queued: {} | failed prep: {} | failed sync: {} | in flight: {} | prefetch request: {}",
                 snapshot.prepared_sentence_indexes.len(),
                 snapshot.queued_sentence_indexes.len(),
+                self.tts_sync_queue.len(),
                 snapshot.failed_sentence_indexes.len(),
+                self.tts_failed_sync.len(),
                 self.tts_prefetch_in_flight,
                 snapshot.request_id
             ));
@@ -1806,6 +1874,7 @@ impl PdfizerApp {
         }
 
         self.paint_selectable_text_layer(ui, page_index, &response, &view.image);
+        self.paint_tts_highlights(ui, page_index, &response, &view.image);
         self.paint_text_region_highlights(ui, page_index, &response, &view.image);
         self.paint_search_highlights(ui, page_index, &response, &view.image);
 
@@ -1853,6 +1922,7 @@ impl PdfizerApp {
                         }
 
                         self.paint_selectable_text_layer(ui, page_index, &response, &view.image);
+                        self.paint_tts_highlights(ui, page_index, &response, &view.image);
                         self.paint_text_region_highlights(ui, page_index, &response, &view.image);
                         self.paint_search_highlights(ui, page_index, &response, &view.image);
 
@@ -1902,6 +1972,72 @@ impl PdfizerApp {
                     egui::StrokeKind::Outside,
                 );
             }
+        }
+    }
+
+    fn paint_tts_highlights(
+        &self,
+        ui: &Ui,
+        page_index: usize,
+        response: &egui::Response,
+        image: &ColorImage,
+    ) {
+        let Some(target) = self.tts_sync_targets.get(&self.tts_active_sentence_index) else {
+            return;
+        };
+        if target.page_index != Some(page_index) {
+            return;
+        }
+
+        let Some(document) = &self.document else {
+            return;
+        };
+        let Some(page_size) = document.page_size(page_index) else {
+            return;
+        };
+
+        let fill = match target.confidence {
+            SentenceSyncConfidence::ExactSentence => {
+                Color32::from_rgba_premultiplied(255, 120, 80, 56)
+            }
+            SentenceSyncConfidence::FuzzySentence => {
+                Color32::from_rgba_premultiplied(255, 176, 80, 48)
+            }
+            SentenceSyncConfidence::BlockFallback => {
+                Color32::from_rgba_premultiplied(255, 220, 80, 40)
+            }
+            SentenceSyncConfidence::PageFallback | SentenceSyncConfidence::Missing => {
+                Color32::from_rgba_premultiplied(160, 160, 160, 24)
+            }
+        };
+        let stroke = match target.confidence {
+            SentenceSyncConfidence::ExactSentence => Color32::from_rgb(255, 120, 80),
+            SentenceSyncConfidence::FuzzySentence => Color32::from_rgb(255, 176, 80),
+            SentenceSyncConfidence::BlockFallback => Color32::from_rgb(255, 220, 80),
+            SentenceSyncConfidence::PageFallback | SentenceSyncConfidence::Missing => {
+                Color32::from_rgb(180, 180, 180)
+            }
+        };
+
+        if target.rects.is_empty() {
+            ui.painter().rect_stroke(
+                response.rect.shrink2(Vec2::splat(6.0)),
+                0.0,
+                egui::Stroke::new(2.0, stroke),
+                egui::StrokeKind::Outside,
+            );
+            return;
+        }
+
+        for rect in &target.rects {
+            let highlight = pdf_rect_to_screen_rect(*rect, page_size, response.rect, image);
+            ui.painter().rect_filled(highlight, 0.0, fill);
+            ui.painter().rect_stroke(
+                highlight,
+                0.0,
+                egui::Stroke::new(2.0, stroke),
+                egui::StrokeKind::Outside,
+            );
         }
     }
 
