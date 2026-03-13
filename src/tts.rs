@@ -111,12 +111,21 @@ pub struct TtsAnalysisArtifacts {
 #[serde(rename_all = "snake_case")]
 pub enum TtsEngineKind {
     DryRun,
+    TonePreview,
 }
 
 impl TtsEngineKind {
     pub fn label(&self) -> &'static str {
         match self {
             Self::DryRun => "dry_run",
+            Self::TonePreview => "tone_preview",
+        }
+    }
+
+    pub fn from_name(name: &str) -> Self {
+        match name {
+            "tone_preview" => Self::TonePreview,
+            _ => Self::DryRun,
         }
     }
 }
@@ -150,9 +159,11 @@ pub struct PreparedSentenceClip {
     pub sentence_index: usize,
     pub engine: TtsEngineKind,
     pub text: String,
-    pub cache_path: PathBuf,
+    pub manifest_path: PathBuf,
+    pub audio_path: Option<PathBuf>,
     pub estimated_duration_ms: u64,
     pub word_count: usize,
+    pub rate: f32,
     pub generated_at_unix_secs: u64,
 }
 
@@ -248,19 +259,40 @@ pub fn prepare_sentence_clip(
         .sentences
         .get(sentence_index)
         .with_context(|| format!("sentence index {sentence_index} is out of bounds"))?;
-    let cache_path = config.tts_audio_cache_dir()?.join(format!(
-        "{}-{}-{}.toml",
+    let stem = format!(
+        "{}-{}-{}-{:.2}",
         analysis.source_fingerprint,
         sentence.id,
-        engine.label()
-    ));
+        engine.label(),
+        config.tts.rate
+    );
+    let manifest_path = config.tts_audio_cache_dir()?.join(format!("{stem}.toml"));
+    let audio_path = match engine {
+        TtsEngineKind::DryRun => None,
+        TtsEngineKind::TonePreview => {
+            Some(config.tts_audio_cache_dir()?.join(format!("{stem}.wav")))
+        }
+    };
 
-    if cache_path.exists() {
-        let contents = fs::read_to_string(&cache_path)
-            .with_context(|| format!("failed to read {}", cache_path.display()))?;
+    if manifest_path.exists() {
+        let contents = fs::read_to_string(&manifest_path)
+            .with_context(|| format!("failed to read {}", manifest_path.display()))?;
         let cached = toml::from_str::<PreparedSentenceClip>(&contents)
-            .with_context(|| format!("failed to parse {}", cache_path.display()))?;
-        return Ok(cached);
+            .with_context(|| format!("failed to parse {}", manifest_path.display()))?;
+        let audio_ok = cached.audio_path.as_ref().is_none_or(|path| path.exists());
+        if (cached.rate - config.tts.rate).abs() < f32::EPSILON && audio_ok {
+            return Ok(cached);
+        }
+    }
+
+    if let Some(parent) = manifest_path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+
+    let estimated_duration_ms = estimate_sentence_duration_ms(&sentence.text, config.tts.rate);
+    if let Some(audio_path) = &audio_path {
+        generate_tone_preview_clip(audio_path, sentence_index, estimated_duration_ms)?;
     }
 
     let clip = PreparedSentenceClip {
@@ -269,30 +301,60 @@ pub fn prepare_sentence_clip(
         sentence_index,
         engine,
         text: sentence.text.clone(),
-        cache_path: cache_path.clone(),
-        estimated_duration_ms: estimate_sentence_duration_ms(&sentence.text),
+        manifest_path: manifest_path.clone(),
+        audio_path,
+        estimated_duration_ms,
         word_count: sentence.text.split_whitespace().count(),
+        rate: config.tts.rate,
         generated_at_unix_secs: unix_timestamp_secs(),
     };
 
-    if let Some(parent) = cache_path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create {}", parent.display()))?;
-    }
-    fs::write(&cache_path, toml::to_string_pretty(&clip)?)
-        .with_context(|| format!("failed to write {}", cache_path.display()))?;
+    fs::write(&manifest_path, toml::to_string_pretty(&clip)?)
+        .with_context(|| format!("failed to write {}", manifest_path.display()))?;
 
     Ok(clip)
 }
 
-pub fn estimate_sentence_duration_ms(text: &str) -> u64 {
+pub fn estimate_sentence_duration_ms(text: &str, rate: f32) -> u64 {
     let word_count = text.split_whitespace().count().max(1) as u64;
     let punctuation_pause = text
         .chars()
         .filter(|ch| matches!(ch, '.' | ',' | ';' | ':' | '?' | '!'))
         .count() as u64
         * 120;
-    (word_count * 360 + punctuation_pause).clamp(900, 12_000)
+    let base = (word_count * 360 + punctuation_pause).clamp(900, 12_000) as f32;
+    (base / rate.max(0.25)).round() as u64
+}
+
+fn generate_tone_preview_clip(path: &Path, sentence_index: usize, duration_ms: u64) -> Result<()> {
+    let spec = hound::WavSpec {
+        channels: 1,
+        sample_rate: 22_050,
+        bits_per_sample: 16,
+        sample_format: hound::SampleFormat::Int,
+    };
+    let mut writer = hound::WavWriter::create(path, spec)
+        .with_context(|| format!("failed to create {}", path.display()))?;
+    let sample_count = (spec.sample_rate as u64 * duration_ms / 1_000) as usize;
+    let frequency_hz = 330.0 + (sentence_index % 6) as f32 * 55.0;
+    let amplitude = 0.2;
+    let fade_samples = (spec.sample_rate / 40) as usize;
+
+    for index in 0..sample_count {
+        let t = index as f32 / spec.sample_rate as f32;
+        let envelope = if index < fade_samples {
+            index as f32 / fade_samples.max(1) as f32
+        } else if index + fade_samples >= sample_count {
+            (sample_count.saturating_sub(index)) as f32 / fade_samples.max(1) as f32
+        } else {
+            1.0
+        };
+        let sample = (2.0 * std::f32::consts::PI * frequency_hz * t).sin() * amplitude * envelope;
+        writer.write_sample((sample * i16::MAX as f32) as i16)?;
+    }
+
+    writer.finalize()?;
+    Ok(())
 }
 
 #[instrument(skip(config, document))]
@@ -919,7 +981,43 @@ mod tests {
 
     #[test]
     fn sentence_duration_estimate_has_reasonable_floor() {
-        assert!(estimate_sentence_duration_ms("Hi.") >= 900);
-        assert!(estimate_sentence_duration_ms("This is a somewhat longer sentence.") > 900);
+        assert!(estimate_sentence_duration_ms("Hi.", 1.0) >= 900);
+        assert!(estimate_sentence_duration_ms("This is a somewhat longer sentence.", 1.0) > 900);
+    }
+
+    #[test]
+    fn prepare_sentence_clip_writes_tone_preview_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let source_path = temp.path().join("fixture.pdf");
+        fs::write(&source_path, b"%PDF-1.4").unwrap();
+
+        let mut config = AppConfig::default();
+        config.tts.audio_cache_dir = temp.path().join("audio").display().to_string();
+
+        let analysis = TtsAnalysisArtifacts {
+            source_path,
+            source_fingerprint: "abc".into(),
+            generated_at_unix_secs: 0,
+            mode: PdfTtsMode::HighTextTrust,
+            confidence: 0.9,
+            tts_text: "Sentence zero.".into(),
+            sentences: vec![SentencePlan {
+                id: 42,
+                text: "Sentence zero.".into(),
+                range: TextRange { start: 0, end: 14 },
+                page_range: PageRange {
+                    start_page: 0,
+                    end_page: 0,
+                },
+            }],
+            pages: Vec::new(),
+            stats: NormalizationStats::default(),
+            artifact_path: None,
+        };
+
+        let clip =
+            prepare_sentence_clip(&config, &analysis, 0, TtsEngineKind::TonePreview).unwrap();
+        assert!(clip.manifest_path.exists());
+        assert!(clip.audio_path.as_ref().is_some_and(|path| path.exists()));
     }
 }

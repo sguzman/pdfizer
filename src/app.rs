@@ -13,6 +13,7 @@ use eframe::egui::{
     TextureHandle, TextureOptions, Ui, UiBuilder, Vec2,
 };
 use rfd::FileDialog;
+use rodio::{Decoder, DeviceSinkBuilder, MixerDeviceSink, Player};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, error, info, instrument, warn};
 
@@ -78,7 +79,10 @@ pub struct PdfizerApp {
     tts_prefetch_request_id: u64,
     tts_prefetch_in_flight: usize,
     tts_started_at: Option<Instant>,
+    tts_elapsed_before_pause: Duration,
     tts_current_duration: Duration,
+    tts_output: Option<MixerDeviceSink>,
+    tts_player: Option<Player>,
 }
 
 impl PdfizerApp {
@@ -95,6 +99,7 @@ impl PdfizerApp {
 
     pub fn new(cc: &eframe::CreationContext<'_>, config: AppConfig) -> Self {
         let tts_enabled = config.tts.enabled;
+        let tts_engine = TtsEngineKind::from_name(&config.tts.engine);
         let runtime = match PdfRuntime::new(&config) {
             Ok(runtime) => Some(runtime),
             Err(err) => {
@@ -156,7 +161,7 @@ impl PdfizerApp {
             tts_worker_tx: None,
             tts_worker_rx: None,
             tts_request_id: 0,
-            tts_engine: TtsEngineKind::DryRun,
+            tts_engine,
             tts_playback_state: TtsPlaybackState::Stopped,
             tts_active_sentence_index: 0,
             tts_follow_mode: true,
@@ -166,7 +171,10 @@ impl PdfizerApp {
             tts_prefetch_request_id: 0,
             tts_prefetch_in_flight: 0,
             tts_started_at: None,
+            tts_elapsed_before_pause: Duration::ZERO,
             tts_current_duration: Duration::ZERO,
+            tts_output: None,
+            tts_player: None,
         };
 
         app.restore_session(&cc.egui_ctx);
@@ -342,8 +350,13 @@ impl PdfizerApp {
         self.tts_failed_prefetch.clear();
         self.tts_prefetch_in_flight = 0;
         self.tts_started_at = None;
+        self.tts_elapsed_before_pause = Duration::ZERO;
         self.tts_current_duration = Duration::ZERO;
         self.tts_prefetch_request_id = self.tts_prefetch_request_id.wrapping_add(1);
+        if let Some(player) = &self.tts_player {
+            player.clear();
+            player.stop();
+        }
     }
 
     fn active_sentence(&self) -> Option<&crate::tts::SentencePlan> {
@@ -427,14 +440,25 @@ impl PdfizerApp {
 
     fn pause_tts_playback(&mut self) {
         if self.tts_playback_state == TtsPlaybackState::Playing {
+            if let Some(started_at) = self.tts_started_at.take() {
+                self.tts_elapsed_before_pause += started_at.elapsed();
+            }
+            if let Some(player) = &self.tts_player {
+                player.pause();
+            }
             self.tts_playback_state = TtsPlaybackState::Paused;
         }
     }
 
     fn resume_tts_playback(&mut self, ctx: &egui::Context) {
         if self.tts_playback_state == TtsPlaybackState::Paused {
-            self.tts_playback_state = TtsPlaybackState::Preparing;
-            self.try_activate_current_sentence(ctx);
+            if let Some(player) = &self.tts_player {
+                player.play();
+            }
+            self.tts_started_at = Some(Instant::now());
+            self.tts_playback_state = TtsPlaybackState::Playing;
+            self.focus_active_sentence(ctx);
+            ctx.request_repaint_after(Duration::from_millis(40));
         }
     }
 
@@ -473,10 +497,20 @@ impl PdfizerApp {
     }
 
     fn try_activate_current_sentence(&mut self, ctx: &egui::Context) {
-        if let Some(clip) = self.tts_prepared_clips.get(&self.tts_active_sentence_index) {
+        if let Some(clip) = self
+            .tts_prepared_clips
+            .get(&self.tts_active_sentence_index)
+            .cloned()
+        {
             self.tts_current_duration = Duration::from_millis(clip.estimated_duration_ms);
             self.tts_started_at = Some(Instant::now());
+            self.tts_elapsed_before_pause = Duration::ZERO;
             self.tts_playback_state = TtsPlaybackState::Playing;
+            if let Err(err) = self.play_prepared_clip(&clip) {
+                self.last_error = Some(format!("TTS playback failed: {err}"));
+                self.tts_playback_state = TtsPlaybackState::Failed;
+                return;
+            }
             self.focus_active_sentence(ctx);
             self.status_message = Some(format!(
                 "TTS playing sentence {}/{} using {} backend",
@@ -509,15 +543,66 @@ impl PdfizerApp {
             return;
         }
 
-        let Some(started_at) = self.tts_started_at else {
-            return;
-        };
+        let elapsed = self.tts_elapsed_before_pause
+            + self
+                .tts_started_at
+                .map(|started_at| started_at.elapsed())
+                .unwrap_or_default();
 
-        if started_at.elapsed() >= self.tts_current_duration {
+        if elapsed >= self.tts_current_duration {
             self.next_tts_sentence(ctx);
         } else {
             ctx.request_repaint_after(Duration::from_millis(40));
         }
+    }
+
+    fn seek_tts_sentence(&mut self, target_sentence_index: usize, ctx: &egui::Context) {
+        let Some(analysis) = &self.tts_analysis else {
+            return;
+        };
+        if target_sentence_index >= analysis.sentences.len() {
+            return;
+        }
+        self.tts_active_sentence_index = target_sentence_index;
+        self.tts_started_at = None;
+        self.tts_elapsed_before_pause = Duration::ZERO;
+        self.start_tts_prefetch();
+        self.try_activate_current_sentence(ctx);
+    }
+
+    fn ensure_audio_player(&mut self) -> Result<&Player> {
+        if self.tts_player.is_none() || self.tts_output.is_none() {
+            let output = DeviceSinkBuilder::open_default_sink()
+                .context("failed to open default audio output device")?;
+            let player = Player::connect_new(output.mixer());
+            self.tts_output = Some(output);
+            self.tts_player = Some(player);
+        }
+
+        self.tts_player
+            .as_ref()
+            .context("audio player was not initialized")
+    }
+
+    fn play_prepared_clip(&mut self, clip: &PreparedSentenceClip) -> Result<()> {
+        let volume = self.config.tts.volume;
+        let rate = self.config.tts.rate;
+        let player = self.ensure_audio_player()?;
+        player.clear();
+        player.stop();
+        player.set_volume(volume);
+        player.set_speed(rate);
+
+        if let Some(audio_path) = &clip.audio_path {
+            let file = fs::File::open(audio_path)
+                .with_context(|| format!("failed to open {}", audio_path.display()))?;
+            let decoder = Decoder::try_from(file)
+                .with_context(|| format!("failed to decode {}", audio_path.display()))?;
+            player.append(decoder);
+        }
+
+        player.play();
+        Ok(())
     }
 
     fn ensure_runtime(&mut self) -> Result<()> {
@@ -1118,6 +1203,18 @@ impl PdfizerApp {
             self.next_tts_sentence(ctx);
         }
         ui.checkbox(&mut self.tts_follow_mode, "Follow");
+        if let Some(analysis) = &self.tts_analysis {
+            let mut target_sentence = self.tts_active_sentence_index;
+            let response = ui.add(
+                egui::DragValue::new(&mut target_sentence)
+                    .speed(1.0)
+                    .range(0..=analysis.sentences.len().saturating_sub(1))
+                    .prefix("Sentence "),
+            );
+            if response.changed() {
+                self.seek_tts_sentence(target_sentence, ctx);
+            }
+        }
 
         if let Some(document) = &self.document {
             ui.separator();

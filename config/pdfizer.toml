@@ -57,6 +57,7 @@ log_dir = "logs"
 enabled = true
 auto_analyze_on_open = true
 language = "en"
+engine = "tone_preview"
 voice = "default"
 rate = 1.0
 volume = 1.0

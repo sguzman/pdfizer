@@ -155,6 +155,7 @@ impl AppConfig {
                 defaults.tts.auto_analyze_on_open,
             )?
             .set_default("tts.language", defaults.tts.language.clone())?
+            .set_default("tts.engine", defaults.tts.engine.clone())?
             .set_default("tts.voice", defaults.tts.voice.clone())?
             .set_default("tts.rate", f64::from(defaults.tts.rate))?
             .set_default("tts.volume", f64::from(defaults.tts.volume))?
@@ -565,6 +566,7 @@ pub struct TtsConfig {
     pub enabled: bool,
     pub auto_analyze_on_open: bool,
     pub language: String,
+    pub engine: String,
     pub voice: String,
     pub rate: f32,
     pub volume: f32,
@@ -591,6 +593,7 @@ impl Default for TtsConfig {
             enabled: true,
             auto_analyze_on_open: true,
             language: "en".into(),
+            engine: "tone_preview".into(),
             voice: "default".into(),
             rate: 1.0,
             volume: 1.0,
@@ -731,6 +734,7 @@ mod tests {
                 [tts]
                 sentence_prefetch = 12
                 language = "es"
+                engine = "dry_run"
             "##,
         )
         .unwrap();
@@ -743,6 +747,7 @@ mod tests {
         assert_eq!(config.rendering.default_preset, "crisp");
         assert_eq!(config.tts.sentence_prefetch, 12);
         assert_eq!(config.tts.language, "es");
+        assert_eq!(config.tts.engine, "dry_run");
     }
 
     #[test]
