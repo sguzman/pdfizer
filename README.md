@@ -20,7 +20,7 @@ The current build is no longer just a minimal viewer. It includes thumbnail navi
 - Zoom interactively and cache render results across zoom levels
 - Use tiled rendering for very large pages
 - Compare two render presets side by side
-- Inspect hovered pixels and drag out a selection rectangle
+- Inspect hovered pixels and select/copy text directly from the PDF
 - Show document metadata, render timing, and aggregate render statistics
 - Persist session state and save edited config back to disk
 - Export benchmark snapshots as CSV
@@ -101,3 +101,4 @@ RUST_LOG=pdfizer=trace cargo run
 ```
 
 The active implementation checklist lives in [docs/roadmap.md](/win/linux/Code/rust/pdfizer/docs/roadmap.md).
+The PDF-specific TTS integration plan lives in [docs/roadmaps/pdf-tts-integration-roadmap.md](/win/linux/Code/rust/pdfizer/docs/roadmaps/pdf-tts-integration-roadmap.md).

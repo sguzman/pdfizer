@@ -30,6 +30,7 @@ This roadmap is organized by feature dimension rather than by milestone. Checked
 - [ ] Spoken-text highlighting and timing alignment
 - [ ] Reading-order modeling for narration
 - [ ] Text extraction work intended specifically for TTS pipelines
+- [x] Separate TTS planning is tracked in [docs/roadmaps/pdf-tts-integration-roadmap.md](/win/linux/Code/rust/pdfizer/docs/roadmaps/pdf-tts-integration-roadmap.md)
 
 ## Configuration And Runtime Controls
 
