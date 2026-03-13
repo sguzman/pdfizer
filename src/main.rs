@@ -1,6 +1,7 @@
 mod app;
 mod config;
 mod pdf;
+mod tts;
 
 use anyhow::{Result, anyhow};
 use app::PdfizerApp;

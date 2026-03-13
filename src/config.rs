@@ -21,6 +21,7 @@ pub struct AppConfig {
     pub ui: UiConfig,
     pub logging: LoggingConfig,
     pub storage: StorageConfig,
+    pub tts: TtsConfig,
 }
 
 impl Default for AppConfig {
@@ -34,6 +35,7 @@ impl Default for AppConfig {
             ui: UiConfig::default(),
             logging: LoggingConfig::default(),
             storage: StorageConfig::default(),
+            tts: TtsConfig::default(),
         }
     }
 }
@@ -146,7 +148,67 @@ impl AppConfig {
                 "storage.benchmark_prefix",
                 defaults.storage.benchmark_prefix.clone(),
             )?
-            .set_default("storage.log_dir", defaults.storage.log_dir.clone())?;
+            .set_default("storage.log_dir", defaults.storage.log_dir.clone())?
+            .set_default("tts.enabled", defaults.tts.enabled)?
+            .set_default(
+                "tts.auto_analyze_on_open",
+                defaults.tts.auto_analyze_on_open,
+            )?
+            .set_default("tts.language", defaults.tts.language.clone())?
+            .set_default("tts.voice", defaults.tts.voice.clone())?
+            .set_default("tts.rate", f64::from(defaults.tts.rate))?
+            .set_default("tts.volume", f64::from(defaults.tts.volume))?
+            .set_default(
+                "tts.sentence_prefetch",
+                defaults.tts.sentence_prefetch as i64,
+            )?
+            .set_default("tts.audio_cache_dir", defaults.tts.audio_cache_dir.clone())?
+            .set_default("tts.artifacts_dir", defaults.tts.artifacts_dir.clone())?
+            .set_default(
+                "tts.experimental_pdf_sync",
+                defaults.tts.experimental_pdf_sync,
+            )?
+            .set_default(
+                "tts.verbose_degraded_logging",
+                defaults.tts.verbose_degraded_logging,
+            )?
+            .set_default(
+                "tts.min_chars_per_text_page",
+                defaults.tts.min_chars_per_text_page as i64,
+            )?
+            .set_default(
+                "tts.min_segments_per_text_page",
+                defaults.tts.min_segments_per_text_page as i64,
+            )?
+            .set_default(
+                "tts.min_text_page_ratio",
+                f64::from(defaults.tts.min_text_page_ratio),
+            )?
+            .set_default(
+                "tts.max_duplicate_line_ratio",
+                f64::from(defaults.tts.max_duplicate_line_ratio),
+            )?
+            .set_default(
+                "tts.max_repeated_edge_line_ratio",
+                f64::from(defaults.tts.max_repeated_edge_line_ratio),
+            )?
+            .set_default(
+                "tts.repeated_edge_line_min_pages",
+                defaults.tts.repeated_edge_line_min_pages as i64,
+            )?
+            .set_default(
+                "tts.page_edge_line_scan_depth",
+                defaults.tts.page_edge_line_scan_depth as i64,
+            )?
+            .set_default(
+                "tts.max_edge_line_length",
+                defaults.tts.max_edge_line_length as i64,
+            )?
+            .set_default(
+                "tts.min_chars_per_line_kept",
+                defaults.tts.min_chars_per_line_kept as i64,
+            )?
+            .set_default("tts.abbreviations", defaults.tts.abbreviations.clone())?;
 
         for path in paths {
             builder = builder.add_source(File::from(path).required(false));
@@ -230,6 +292,30 @@ impl AppConfig {
         };
 
         Ok(dir.join(file_name))
+    }
+
+    pub fn tts_artifacts_dir(&self) -> Result<PathBuf> {
+        let path = self.resolve_storage_dir(&self.tts.artifacts_dir)?;
+        fs::create_dir_all(&path).with_context(|| {
+            format!("failed to create TTS artifact directory {}", path.display())
+        })?;
+        Ok(path)
+    }
+
+    pub fn tts_audio_cache_dir(&self) -> Result<PathBuf> {
+        let path = self.resolve_storage_dir(&self.tts.audio_cache_dir)?;
+        fs::create_dir_all(&path).with_context(|| {
+            format!(
+                "failed to create TTS audio cache directory {}",
+                path.display()
+            )
+        })?;
+        Ok(path)
+    }
+
+    pub fn tts_artifact_path(&self, source_path: &Path) -> Result<PathBuf> {
+        let dir = self.tts_artifacts_dir()?;
+        Ok(dir.join(format!("{}.toml", stable_source_fingerprint(source_path)?)))
     }
 
     pub fn to_native_options(&self) -> eframe::NativeOptions {
@@ -474,6 +560,68 @@ impl Default for StorageConfig {
     }
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+pub struct TtsConfig {
+    pub enabled: bool,
+    pub auto_analyze_on_open: bool,
+    pub language: String,
+    pub voice: String,
+    pub rate: f32,
+    pub volume: f32,
+    pub sentence_prefetch: usize,
+    pub audio_cache_dir: String,
+    pub artifacts_dir: String,
+    pub experimental_pdf_sync: bool,
+    pub verbose_degraded_logging: bool,
+    pub min_chars_per_text_page: usize,
+    pub min_segments_per_text_page: usize,
+    pub min_text_page_ratio: f32,
+    pub max_duplicate_line_ratio: f32,
+    pub max_repeated_edge_line_ratio: f32,
+    pub repeated_edge_line_min_pages: usize,
+    pub page_edge_line_scan_depth: usize,
+    pub max_edge_line_length: usize,
+    pub min_chars_per_line_kept: usize,
+    pub abbreviations: Vec<String>,
+}
+
+impl Default for TtsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            auto_analyze_on_open: true,
+            language: "en".into(),
+            voice: "default".into(),
+            rate: 1.0,
+            volume: 1.0,
+            sentence_prefetch: 8,
+            audio_cache_dir: "tts/audio".into(),
+            artifacts_dir: "tts/artifacts".into(),
+            experimental_pdf_sync: false,
+            verbose_degraded_logging: true,
+            min_chars_per_text_page: 80,
+            min_segments_per_text_page: 24,
+            min_text_page_ratio: 0.6,
+            max_duplicate_line_ratio: 0.35,
+            max_repeated_edge_line_ratio: 0.35,
+            repeated_edge_line_min_pages: 3,
+            page_edge_line_scan_depth: 3,
+            max_edge_line_length: 96,
+            min_chars_per_line_kept: 2,
+            abbreviations: vec![
+                "mr.".into(),
+                "mrs.".into(),
+                "ms.".into(),
+                "dr.".into(),
+                "prof.".into(),
+                "etc.".into(),
+                "e.g.".into(),
+                "i.e.".into(),
+            ],
+        }
+    }
+}
+
 fn parse_hex_color(value: &str) -> Option<Color32> {
     let trimmed = value.trim().trim_start_matches('#');
 
@@ -520,6 +668,25 @@ fn unix_timestamp_secs() -> u64 {
         .as_secs()
 }
 
+fn stable_source_fingerprint(path: &Path) -> Result<String> {
+    use std::hash::{DefaultHasher, Hash, Hasher};
+
+    let metadata = fs::metadata(path)
+        .with_context(|| format!("failed to read metadata for {}", path.display()))?;
+    let modified = metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0);
+
+    let mut hasher = DefaultHasher::new();
+    path.display().to_string().hash(&mut hasher);
+    metadata.len().hash(&mut hasher);
+    modified.hash(&mut hasher);
+    Ok(format!("{:016x}", hasher.finish()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -534,6 +701,8 @@ mod tests {
         assert!(config.rendering.initial_zoom < config.rendering.max_zoom);
         assert_eq!(config.rendering.compare_presets.len(), 2);
         assert_eq!(config.mode, AppMode::Prod);
+        assert!(config.tts.enabled);
+        assert_eq!(config.tts.sentence_prefetch, 8);
     }
 
     #[test]
@@ -558,6 +727,10 @@ mod tests {
                 cache_zoom_bucket = 0.1
                 default_preset = "crisp"
                 compare_presets = ["balanced", "grayscale"]
+
+                [tts]
+                sentence_prefetch = 12
+                language = "es"
             "##,
         )
         .unwrap();
@@ -568,6 +741,8 @@ mod tests {
         assert_eq!(config.rendering.initial_zoom, 2.0);
         assert_eq!(config.rendering.texture_filter, TextureFilterName::Nearest);
         assert_eq!(config.rendering.default_preset, "crisp");
+        assert_eq!(config.tts.sentence_prefetch, 12);
+        assert_eq!(config.tts.language, "es");
     }
 
     #[test]
@@ -577,6 +752,7 @@ mod tests {
         assert!(preview.contains("[window]"));
         assert!(preview.contains("[rendering]"));
         assert!(preview.contains("[storage]"));
+        assert!(preview.contains("[tts]"));
     }
 
     #[test]
@@ -593,5 +769,19 @@ mod tests {
         );
         assert!(file_name.starts_with("pdfizer-"));
         assert!(file_name.ends_with(".log"));
+    }
+
+    #[test]
+    fn tts_artifact_path_is_stable() {
+        let temp = tempdir().unwrap();
+        let source_path = temp.path().join("fixture.pdf");
+        fs::write(&source_path, b"%PDF-1.4").unwrap();
+
+        let config = AppConfig::default();
+        let first = config.tts_artifact_path(&source_path).unwrap();
+        let second = config.tts_artifact_path(&source_path).unwrap();
+
+        assert_eq!(first, second);
+        assert!(first.to_string_lossy().contains("tts"));
     }
 }

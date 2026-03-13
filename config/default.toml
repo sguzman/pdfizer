@@ -52,3 +52,26 @@ session_file = "session.toml"
 benchmark_dir = "benchmarks"
 benchmark_prefix = "render-snapshot"
 log_dir = "logs"
+
+[tts]
+enabled = true
+auto_analyze_on_open = true
+language = "en"
+voice = "default"
+rate = 1.0
+volume = 1.0
+sentence_prefetch = 8
+audio_cache_dir = "tts/audio"
+artifacts_dir = "tts/artifacts"
+experimental_pdf_sync = false
+verbose_degraded_logging = true
+min_chars_per_text_page = 80
+min_segments_per_text_page = 24
+min_text_page_ratio = 0.6
+max_duplicate_line_ratio = 0.35
+max_repeated_edge_line_ratio = 0.35
+repeated_edge_line_min_pages = 3
+page_edge_line_scan_depth = 3
+max_edge_line_length = 96
+min_chars_per_line_kept = 2
+abbreviations = ["mr.", "mrs.", "ms.", "dr.", "prof.", "etc.", "e.g.", "i.e."]

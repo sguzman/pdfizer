@@ -213,6 +213,19 @@ impl PdfDocument<'_> {
             .collect())
     }
 
+    pub fn full_text_for_page(&self, page_index: usize) -> Result<String> {
+        let page = self
+            .document
+            .pages()
+            .get(page_index as u16)
+            .with_context(|| format!("page index {page_index} is out of bounds"))?;
+        let text = page
+            .text()
+            .map_err(|err| anyhow!("failed to load page text: {err}"))?;
+
+        Ok(text.all())
+    }
+
     #[instrument(skip(self))]
     pub fn render_page_image(&self, request: &RenderRequest) -> Result<RenderedPageImage> {
         let started = Instant::now();

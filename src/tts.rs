@@ -1,0 +1,735 @@
+use std::{
+    collections::{HashMap, HashSet},
+    fs,
+    hash::{DefaultHasher, Hash, Hasher},
+    path::{Path, PathBuf},
+    time::{SystemTime, UNIX_EPOCH},
+};
+
+use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
+use tracing::{info, instrument};
+
+use crate::{
+    config::AppConfig,
+    pdf::{PdfDocument, PdfRuntime},
+};
+
+const PDF_LIGATURES: [(&str, &str); 7] = [
+    ("\u{FB00}", "ff"),
+    ("\u{FB01}", "fi"),
+    ("\u{FB02}", "fl"),
+    ("\u{FB03}", "ffi"),
+    ("\u{FB04}", "ffl"),
+    ("\u{FB05}", "ft"),
+    ("\u{FB06}", "st"),
+];
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PdfTtsMode {
+    HighTextTrust,
+    MixedTextTrust,
+    OcrRequired,
+    RenderOnlyNoSync,
+}
+
+impl PdfTtsMode {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::HighTextTrust => "high_text_trust",
+            Self::MixedTextTrust => "mixed_text_trust",
+            Self::OcrRequired => "ocr_required",
+            Self::RenderOnlyNoSync => "render_only_no_sync",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TextRange {
+    pub start: usize,
+    pub end: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PageRange {
+    pub start_page: usize,
+    pub end_page: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SentencePlan {
+    pub id: u64,
+    pub text: String,
+    pub range: TextRange,
+    pub page_range: PageRange,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PageTtsArtifact {
+    pub page_index: usize,
+    pub original_char_count: usize,
+    pub normalized_char_count: usize,
+    pub segment_count: usize,
+    pub duplicate_lines_removed: usize,
+    pub repeated_edge_lines_removed: usize,
+    pub empty_after_normalization: bool,
+    pub range: Option<TextRange>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct NormalizationStats {
+    pub pages_with_text: usize,
+    pub empty_pages: usize,
+    pub original_chars: usize,
+    pub normalized_chars: usize,
+    pub ligatures_replaced: usize,
+    pub soft_hyphens_removed: usize,
+    pub zero_width_chars_removed: usize,
+    pub duplicate_lines_removed: usize,
+    pub repeated_edge_lines_removed: usize,
+    pub joined_hyphenations: usize,
+    pub collapsed_whitespace_runs: usize,
+    pub sentence_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TtsAnalysisArtifacts {
+    pub source_path: PathBuf,
+    pub source_fingerprint: String,
+    pub generated_at_unix_secs: u64,
+    pub mode: PdfTtsMode,
+    pub confidence: f32,
+    pub tts_text: String,
+    pub sentences: Vec<SentencePlan>,
+    pub pages: Vec<PageTtsArtifact>,
+    pub stats: NormalizationStats,
+    pub artifact_path: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone)]
+pub enum TtsWorkerMessage {
+    Completed {
+        request_id: u64,
+        artifacts: TtsAnalysisArtifacts,
+    },
+    Failed {
+        request_id: u64,
+        error: String,
+    },
+}
+
+#[instrument(skip(config))]
+pub fn analyze_pdf_for_tts(config: &AppConfig, source_path: &Path) -> Result<TtsAnalysisArtifacts> {
+    let runtime =
+        PdfRuntime::new(config).context("failed to initialize Pdfium for TTS analysis")?;
+    let document = runtime
+        .open_document(source_path)
+        .with_context(|| format!("failed to open {} for TTS analysis", source_path.display()))?;
+    build_artifacts_from_document(config, source_path, &document)
+}
+
+pub fn persist_artifacts(config: &AppConfig, artifacts: &TtsAnalysisArtifacts) -> Result<PathBuf> {
+    let path = config.tts_artifact_path(&artifacts.source_path)?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+
+    let contents =
+        toml::to_string_pretty(artifacts).context("failed to serialize TTS artifacts")?;
+    fs::write(&path, contents)
+        .with_context(|| format!("failed to write TTS artifacts to {}", path.display()))?;
+    Ok(path)
+}
+
+#[instrument(skip(config, document))]
+pub fn build_artifacts_from_document(
+    config: &AppConfig,
+    source_path: &Path,
+    document: &PdfDocument<'_>,
+) -> Result<TtsAnalysisArtifacts> {
+    let fingerprint = fingerprint_document_path(source_path)?;
+    let repeated_edge_lines = collect_repeated_edge_lines(config, document)?;
+    let mut stats = NormalizationStats::default();
+    let mut full_text = String::new();
+    let mut pages = Vec::with_capacity(document.metadata.page_count);
+
+    for page_index in 0..document.metadata.page_count {
+        let page_text = document.full_text_for_page(page_index)?;
+        let segment_count = document.text_segments_for_page(page_index)?.len();
+        let normalized = normalize_page_text(&page_text, &repeated_edge_lines, config);
+
+        stats.original_chars += page_text.chars().count();
+        stats.normalized_chars += normalized.text.chars().count();
+        stats.ligatures_replaced += normalized.stats.ligatures_replaced;
+        stats.soft_hyphens_removed += normalized.stats.soft_hyphens_removed;
+        stats.zero_width_chars_removed += normalized.stats.zero_width_chars_removed;
+        stats.duplicate_lines_removed += normalized.stats.duplicate_lines_removed;
+        stats.repeated_edge_lines_removed += normalized.stats.repeated_edge_lines_removed;
+        stats.joined_hyphenations += normalized.stats.joined_hyphenations;
+        stats.collapsed_whitespace_runs += normalized.stats.collapsed_whitespace_runs;
+
+        if normalized.text.trim().is_empty() {
+            stats.empty_pages += 1;
+            pages.push(PageTtsArtifact {
+                page_index,
+                original_char_count: page_text.chars().count(),
+                normalized_char_count: 0,
+                segment_count,
+                duplicate_lines_removed: normalized.stats.duplicate_lines_removed,
+                repeated_edge_lines_removed: normalized.stats.repeated_edge_lines_removed,
+                empty_after_normalization: true,
+                range: None,
+            });
+            continue;
+        }
+
+        stats.pages_with_text += 1;
+        if !full_text.is_empty() {
+            full_text.push_str("\n\n");
+        }
+        let start = full_text.len();
+        full_text.push_str(&normalized.text);
+        let end = full_text.len();
+
+        pages.push(PageTtsArtifact {
+            page_index,
+            original_char_count: page_text.chars().count(),
+            normalized_char_count: normalized.text.chars().count(),
+            segment_count,
+            duplicate_lines_removed: normalized.stats.duplicate_lines_removed,
+            repeated_edge_lines_removed: normalized.stats.repeated_edge_lines_removed,
+            empty_after_normalization: false,
+            range: Some(TextRange { start, end }),
+        });
+    }
+
+    let sentences = build_sentence_plan(&full_text, &pages, &fingerprint, config);
+    stats.sentence_count = sentences.len();
+
+    let (mode, confidence) =
+        classify_pdf_for_tts(document.metadata.page_count, &pages, &stats, config);
+
+    let mut artifacts = TtsAnalysisArtifacts {
+        source_path: source_path.to_path_buf(),
+        source_fingerprint: fingerprint,
+        generated_at_unix_secs: unix_timestamp_secs(),
+        mode,
+        confidence,
+        tts_text: full_text,
+        sentences,
+        pages,
+        stats,
+        artifact_path: None,
+    };
+
+    let artifact_path = persist_artifacts(config, &artifacts)?;
+    artifacts.artifact_path = Some(artifact_path.clone());
+
+    info!(
+        path = %source_path.display(),
+        mode = %artifacts.mode.label(),
+        confidence = artifacts.confidence,
+        sentences = artifacts.sentences.len(),
+        chars = artifacts.stats.normalized_chars,
+        artifact = %artifact_path.display(),
+        "built PDF TTS analysis artifacts"
+    );
+
+    Ok(artifacts)
+}
+
+fn classify_pdf_for_tts(
+    total_pages: usize,
+    pages: &[PageTtsArtifact],
+    stats: &NormalizationStats,
+    config: &AppConfig,
+) -> (PdfTtsMode, f32) {
+    if stats.normalized_chars == 0 || stats.pages_with_text == 0 {
+        return (PdfTtsMode::OcrRequired, 0.05);
+    }
+
+    if stats.sentence_count == 0 {
+        return (PdfTtsMode::RenderOnlyNoSync, 0.15);
+    }
+
+    let coverage_ratio = stats.pages_with_text as f32 / total_pages.max(1) as f32;
+    let duplicate_ratio =
+        stats.duplicate_lines_removed as f32 / (stats.pages_with_text.max(1) as f32 * 4.0);
+    let boilerplate_ratio =
+        stats.repeated_edge_lines_removed as f32 / (stats.pages_with_text.max(1) as f32 * 4.0);
+    let avg_chars_per_text_page =
+        stats.normalized_chars as f32 / stats.pages_with_text.max(1) as f32;
+    let avg_segments_per_text_page = pages
+        .iter()
+        .filter(|page| !page.empty_after_normalization)
+        .map(|page| page.segment_count)
+        .sum::<usize>() as f32
+        / stats.pages_with_text.max(1) as f32;
+
+    let high_trust = coverage_ratio >= config.tts.min_text_page_ratio
+        && avg_chars_per_text_page >= config.tts.min_chars_per_text_page as f32
+        && avg_segments_per_text_page >= config.tts.min_segments_per_text_page as f32
+        && duplicate_ratio <= config.tts.max_duplicate_line_ratio
+        && boilerplate_ratio <= config.tts.max_repeated_edge_line_ratio;
+
+    if high_trust {
+        let confidence = (0.72
+            + (coverage_ratio * 0.1)
+            + (avg_segments_per_text_page.min(120.0) / 120.0) * 0.08)
+            .clamp(0.0, 0.98);
+        return (PdfTtsMode::HighTextTrust, confidence);
+    }
+
+    let mixed_confidence = (0.35
+        + (coverage_ratio * 0.2)
+        + ((avg_chars_per_text_page / config.tts.min_chars_per_text_page.max(1) as f32) * 0.05))
+        .clamp(0.0, 0.7);
+    (PdfTtsMode::MixedTextTrust, mixed_confidence)
+}
+
+fn build_sentence_plan(
+    text: &str,
+    pages: &[PageTtsArtifact],
+    fingerprint: &str,
+    config: &AppConfig,
+) -> Vec<SentencePlan> {
+    split_sentences(text, &config.tts.abbreviations)
+        .into_iter()
+        .map(|(range, sentence)| {
+            let page_range = sentence_page_range(&range, pages);
+            let mut hasher = DefaultHasher::new();
+            fingerprint.hash(&mut hasher);
+            range.start.hash(&mut hasher);
+            range.end.hash(&mut hasher);
+            sentence.hash(&mut hasher);
+            SentencePlan {
+                id: hasher.finish(),
+                text: sentence,
+                range,
+                page_range,
+            }
+        })
+        .collect()
+}
+
+fn sentence_page_range(range: &TextRange, pages: &[PageTtsArtifact]) -> PageRange {
+    let mut start_page = 0;
+    let mut end_page = 0;
+
+    for page in pages {
+        let Some(page_range) = &page.range else {
+            continue;
+        };
+        if page_range.end > range.start {
+            start_page = page.page_index;
+            break;
+        }
+    }
+
+    for page in pages.iter().rev() {
+        let Some(page_range) = &page.range else {
+            continue;
+        };
+        if page_range.start < range.end {
+            end_page = page.page_index;
+            break;
+        }
+    }
+
+    PageRange {
+        start_page,
+        end_page,
+    }
+}
+
+fn split_sentences(text: &str, abbreviations: &[String]) -> Vec<(TextRange, String)> {
+    let mut out = Vec::new();
+    let abbreviation_set: HashSet<String> = abbreviations
+        .iter()
+        .map(|value| value.trim().to_ascii_lowercase())
+        .collect();
+    let bytes = text.as_bytes();
+    let mut start = 0usize;
+    let mut index = 0usize;
+
+    while index < bytes.len() {
+        let ch = text[index..].chars().next().unwrap_or_default();
+        let ch_len = ch.len_utf8();
+        let should_break = match ch {
+            '.' | '!' | '?' => {
+                let candidate = text[start..index + ch_len].trim();
+                let last_token = candidate
+                    .split_whitespace()
+                    .last()
+                    .unwrap_or_default()
+                    .trim_matches(|c: char| {
+                        c == '"' || c == '\'' || c == ')' || c == ']' || c == '}'
+                    })
+                    .to_ascii_lowercase();
+                let next_non_ws = text[index + ch_len..].chars().find(|c| !c.is_whitespace());
+                !abbreviation_set.contains(&last_token) && next_non_ws.is_some()
+            }
+            '\n' => text[index + ch_len..].starts_with('\n'),
+            _ => false,
+        };
+
+        if should_break {
+            let end = index + ch_len;
+            let sentence = text[start..end].trim().to_string();
+            if !sentence.is_empty() {
+                let trimmed_start = start
+                    + text[start..end]
+                        .find(|c: char| !c.is_whitespace())
+                        .unwrap_or(0);
+                let trimmed_end = trimmed_start + sentence.len();
+                out.push((
+                    TextRange {
+                        start: trimmed_start,
+                        end: trimmed_end,
+                    },
+                    sentence,
+                ));
+            }
+
+            start = end;
+            while start < bytes.len() {
+                let next = text[start..].chars().next().unwrap_or_default();
+                if !next.is_whitespace() {
+                    break;
+                }
+                start += next.len_utf8();
+            }
+            index = start;
+            continue;
+        }
+
+        index += ch_len;
+    }
+
+    if start < text.len() {
+        let sentence = text[start..].trim().to_string();
+        if !sentence.is_empty() {
+            let trimmed_start = start
+                + text[start..]
+                    .find(|c: char| !c.is_whitespace())
+                    .unwrap_or(0);
+            let trimmed_end = trimmed_start + sentence.len();
+            out.push((
+                TextRange {
+                    start: trimmed_start,
+                    end: trimmed_end,
+                },
+                sentence,
+            ));
+        }
+    }
+
+    out
+}
+
+#[derive(Debug, Default)]
+struct PageNormalizationStats {
+    ligatures_replaced: usize,
+    soft_hyphens_removed: usize,
+    zero_width_chars_removed: usize,
+    duplicate_lines_removed: usize,
+    repeated_edge_lines_removed: usize,
+    joined_hyphenations: usize,
+    collapsed_whitespace_runs: usize,
+}
+
+#[derive(Debug)]
+struct NormalizedPageText {
+    text: String,
+    stats: PageNormalizationStats,
+}
+
+fn normalize_page_text(
+    raw_text: &str,
+    repeated_edge_lines: &HashSet<String>,
+    config: &AppConfig,
+) -> NormalizedPageText {
+    let mut stats = PageNormalizationStats::default();
+    let mut normalized = raw_text.replace("\r\n", "\n");
+
+    for (ligature, replacement) in PDF_LIGATURES {
+        let count = normalized.matches(ligature).count();
+        if count > 0 {
+            stats.ligatures_replaced += count;
+            normalized = normalized.replace(ligature, replacement);
+        }
+    }
+
+    let soft_hyphens = normalized.matches('\u{00AD}').count();
+    if soft_hyphens > 0 {
+        stats.soft_hyphens_removed += soft_hyphens;
+        normalized = normalized.replace('\u{00AD}', "");
+    }
+
+    let zero_widths = ['\u{200B}', '\u{200C}', '\u{200D}', '\u{2060}', '\u{FEFF}'];
+    for marker in zero_widths {
+        let count = normalized.matches(marker).count();
+        if count > 0 {
+            stats.zero_width_chars_removed += count;
+            normalized = normalized.replace(marker, "");
+        }
+    }
+
+    let mut filtered_lines = Vec::new();
+    let mut previous_normalized_line = String::new();
+    for line in normalized.lines() {
+        let compact = collapse_inline_whitespace(line.trim(), &mut stats);
+        if compact.is_empty() {
+            filtered_lines.push(String::new());
+            previous_normalized_line.clear();
+            continue;
+        }
+        if repeated_edge_lines.contains(&compact) {
+            stats.repeated_edge_lines_removed += 1;
+            continue;
+        }
+        if compact == previous_normalized_line {
+            stats.duplicate_lines_removed += 1;
+            continue;
+        }
+        previous_normalized_line = compact.clone();
+        filtered_lines.push(compact);
+    }
+
+    let mut paragraphs = Vec::new();
+    let mut current = String::new();
+    for line in filtered_lines {
+        if line.is_empty() {
+            if !current.is_empty() {
+                paragraphs.push(current.trim().to_string());
+                current.clear();
+            }
+            continue;
+        }
+
+        if current.is_empty() {
+            current.push_str(&line);
+            continue;
+        }
+
+        if current.ends_with('-')
+            && line
+                .chars()
+                .next()
+                .is_some_and(|ch| ch.is_ascii_lowercase())
+        {
+            current.pop();
+            current.push_str(&line);
+            stats.joined_hyphenations += 1;
+        } else {
+            current.push(' ');
+            current.push_str(&line);
+        }
+    }
+
+    if !current.is_empty() {
+        paragraphs.push(current.trim().to_string());
+    }
+
+    let text = paragraphs
+        .into_iter()
+        .filter(|paragraph| paragraph.chars().count() >= config.tts.min_chars_per_line_kept)
+        .collect::<Vec<_>>()
+        .join("\n\n");
+
+    NormalizedPageText { text, stats }
+}
+
+fn collapse_inline_whitespace(line: &str, stats: &mut PageNormalizationStats) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut saw_ws = false;
+
+    for ch in line.chars() {
+        if ch.is_whitespace() {
+            if !saw_ws {
+                out.push(' ');
+                saw_ws = true;
+            } else {
+                stats.collapsed_whitespace_runs += 1;
+            }
+        } else {
+            saw_ws = false;
+            out.push(ch);
+        }
+    }
+
+    out.trim().to_string()
+}
+
+fn collect_repeated_edge_lines(
+    config: &AppConfig,
+    document: &PdfDocument<'_>,
+) -> Result<HashSet<String>> {
+    let mut counts: HashMap<String, HashSet<usize>> = HashMap::new();
+
+    for page_index in 0..document.metadata.page_count {
+        let page_text = document.full_text_for_page(page_index)?;
+        let lines = page_text
+            .lines()
+            .map(|line| line.trim())
+            .filter(|line| !line.is_empty())
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+
+        let mut candidates = Vec::new();
+        let edge_depth = config.tts.page_edge_line_scan_depth;
+        candidates.extend(lines.iter().take(edge_depth).cloned());
+        candidates.extend(lines.iter().rev().take(edge_depth).cloned());
+
+        for candidate in candidates {
+            let entry = counts.entry(candidate).or_default();
+            entry.insert(page_index);
+        }
+    }
+
+    Ok(counts
+        .into_iter()
+        .filter(|(line, pages)| {
+            pages.len() >= config.tts.repeated_edge_line_min_pages
+                && line.chars().count() <= config.tts.max_edge_line_length
+        })
+        .map(|(line, _)| line)
+        .collect())
+}
+
+fn fingerprint_document_path(path: &Path) -> Result<String> {
+    let metadata = fs::metadata(path)
+        .with_context(|| format!("failed to read metadata for {}", path.display()))?;
+    let modified_secs = metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0);
+
+    let mut hasher = DefaultHasher::new();
+    path.display().to_string().hash(&mut hasher);
+    metadata.len().hash(&mut hasher);
+    modified_secs.hash(&mut hasher);
+    Ok(format!("{:016x}", hasher.finish()))
+}
+
+fn unix_timestamp_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::AppConfig;
+
+    #[test]
+    fn normalization_replaces_ligatures_and_soft_hyphens() {
+        let config = AppConfig::default();
+        let repeated = HashSet::new();
+        let normalized = normalize_page_text(
+            "of\u{FB01}ce co\u{00AD}operate\n\nHeader",
+            &repeated,
+            &config,
+        );
+
+        assert!(normalized.text.contains("office"));
+        assert!(normalized.text.contains("cooperate"));
+        assert_eq!(normalized.stats.ligatures_replaced, 1);
+        assert_eq!(normalized.stats.soft_hyphens_removed, 1);
+    }
+
+    #[test]
+    fn normalization_suppresses_repeated_edge_lines_and_duplicates() {
+        let config = AppConfig::default();
+        let repeated = HashSet::from([String::from("Header")]);
+        let normalized = normalize_page_text("Header\nAlpha\nAlpha\nBeta", &repeated, &config);
+
+        assert_eq!(normalized.text, "Alpha Beta");
+        assert_eq!(normalized.stats.repeated_edge_lines_removed, 1);
+        assert_eq!(normalized.stats.duplicate_lines_removed, 1);
+    }
+
+    #[test]
+    fn sentence_splitter_respects_abbreviations() {
+        let mut config = AppConfig::default();
+        config.tts.abbreviations = vec!["dr.".into()];
+
+        let sentences = build_sentence_plan(
+            "Dr. Smith arrived. Then he left.",
+            &[PageTtsArtifact {
+                page_index: 0,
+                original_char_count: 32,
+                normalized_char_count: 32,
+                segment_count: 10,
+                duplicate_lines_removed: 0,
+                repeated_edge_lines_removed: 0,
+                empty_after_normalization: false,
+                range: Some(TextRange { start: 0, end: 32 }),
+            }],
+            "fixture",
+            &config,
+        );
+
+        assert_eq!(sentences.len(), 2);
+        assert_eq!(sentences[0].text, "Dr. Smith arrived.");
+        assert_eq!(sentences[1].text, "Then he left.");
+    }
+
+    #[test]
+    fn classifier_marks_empty_documents_as_ocr_required() {
+        let config = AppConfig::default();
+        let stats = NormalizationStats::default();
+        let (mode, confidence) = classify_pdf_for_tts(4, &[], &stats, &config);
+
+        assert_eq!(mode, PdfTtsMode::OcrRequired);
+        assert!(confidence < 0.1);
+    }
+
+    #[test]
+    fn classifier_marks_clean_text_as_high_trust() {
+        let config = AppConfig::default();
+        let pages = vec![
+            PageTtsArtifact {
+                page_index: 0,
+                original_char_count: 400,
+                normalized_char_count: 380,
+                segment_count: 120,
+                duplicate_lines_removed: 0,
+                repeated_edge_lines_removed: 0,
+                empty_after_normalization: false,
+                range: Some(TextRange { start: 0, end: 380 }),
+            },
+            PageTtsArtifact {
+                page_index: 1,
+                original_char_count: 420,
+                normalized_char_count: 390,
+                segment_count: 130,
+                duplicate_lines_removed: 0,
+                repeated_edge_lines_removed: 0,
+                empty_after_normalization: false,
+                range: Some(TextRange {
+                    start: 382,
+                    end: 772,
+                }),
+            },
+        ];
+        let stats = NormalizationStats {
+            pages_with_text: 2,
+            empty_pages: 0,
+            original_chars: 820,
+            normalized_chars: 770,
+            sentence_count: 18,
+            ..NormalizationStats::default()
+        };
+
+        let (mode, confidence) = classify_pdf_for_tts(2, &pages, &stats, &config);
+        assert_eq!(mode, PdfTtsMode::HighTextTrust);
+        assert!(confidence > 0.7);
+    }
+}

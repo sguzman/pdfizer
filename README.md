@@ -4,6 +4,8 @@
 
 The current build is no longer just a minimal viewer. It includes thumbnail navigation, cached page renders, large-page tiled rendering, comparison presets, a pixel inspector, benchmark export, persisted session state, layered TOML config, and file-backed tracing.
 
+It also now includes the first PDF TTS groundwork tranche: canonical PDF text analysis, normalization, sentence planning, trust classification, persisted TTS-sidecar artifacts, and in-app diagnostics. Audio playback and sentence-following sync are still future work.
+
 ## Stack
 
 - Rust 2024
@@ -25,6 +27,7 @@ The current build is no longer just a minimal viewer. It includes thumbnail navi
 - Persist session state and save edited config back to disk
 - Export benchmark snapshots as CSV
 - Write logs to stdout and a file sink
+- Build and inspect canonical PDF TTS analysis artifacts in the background when a document opens
 
 ## Pdfium Runtime
 

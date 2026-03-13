@@ -2,6 +2,8 @@ use std::{
     collections::HashMap,
     fs,
     path::PathBuf,
+    sync::mpsc::{self, Receiver, TryRecvError},
+    thread,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -21,6 +23,7 @@ use crate::{
         RenderPreset, RenderRequest, RenderedPageImage, SearchHit, TextSegmentData,
         TileRenderRequest,
     },
+    tts::{self, PdfTtsMode, TtsAnalysisArtifacts, TtsWorkerMessage},
 };
 
 pub struct PdfizerApp {
@@ -56,10 +59,16 @@ pub struct PdfizerApp {
     highlight_text: bool,
     text_rect_cache: HashMap<usize, Vec<PdfRectData>>,
     text_segment_cache: HashMap<usize, Vec<TextSegmentData>>,
+    current_document_path: Option<PathBuf>,
+    tts_analysis: Option<TtsAnalysisArtifacts>,
+    tts_analysis_status: TtsAnalysisStatus,
+    tts_worker_rx: Option<Receiver<TtsWorkerMessage>>,
+    tts_request_id: u64,
 }
 
 impl PdfizerApp {
     pub fn new(cc: &eframe::CreationContext<'_>, config: AppConfig) -> Self {
+        let tts_enabled = config.tts.enabled;
         let runtime = match PdfRuntime::new(&config) {
             Ok(runtime) => Some(runtime),
             Err(err) => {
@@ -111,6 +120,15 @@ impl PdfizerApp {
             highlight_text: false,
             text_rect_cache: HashMap::new(),
             text_segment_cache: HashMap::new(),
+            current_document_path: None,
+            tts_analysis: None,
+            tts_analysis_status: if tts_enabled {
+                TtsAnalysisStatus::Idle
+            } else {
+                TtsAnalysisStatus::Disabled
+            },
+            tts_worker_rx: None,
+            tts_request_id: 0,
         };
 
         app.restore_session(&cc.egui_ctx);
@@ -133,6 +151,7 @@ impl PdfizerApp {
             Ok(document) => {
                 info!(path = %path.display(), pages = document.metadata.page_count, "opened PDF");
                 self.document = Some(document);
+                self.current_document_path = Some(path.clone());
                 self.current_page = 0;
                 self.last_error = None;
                 self.primary_view = None;
@@ -144,14 +163,112 @@ impl PdfizerApp {
                 self.active_search_result = None;
                 self.text_rect_cache.clear();
                 self.text_segment_cache.clear();
+                self.tts_analysis = None;
+                self.tts_analysis_status = if self.config.tts.enabled {
+                    TtsAnalysisStatus::Idle
+                } else {
+                    TtsAnalysisStatus::Disabled
+                };
                 self.single_scroll_offset = Vec2::ZERO;
                 self.continuous_scroll_offset = Vec2::ZERO;
                 self.render_current_page(ctx);
+                self.start_tts_analysis(path);
                 self.persist_session();
             }
             Err(err) => {
                 error!(path = %path.display(), error = %err, "failed to open PDF");
                 self.last_error = Some(err.to_string());
+            }
+        }
+    }
+
+    fn start_tts_analysis(&mut self, path: PathBuf) {
+        self.tts_worker_rx = None;
+
+        if !self.config.tts.enabled {
+            self.tts_analysis_status = TtsAnalysisStatus::Disabled;
+            return;
+        }
+
+        if !self.config.tts.auto_analyze_on_open {
+            self.tts_analysis_status = TtsAnalysisStatus::Idle;
+            return;
+        }
+
+        self.tts_request_id = self.tts_request_id.wrapping_add(1);
+        let request_id = self.tts_request_id;
+        let config = self.config.clone();
+        let (tx, rx) = mpsc::channel();
+        self.tts_worker_rx = Some(rx);
+        self.tts_analysis_status = TtsAnalysisStatus::Analyzing;
+
+        thread::spawn(move || {
+            let message = match tts::analyze_pdf_for_tts(&config, &path) {
+                Ok(artifacts) => TtsWorkerMessage::Completed {
+                    request_id,
+                    artifacts,
+                },
+                Err(err) => TtsWorkerMessage::Failed {
+                    request_id,
+                    error: err.to_string(),
+                },
+            };
+            let _ = tx.send(message);
+        });
+    }
+
+    fn rebuild_tts_analysis(&mut self) {
+        let Some(path) = self.current_document_path.clone() else {
+            self.last_error = Some("open a PDF before rebuilding TTS analysis".into());
+            return;
+        };
+        self.start_tts_analysis(path);
+        self.status_message = Some("Rebuilding TTS analysis".into());
+    }
+
+    fn poll_tts_analysis(&mut self) {
+        let Some(receiver) = &self.tts_worker_rx else {
+            return;
+        };
+
+        match receiver.try_recv() {
+            Ok(TtsWorkerMessage::Completed {
+                request_id,
+                artifacts,
+            }) if request_id == self.tts_request_id => {
+                if artifacts.mode != PdfTtsMode::HighTextTrust
+                    && self.config.tts.verbose_degraded_logging
+                {
+                    warn!(
+                        path = %artifacts.source_path.display(),
+                        mode = %artifacts.mode.label(),
+                        confidence = artifacts.confidence,
+                        "PDF TTS analysis completed in degraded mode"
+                    );
+                }
+                self.status_message = Some(format!(
+                    "TTS analysis ready: {} sentences ({})",
+                    artifacts.sentences.len(),
+                    artifacts.mode.label()
+                ));
+                self.tts_analysis = Some(artifacts);
+                self.tts_analysis_status = TtsAnalysisStatus::Ready;
+                self.tts_worker_rx = None;
+            }
+            Ok(TtsWorkerMessage::Failed { request_id, error })
+                if request_id == self.tts_request_id =>
+            {
+                error!(error = %error, "TTS analysis failed");
+                self.last_error = Some(format!("TTS analysis failed: {error}"));
+                self.tts_analysis_status = TtsAnalysisStatus::Failed(error);
+                self.tts_worker_rx = None;
+            }
+            Ok(_) => {}
+            Err(TryRecvError::Empty) => {}
+            Err(TryRecvError::Disconnected) => {
+                self.tts_analysis_status =
+                    TtsAnalysisStatus::Failed("analysis worker disconnected unexpectedly".into());
+                self.tts_worker_rx = None;
             }
         }
     }
@@ -633,6 +750,16 @@ impl PdfizerApp {
             self.render_current_page(ctx);
         }
 
+        if ui
+            .add_enabled(
+                self.document.is_some() && self.config.tts.enabled,
+                egui::Button::new("Rebuild TTS"),
+            )
+            .clicked()
+        {
+            self.rebuild_tts_analysis();
+        }
+
         ui.separator();
         ui.label("Search");
         let response = ui.add(
@@ -833,6 +960,48 @@ impl PdfizerApp {
             ui.label("Select text directly on the PDF page and copy it with the usual clipboard shortcut.");
         });
 
+        ui.collapsing("TTS diagnostics", |ui| {
+            ui.label(format!("Status: {}", self.tts_analysis_status.label()));
+
+            if let Some(analysis) = &self.tts_analysis {
+                ui.label(format!(
+                    "Mode: {} ({:.0}% confidence)",
+                    analysis.mode.label(),
+                    analysis.confidence * 100.0
+                ));
+                ui.label(format!(
+                    "Sentences: {} | chars: {} | text pages: {} / {}",
+                    analysis.sentences.len(),
+                    analysis.stats.normalized_chars,
+                    analysis.stats.pages_with_text,
+                    analysis.pages.len()
+                ));
+                ui.label(format!(
+                    "Normalization: ligatures {} | soft hyphens {} | duplicate lines {} | repeated edge lines {}",
+                    analysis.stats.ligatures_replaced,
+                    analysis.stats.soft_hyphens_removed,
+                    analysis.stats.duplicate_lines_removed,
+                    analysis.stats.repeated_edge_lines_removed
+                ));
+                if let Some(path) = &analysis.artifact_path {
+                    ui.label(format!("Artifact: {}", path.display()));
+                }
+            } else if matches!(self.tts_analysis_status, TtsAnalysisStatus::Idle) {
+                ui.label("No TTS analysis has been built for the current document yet.");
+            }
+
+            if let Ok(audio_cache_dir) = self.config.tts_audio_cache_dir() {
+                ui.label(format!("Audio cache dir: {}", audio_cache_dir.display()));
+            }
+
+            if ui
+                .add_enabled(self.document.is_some() && self.config.tts.enabled, egui::Button::new("Rebuild TTS analysis"))
+                .clicked()
+            {
+                self.rebuild_tts_analysis();
+            }
+        });
+
         ui.collapsing("Search results", |ui| {
             if self.search_results.is_empty() {
                 ui.label("No active results.");
@@ -952,6 +1121,16 @@ impl PdfizerApp {
                 self.runtime = None;
                 self.runtime_error = Some(err.to_string());
             }
+        }
+
+        self.tts_analysis_status = if self.config.tts.enabled {
+            TtsAnalysisStatus::Idle
+        } else {
+            TtsAnalysisStatus::Disabled
+        };
+
+        if self.document.is_some() && self.config.tts.enabled {
+            self.rebuild_tts_analysis();
         }
 
         self.render_current_page(ctx);
@@ -1527,6 +1706,7 @@ impl PdfizerApp {
 impl eframe::App for PdfizerApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         ctx.set_pixels_per_point(1.0);
+        self.poll_tts_analysis();
         self.handle_shortcuts(ctx);
         self.process_tiled_jobs(ctx);
 
@@ -1682,6 +1862,27 @@ impl ViewMode {
         match self {
             Self::SinglePage => "Single",
             Self::Continuous => "Continuous",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+enum TtsAnalysisStatus {
+    Disabled,
+    Idle,
+    Analyzing,
+    Ready,
+    Failed(String),
+}
+
+impl TtsAnalysisStatus {
+    fn label(&self) -> String {
+        match self {
+            Self::Disabled => "disabled".into(),
+            Self::Idle => "idle".into(),
+            Self::Analyzing => "analyzing".into(),
+            Self::Ready => "ready".into(),
+            Self::Failed(message) => format!("failed: {message}"),
         }
     }
 }

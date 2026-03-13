@@ -4,6 +4,59 @@ This roadmap is PDF-specific and is intentionally stricter than the current Lant
 
 Checked items reflect capabilities already present in this repository that reduce integration risk. Unchecked items are still to be designed or implemented.
 
+## Tranches
+
+### Tranche 1: Canonical Text And Analysis Foundation
+
+- [x] Add a dedicated `[tts]` config section with language, voice, rate, volume, prefetch, and artifact/cache settings.
+- [x] Add an `auto_analyze_on_open` switch so PDF TTS groundwork can run without blocking the open flow.
+- [x] Define a canonical PDF `tts_text` artifact in Rust.
+- [x] Define a canonical `sentence_plan` artifact in Rust.
+- [x] Generate stable sentence ids from canonical text ranges and source fingerprint.
+- [x] Preserve page-range provenance for each sentence before geometry sync exists.
+- [x] Introduce explicit PDF trust classes for TTS work.
+- [x] Support `high_text_trust`.
+- [x] Support `mixed_text_trust`.
+- [x] Support `ocr_required`.
+- [x] Support `render_only_no_sync`.
+- [x] Build PDF TTS analysis on a background worker thread instead of on the UI thread.
+- [x] Persist PDF TTS artifacts to a stable sidecar location.
+- [x] Fingerprint source PDFs so artifact cache paths are deterministic across reopen.
+- [x] Normalize ligatures.
+- [x] Normalize soft hyphens and zero-width characters.
+- [x] Suppress repeated edge boilerplate lines.
+- [x] Suppress consecutive duplicate lines.
+- [x] Segment canonical text into sentences with configurable abbreviations.
+- [x] Surface TTS analysis diagnostics in the UI, including mode, confidence, sentence count, and artifact path.
+- [x] Add a manual rebuild action for TTS analysis.
+- [x] Add unit tests for normalization, sentence planning, classification, and artifact-path stability.
+
+### Tranche 2: Playback Runtime And Prefetch
+
+- [ ] Introduce the TTS engine abstraction.
+- [ ] Add play/pause/stop/seek controls.
+- [ ] Add ahead-of-time sentence audio generation.
+- [ ] Add clip caching and invalidation.
+- [ ] Add cancellation-aware playback and prefetch workers.
+- [ ] Keep playback state changes isolated from viewer rerender churn.
+
+### Tranche 3: Geometry Sync And Highlighting
+
+- [ ] Build sentence-to-PDF geometry artifacts.
+- [ ] Add confidence-scored sentence highlight overlays.
+- [ ] Add line/block/page fallback behavior.
+- [ ] Add scroll-follow logic that does not fight manual reading.
+- [ ] Keep zoom/scroll/continuous mode stable while highlight sync is active.
+
+### Tranche 4: OCR, Performance, And Hardening
+
+- [ ] Add OCR-backed text and geometry policy.
+- [ ] Add viewport-local sync budgeting.
+- [ ] Add playback-under-load performance profiling.
+- [ ] Add a broader PDF fixture corpus.
+- [ ] Add regression coverage for degraded-mode behavior.
+- [ ] Add manual QA and acceptance gates for high-trust and degraded PDFs.
+
 ## Product Contract
 
 - [ ] Deliver PDF TTS with a stable play/pause experience in the native `eframe` / `egui` reader.
