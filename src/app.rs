@@ -716,11 +716,12 @@ impl PdfizerApp {
             .tts_analysis_progress
             .as_deref()
             .unwrap_or("Queued TTS analysis");
-        let heartbeat = format!("still working after {:.1}s | {}", elapsed, stage);
         info!(elapsed_secs = elapsed, stage = %stage, "TTS analysis heartbeat");
-        self.status_message = Some(format!("TTS analysis heartbeat: {heartbeat}"));
+        self.status_message = Some(format!(
+            "TTS analysis heartbeat: still working after {:.1}s | {}",
+            elapsed, stage
+        ));
         self.tts_analysis_last_heartbeat_at = Some(now);
-        self.tts_analysis_progress = Some(heartbeat);
     }
 
     fn reset_tts_runtime(&mut self) {
