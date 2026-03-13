@@ -33,6 +33,8 @@ Checked items reflect capabilities already present in this repository that reduc
 - [ ] Never present low-confidence sentence geometry as exact sync.
 - [ ] Keep fallback decisions monotonic: sentence -> line -> block -> page -> no sync.
 - [ ] Separate rendering-thread work from TTS preparation work.
+- [ ] TTS work must never make PDF rendering, scrolling, zooming, or page navigation feel laggy under normal operation.
+- [ ] When resources are constrained, degrade TTS preparation or prefetch before degrading reader responsiveness.
 - [ ] Keep every sync decision auditable with confidence, fallback reason, and source artifact identifiers.
 
 ## Phase 1: Canonical Text Ownership
@@ -237,4 +239,5 @@ Checked items reflect capabilities already present in this repository that reduc
 - [ ] The active sentence highlight lands on the correct PDF geometry for high-trust PDFs.
 - [ ] Mixed-trust and OCR PDFs degrade to line, block, page, or no-sync modes without false precision.
 - [ ] Continuous PDF viewing remains visually responsive while TTS is active.
+- [ ] Reader interaction latency remains within budget while TTS is active, including scroll, zoom, page jump, and search.
 - [ ] Logs and diagnostics are sufficient to explain every sync and fallback decision.
