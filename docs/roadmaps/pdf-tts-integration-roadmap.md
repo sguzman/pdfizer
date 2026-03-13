@@ -259,12 +259,12 @@ Checked items reflect capabilities already present in this repository that reduc
 ## Phase 16: Observability And Diagnostics
 
 - [x] Trace classification decisions for every PDF opened for TTS use.
-- [ ] Trace normalization edits and mapping confidence summaries.
-- [ ] Trace synthesis queue fill level, clip cache hit rates, and playback underruns.
+- [x] Trace normalization edits and mapping confidence summaries.
+- [x] Trace synthesis queue fill level, clip cache hit rates, and playback underruns.
 - [x] Trace highlight target resolution and fallback transitions.
 - [x] Add a developer diagnostics panel for active sentence id, page, rect count, confidence, and fallback reason.
-- [ ] Add exportable debug snapshots that capture sentence plan, geometry matches, and visible highlight state.
-- [ ] Add failure counters for wrong-page rejects, distant-geometry rejects, and unmappable sentences.
+- [x] Add exportable debug snapshots that capture sentence plan, geometry matches, and visible highlight state.
+- [x] Add failure counters for wrong-page rejects, distant-geometry rejects, and unmappable sentences.
 
 ## Phase 17: Test Fixtures And Regression Coverage
 
@@ -278,11 +278,11 @@ Checked items reflect capabilities already present in this repository that reduc
 - [x] scanned image PDFs
 - [x] mixed OCR plus embedded-text PDFs
 - [x] corrupted or duplicate text-layer PDFs
-- [ ] Add unit tests for normalization and sentence planning.
-- [ ] Add unit tests for sentence-to-geometry mapping and confidence scoring.
-- [ ] Add integration tests for playback stepping, seek, pause/resume, and reopen.
-- [ ] Add regression tests for highlight alignment during zoom and continuous scrolling.
-- [ ] Add performance tests that exercise playback during active scrolling and zoom.
+- [x] Add unit tests for normalization and sentence planning.
+- [x] Add unit tests for sentence-to-geometry mapping and confidence scoring.
+- [x] Add integration tests for playback stepping, seek, pause/resume, and reopen.
+- [x] Add regression tests for highlight alignment during zoom and continuous scrolling.
+- [x] Add performance tests that exercise playback during active scrolling and zoom.
 
 ## Phase 18: Manual QA
 

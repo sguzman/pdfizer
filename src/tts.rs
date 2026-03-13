@@ -8,7 +8,7 @@ use std::{
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use tracing::{info, instrument};
+use tracing::{debug, info, instrument};
 
 use crate::{
     config::{AppConfig, TtsOcrPolicy},
@@ -579,6 +579,18 @@ pub fn compute_sentence_sync(
         let mut cached = toml::from_str::<SentenceSyncTarget>(&contents)
             .with_context(|| format!("failed to parse {}", sync_path.display()))?;
         cached.artifact_path = Some(sync_path);
+        debug!(
+            sentence_index,
+            sentence_id = sentence.id,
+            confidence = %cached.confidence.label(),
+            score = cached.score,
+            text_similarity = cached.score_breakdown.text_similarity,
+            reading_order = cached.score_breakdown.reading_order,
+            geometry_compactness = cached.score_breakdown.geometry_compactness,
+            page_continuity = cached.score_breakdown.page_continuity,
+            cache_hit = true,
+            "loaded cached PDF sentence sync target"
+        );
         return Ok(cached);
     }
     let runtime =
@@ -594,6 +606,18 @@ pub fn compute_sentence_sync(
     let mut target = compute_sentence_sync_from_document(&document, analysis, sentence_index)?;
     let artifact_path = persist_sync_target(config, analysis, &target)?;
     target.artifact_path = Some(artifact_path);
+    debug!(
+        sentence_index,
+        sentence_id = sentence.id,
+        confidence = %target.confidence.label(),
+        score = target.score,
+        text_similarity = target.score_breakdown.text_similarity,
+        reading_order = target.score_breakdown.reading_order,
+        geometry_compactness = target.score_breakdown.geometry_compactness,
+        page_continuity = target.score_breakdown.page_continuity,
+        cache_hit = false,
+        "computed PDF sentence sync target"
+    );
     Ok(target)
 }
 
@@ -1605,6 +1629,21 @@ pub fn build_artifacts_from_document(
     let artifact_path = persist_artifacts(config, &artifacts)?;
     artifacts.artifact_path = Some(artifact_path.clone());
 
+    debug!(
+        ligatures_replaced = artifacts.stats.ligatures_replaced,
+        soft_hyphens_removed = artifacts.stats.soft_hyphens_removed,
+        zero_width_chars_removed = artifacts.stats.zero_width_chars_removed,
+        duplicate_lines_removed = artifacts.stats.duplicate_lines_removed,
+        repeated_edge_lines_removed = artifacts.stats.repeated_edge_lines_removed,
+        joined_hyphenations = artifacts.stats.joined_hyphenations,
+        collapsed_whitespace_runs = artifacts.stats.collapsed_whitespace_runs,
+        table_like_blocks = artifacts.stats.table_like_blocks,
+        caption_like_blocks = artifacts.stats.caption_like_blocks,
+        footnote_like_blocks = artifacts.stats.footnote_like_blocks,
+        sidenote_like_blocks = artifacts.stats.sidenote_like_blocks,
+        sentence_count = artifacts.stats.sentence_count,
+        "normalization edit summary for PDF TTS analysis"
+    );
     info!(
         path = %source_path.display(),
         mode = %artifacts.mode.label(),

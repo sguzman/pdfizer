@@ -464,6 +464,15 @@ impl PdfizerApp {
                     if clip.cache_hit {
                         self.tts_profile.prepare_cache_hits += 1;
                     }
+                    debug!(
+                        sentence_index = clip.sentence_index,
+                        cache_hit = clip.cache_hit,
+                        queued_remaining = self.tts_prefetch_queue.len().saturating_sub(1),
+                        in_flight_before = self.tts_prefetch_in_flight,
+                        prepare_cache_hits = self.tts_profile.prepare_cache_hits,
+                        elapsed_ms,
+                        "processed prepared TTS clip"
+                    );
                     self.tts_prepared_clips.insert(clip.sentence_index, clip);
                     self.tts_prefetch_queue
                         .retain(|index| !self.tts_prepared_clips.contains_key(index));
@@ -480,6 +489,14 @@ impl PdfizerApp {
                     && cancel_token == self.tts_cancel_token =>
                 {
                     self.tts_profile.prepare.record(elapsed_ms as f64);
+                    debug!(
+                        sentence_index,
+                        queued_remaining = self.tts_prefetch_queue.len().saturating_sub(1),
+                        in_flight_before = self.tts_prefetch_in_flight,
+                        elapsed_ms,
+                        error = %error,
+                        "processed failed TTS clip preparation"
+                    );
                     self.tts_prefetch_queue
                         .retain(|index| *index != sentence_index);
                     self.tts_prefetch_in_flight = self.tts_prefetch_in_flight.saturating_sub(1);
@@ -625,12 +642,15 @@ impl PdfizerApp {
             .and_then(|analysis| analysis.sentences.get(target.sentence_index))
             .and_then(|sentence| {
                 target.page_index.map(|page_index| {
-                    page_index < sentence.page_range.start_page || page_index > sentence.page_range.end_page
+                    page_index < sentence.page_range.start_page
+                        || page_index > sentence.page_range.end_page
                 })
             })
             .unwrap_or(false);
         let distant_geometry = target.fallback_reason.contains("visually_implausible")
-            || target.fallback_reason.contains("rejected_visually_implausible_match");
+            || target
+                .fallback_reason
+                .contains("rejected_visually_implausible_match");
         let unmappable = target.confidence == SentenceSyncConfidence::Missing
             || target.fallback_reason.contains("no_page_candidate")
             || target.fallback_reason.contains("page_location_only");
@@ -1306,7 +1326,7 @@ impl PdfizerApp {
             return;
         };
 
-        if self.viewport_contains_target(
+        if viewport_contains_target(
             old_offset,
             viewport_size,
             target_offset,
@@ -1366,7 +1386,7 @@ impl PdfizerApp {
             .and_then(|rect| self.continuous_focus_offset(page_index, rect))
             .unwrap_or_else(|| self.continuous_page_top(page_index));
 
-        if self.axis_contains_target(
+        if axis_contains_target(
             old_offset.y,
             viewport_size.y,
             target_y,
@@ -1401,33 +1421,6 @@ impl PdfizerApp {
         self.continuous_scroll_offset = Vec2::new(0.0, new_y.max(0.0));
         self.persist_session();
         ctx.request_repaint();
-    }
-
-    fn viewport_contains_target(
-        &self,
-        offset: Vec2,
-        viewport_size: Vec2,
-        target: Vec2,
-        margin_ratio: f32,
-    ) -> bool {
-        self.axis_contains_target(offset.x, viewport_size.x, target.x, margin_ratio)
-            && self.axis_contains_target(offset.y, viewport_size.y, target.y, margin_ratio)
-    }
-
-    fn axis_contains_target(
-        &self,
-        offset: f32,
-        viewport_size: f32,
-        target: f32,
-        margin_ratio: f32,
-    ) -> bool {
-        if viewport_size <= 0.0 {
-            return false;
-        }
-        let margin = (viewport_size * margin_ratio).clamp(24.0, viewport_size * 0.45);
-        let min = offset + margin;
-        let max = offset + viewport_size - margin;
-        target >= min && target <= max
     }
 
     fn advance_tts_clock(&mut self, ctx: &egui::Context) {
@@ -2516,9 +2509,10 @@ impl PdfizerApp {
                 self.tts_profile.activation.max_ms
             ));
             ui.label(format!(
-                "Perf guardrails: latency budget {} ms | cache hits {} | stale worker results {} | cancelled worker results {} | cancelled playback events {} | queue peak {} | starvation signals {} | playback worker failures {} | sync counts exact {} fuzzy {} block {} page {} missing {}",
+                "Perf guardrails: latency budget {} ms | cache hits {} | underruns {} | stale worker results {} | cancelled worker results {} | cancelled playback events {} | queue peak {} | starvation signals {} | playback worker failures {} | sync counts exact {} fuzzy {} block {} page {} missing {}",
                 self.config.tts.active_latency_budget_ms,
                 self.tts_profile.prepare_cache_hits,
+                self.tts_profile.playback_underruns,
                 self.tts_profile.stale_worker_results,
                 self.tts_profile.cancelled_worker_results,
                 self.tts_profile.cancelled_playback_events,
@@ -2530,6 +2524,12 @@ impl PdfizerApp {
                 self.tts_profile.block_sync_count,
                 self.tts_profile.page_sync_count,
                 self.tts_profile.missing_sync_count
+            ));
+            ui.label(format!(
+                "Sync failure counters: wrong-page {} | distant-geometry {} | unmappable {}",
+                self.tts_profile.wrong_page_rejects,
+                self.tts_profile.distant_geometry_rejects,
+                self.tts_profile.unmappable_sentences
             ));
             ui.label(format!(
                 "Viewports: single {:.0}x{:.0} @ ({:.0}, {:.0}) | continuous {:.0}x{:.0} @ ({:.0}, {:.0})",
@@ -2548,6 +2548,23 @@ impl PdfizerApp {
                 .clicked()
             {
                 self.rebuild_tts_analysis();
+            }
+            if ui
+                .add_enabled(
+                    self.document.is_some() && self.tts_analysis.is_some(),
+                    egui::Button::new("Export TTS debug snapshot"),
+                )
+                .clicked()
+            {
+                match self.export_tts_debug_snapshot() {
+                    Ok(path) => {
+                        self.status_message =
+                            Some(format!("Exported TTS debug snapshot to {}", path.display()));
+                    }
+                    Err(err) => {
+                        self.last_error = Some(format!("failed to export TTS debug snapshot: {err}"));
+                    }
+                }
             }
         });
 
@@ -3403,6 +3420,69 @@ impl PdfizerApp {
         Ok(path)
     }
 
+    fn export_tts_debug_snapshot(&self) -> Result<PathBuf> {
+        let analysis = self
+            .tts_analysis
+            .as_ref()
+            .context("TTS analysis is not available for snapshot export")?;
+        let active_sentence = self.active_sentence();
+        let active_target = self.effective_sync_target(self.tts_active_sentence_index);
+        let dir = self.config.tts_artifacts_dir()?.join("debug-snapshots");
+        fs::create_dir_all(&dir).with_context(|| format!("failed to create {}", dir.display()))?;
+        let timestamp = unix_timestamp_secs();
+        let path = dir.join(format!("tts-debug-snapshot-{timestamp}.toml"));
+
+        let snapshot = TtsDebugSnapshot {
+            document_path: analysis.source_path.clone(),
+            source_fingerprint: analysis.source_fingerprint.clone(),
+            active_sentence_index: self.tts_active_sentence_index,
+            active_sentence_id: active_sentence.map(|sentence| sentence.id),
+            current_page: self.current_page,
+            playback_state: self.tts_playback_state.label().into(),
+            follow_mode: self.tts_follow_mode,
+            follow_pin_to_center: self.tts_follow_pin_to_center,
+            highlights_enabled: self.tts_highlights_enabled,
+            experimental_sync_enabled: self.tts_experimental_sync_enabled,
+            visible_highlight: active_target.as_ref().and_then(|target| {
+                target
+                    .page_index
+                    .map(|page_index| VisibleHighlightSnapshot {
+                        page_index,
+                        confidence: target.confidence.label().into(),
+                        rect_count: target.rects.len(),
+                        fallback_reason: target.fallback_reason.clone(),
+                    })
+            }),
+            prepared_sentence_indexes: {
+                let mut indexes = self.tts_prepared_clips.keys().copied().collect::<Vec<_>>();
+                indexes.sort_unstable();
+                indexes
+            },
+            queued_sentence_indexes: self.tts_prefetch_queue.clone(),
+            queued_sync_indexes: self.tts_sync_queue.clone(),
+            active_sync_target: active_target,
+            sentence_plan: analysis
+                .sentences
+                .iter()
+                .map(|sentence| SentenceDebugSummary {
+                    id: sentence.id,
+                    page_start: sentence.page_range.start_page,
+                    page_end: sentence.page_range.end_page,
+                    unit_kind: format!("{:?}", sentence.unit_kind),
+                    char_start: sentence.range.start,
+                    char_end: sentence.range.end,
+                })
+                .collect(),
+            sync_targets: self.tts_sync_targets.values().cloned().collect::<Vec<_>>(),
+            performance: TtsDebugPerformanceSnapshot::from_profile(&self.tts_profile),
+        };
+
+        fs::write(&path, toml::to_string_pretty(&snapshot)?)
+            .with_context(|| format!("failed to write {}", path.display()))?;
+        info!(path = %path.display(), "exported TTS debug snapshot");
+        Ok(path)
+    }
+
     fn record_metric(
         &mut self,
         elapsed_ms: f64,
@@ -3822,6 +3902,79 @@ struct SessionState {
     highlights_enabled: bool,
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct TtsDebugSnapshot {
+    document_path: PathBuf,
+    source_fingerprint: String,
+    active_sentence_index: usize,
+    active_sentence_id: Option<u64>,
+    current_page: usize,
+    playback_state: String,
+    follow_mode: bool,
+    follow_pin_to_center: bool,
+    highlights_enabled: bool,
+    experimental_sync_enabled: bool,
+    visible_highlight: Option<VisibleHighlightSnapshot>,
+    prepared_sentence_indexes: Vec<usize>,
+    queued_sentence_indexes: Vec<usize>,
+    queued_sync_indexes: Vec<usize>,
+    active_sync_target: Option<SentenceSyncTarget>,
+    sentence_plan: Vec<SentenceDebugSummary>,
+    sync_targets: Vec<SentenceSyncTarget>,
+    performance: TtsDebugPerformanceSnapshot,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct VisibleHighlightSnapshot {
+    page_index: usize,
+    confidence: String,
+    rect_count: usize,
+    fallback_reason: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct SentenceDebugSummary {
+    id: u64,
+    page_start: usize,
+    page_end: usize,
+    unit_kind: String,
+    char_start: usize,
+    char_end: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct TtsDebugPerformanceSnapshot {
+    prepare_cache_hits: u64,
+    playback_underruns: u64,
+    stale_worker_results: u64,
+    cancelled_worker_results: u64,
+    cancelled_playback_events: u64,
+    scheduler_queue_peak: u64,
+    starvation_signals: u64,
+    playback_worker_failures: u64,
+    wrong_page_rejects: u64,
+    distant_geometry_rejects: u64,
+    unmappable_sentences: u64,
+}
+
+impl TtsDebugPerformanceSnapshot {
+    fn from_profile(profile: &TtsPerformanceProfile) -> Self {
+        Self {
+            prepare_cache_hits: profile.prepare_cache_hits,
+            playback_underruns: profile.playback_underruns,
+            stale_worker_results: profile.stale_worker_results,
+            cancelled_worker_results: profile.cancelled_worker_results,
+            cancelled_playback_events: profile.cancelled_playback_events,
+            scheduler_queue_peak: profile.scheduler_queue_peak,
+            starvation_signals: profile.starvation_signals,
+            playback_worker_failures: profile.playback_worker_failures,
+            wrong_page_rejects: profile.wrong_page_rejects,
+            distant_geometry_rejects: profile.distant_geometry_rejects,
+            unmappable_sentences: profile.unmappable_sentences,
+        }
+    }
+}
+
 fn render_metadata(ui: &mut Ui, metadata: &PdfMetadata) {
     ui.heading("Document");
     ui.label(RichText::new(metadata.path.display().to_string()).monospace());
@@ -3888,6 +4041,26 @@ fn centered_offset(target: f32, viewport_size: f32) -> f32 {
         return target.max(0.0);
     }
     (target - viewport_size * 0.5).max(0.0)
+}
+
+fn viewport_contains_target(
+    offset: Vec2,
+    viewport_size: Vec2,
+    target: Vec2,
+    margin_ratio: f32,
+) -> bool {
+    axis_contains_target(offset.x, viewport_size.x, target.x, margin_ratio)
+        && axis_contains_target(offset.y, viewport_size.y, target.y, margin_ratio)
+}
+
+fn axis_contains_target(offset: f32, viewport_size: f32, target: f32, margin_ratio: f32) -> bool {
+    if viewport_size <= 0.0 {
+        return false;
+    }
+    let margin = (viewport_size * margin_ratio).clamp(24.0, viewport_size * 0.45);
+    let min = offset + margin;
+    let max = offset + viewport_size - margin;
+    target >= min && target <= max
 }
 
 fn parse_rgba_hex(value: &str) -> Option<Color32> {
@@ -4145,5 +4318,88 @@ mod tests {
         };
 
         assert!(rect_distance_score(anchor, near) < rect_distance_score(anchor, far));
+    }
+
+    #[test]
+    fn pdf_rect_to_screen_rect_scales_consistently() {
+        let page_size = PageSizePoints {
+            width: 200.0,
+            height: 400.0,
+        };
+        let rect = PdfRectData {
+            left: 50.0,
+            right: 100.0,
+            top: 300.0,
+            bottom: 200.0,
+        };
+        let image = ColorImage::filled([200, 400], Color32::WHITE);
+        let small = pdf_rect_to_screen_rect(
+            rect,
+            page_size,
+            Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(200.0, 400.0)),
+            &image,
+        );
+        let large = pdf_rect_to_screen_rect(
+            rect,
+            page_size,
+            Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(400.0, 800.0)),
+            &image,
+        );
+
+        assert!((large.width() / small.width() - 2.0).abs() < 0.001);
+        assert!((large.height() / small.height() - 2.0).abs() < 0.001);
+        assert!((large.left() / small.left() - 2.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn viewport_contains_target_respects_safe_region() {
+        let offset = Vec2::new(100.0, 200.0);
+        let viewport = Vec2::new(300.0, 500.0);
+
+        assert!(viewport_contains_target(
+            offset,
+            viewport,
+            Vec2::new(250.0, 450.0),
+            0.18
+        ));
+        assert!(!viewport_contains_target(
+            offset,
+            viewport,
+            Vec2::new(110.0, 230.0),
+            0.18
+        ));
+    }
+
+    #[test]
+    fn session_state_round_trips_tts_resume_fields() {
+        let session = SessionState {
+            last_document: Some(PathBuf::from("/tmp/test.pdf")),
+            last_page: 4,
+            zoom: 1.5,
+            preset: "balanced".into(),
+            view_mode: "continuous".into(),
+            compare_enabled: false,
+            compare_preset: "crisp".into(),
+            tts_sentence_id: Some(42),
+            focus_rect: Some(PdfRectData {
+                left: 1.0,
+                right: 2.0,
+                top: 3.0,
+                bottom: 0.5,
+            }),
+            follow_mode: true,
+            follow_pin_to_center: false,
+            highlights_enabled: true,
+        };
+
+        let serialized = toml::to_string(&session).expect("session should serialize");
+        let restored: SessionState =
+            toml::from_str(&serialized).expect("session should deserialize");
+
+        assert_eq!(restored.tts_sentence_id, Some(42));
+        assert_eq!(restored.focus_rect.expect("focus rect").top, 3.0);
+        assert!(restored.follow_mode);
+        assert!(!restored.follow_pin_to_center);
+        assert!(restored.highlights_enabled);
     }
 }
