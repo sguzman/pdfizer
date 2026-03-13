@@ -327,9 +327,7 @@ impl PdfizerApp {
                     request_id,
                     clip,
                     elapsed_ms,
-                })
-                    if request_id == self.tts_prefetch_request_id =>
-                {
+                }) if request_id == self.tts_prefetch_request_id => {
                     self.tts_profile.prepare.record(elapsed_ms as f64);
                     if clip.cache_hit {
                         self.tts_profile.prepare_cache_hits += 1;
@@ -358,9 +356,7 @@ impl PdfizerApp {
                     request_id,
                     target,
                     elapsed_ms,
-                })
-                    if request_id == self.tts_prefetch_request_id =>
-                {
+                }) if request_id == self.tts_prefetch_request_id => {
                     self.tts_profile.sync.record(elapsed_ms as f64);
                     self.tts_profile.record_sync_confidence(target.confidence);
                     self.tts_sync_targets.insert(target.sentence_index, target);
@@ -443,6 +439,79 @@ impl PdfizerApp {
                 && sentence.page_range.end_page >= self.current_page
         }) {
             self.tts_active_sentence_index = index;
+        }
+    }
+
+    fn tts_viewport_focus_sentence_index(&self) -> Option<usize> {
+        let analysis = self.tts_analysis.as_ref()?;
+        analysis
+            .sentences
+            .iter()
+            .enumerate()
+            .find(|(_, sentence)| {
+                sentence.page_range.start_page <= self.current_page
+                    && sentence.page_range.end_page >= self.current_page
+            })
+            .map(|(index, _)| index)
+            .or_else(|| {
+                if analysis.sentences.is_empty() {
+                    None
+                } else {
+                    Some(
+                        self.tts_active_sentence_index
+                            .min(analysis.sentences.len() - 1),
+                    )
+                }
+            })
+    }
+
+    fn enforce_tts_runtime_budget(&mut self) {
+        let Some(analysis) = &self.tts_analysis else {
+            return;
+        };
+        let Some(focus_index) = self.tts_viewport_focus_sentence_index() else {
+            return;
+        };
+
+        let clip_keep = tts::sentence_budget_window(
+            focus_index,
+            analysis.sentences.len(),
+            self.config.tts.clip_budget_sentences,
+        );
+        let sync_keep = tts::sentence_budget_window(
+            focus_index,
+            analysis.sentences.len(),
+            self.config.tts.sync_budget_sentences,
+        );
+
+        let clip_before = self.tts_prepared_clips.len();
+        let sync_before = self.tts_sync_targets.len();
+
+        self.tts_prepared_clips
+            .retain(|index, _| clip_keep.contains(index));
+        self.tts_prefetch_queue
+            .retain(|index| clip_keep.contains(index));
+        self.tts_failed_prefetch
+            .retain(|index, _| clip_keep.contains(index));
+
+        self.tts_sync_targets
+            .retain(|index, _| sync_keep.contains(index));
+        self.tts_sync_queue
+            .retain(|index| sync_keep.contains(index));
+        self.tts_failed_sync
+            .retain(|index, _| sync_keep.contains(index));
+
+        if self.tts_prepared_clips.len() != clip_before
+            || self.tts_sync_targets.len() != sync_before
+        {
+            debug!(
+                focus_index,
+                clip_before,
+                clip_after = self.tts_prepared_clips.len(),
+                sync_before,
+                sync_after = self.tts_sync_targets.len(),
+                "trimmed TTS runtime state to viewport-local budget"
+            );
         }
     }
 
@@ -641,9 +710,16 @@ impl PdfizerApp {
                 return;
             }
             if let Some(requested_at) = self.tts_activation_requested_at.take() {
-                self.tts_profile
-                    .activation
-                    .record(requested_at.elapsed().as_secs_f64() * 1000.0);
+                let activation_ms = requested_at.elapsed().as_secs_f64() * 1000.0;
+                self.tts_profile.activation.record(activation_ms);
+                if activation_ms > self.config.tts.active_latency_budget_ms as f64 {
+                    warn!(
+                        activation_ms,
+                        budget_ms = self.config.tts.active_latency_budget_ms,
+                        sentence_index = self.tts_active_sentence_index,
+                        "TTS activation exceeded latency budget"
+                    );
+                }
             }
             self.focus_active_sentence(ctx);
             self.status_message = Some(format!(
@@ -666,7 +742,7 @@ impl PdfizerApp {
         if !self.tts_follow_mode {
             return;
         }
-        if let Some(target) = self.tts_sync_targets.get(&self.tts_active_sentence_index) {
+        if let Some(target) = self.effective_sync_target(self.tts_active_sentence_index) {
             self.navigate_to_page(
                 target.page_index.unwrap_or(self.current_page),
                 target.rects.first().copied(),
@@ -1004,6 +1080,7 @@ impl PdfizerApp {
         if self.tts_playback_state == TtsPlaybackState::Stopped {
             self.sync_tts_sentence_to_current_page();
         }
+        self.enforce_tts_runtime_budget();
 
         match self.view_mode {
             ViewMode::SinglePage => {
@@ -1531,6 +1608,16 @@ impl PdfizerApp {
                     analysis.mode.label(),
                     analysis.confidence * 100.0
                 ));
+                if let Some(policy) = self.active_tts_policy() {
+                    ui.label(format!(
+                        "Policy: playback {} | rect highlight {} | sync prefetch {} | max sync {}",
+                        policy.allow_playback,
+                        policy.allow_rect_highlights,
+                        policy.allow_sync_prefetch,
+                        policy.max_sync_confidence.label()
+                    ));
+                    ui.label(format!("Policy reason: {}", policy.reason));
+                }
                 ui.label(format!(
                     "Sentences: {} | chars: {} | text pages: {} / {}",
                     analysis.sentences.len(),
@@ -1555,7 +1642,9 @@ impl PdfizerApp {
                         sentence.page_range.start_page + 1,
                         sentence.page_range.end_page + 1
                     ));
-                    if let Some(target) = self.tts_sync_targets.get(&self.tts_active_sentence_index) {
+                    if let Some(target) =
+                        self.effective_sync_target(self.tts_active_sentence_index)
+                    {
                         ui.label(format!(
                             "Sync: {} | score {:.2} | reason {}",
                             target.confidence.label(),
@@ -1602,6 +1691,26 @@ impl PdfizerApp {
                 self.tts_failed_sync.len(),
                 self.tts_prefetch_in_flight,
                 snapshot.request_id
+            ));
+            ui.label(format!(
+                "Perf: prepare avg {:.1} ms max {:.1} | sync avg {:.1} ms max {:.1} | activate avg {:.1} ms max {:.1}",
+                self.tts_profile.prepare.average_ms(),
+                self.tts_profile.prepare.max_ms,
+                self.tts_profile.sync.average_ms(),
+                self.tts_profile.sync.max_ms,
+                self.tts_profile.activation.average_ms(),
+                self.tts_profile.activation.max_ms
+            ));
+            ui.label(format!(
+                "Perf guardrails: latency budget {} ms | cache hits {} | stale worker results {} | sync counts exact {} fuzzy {} block {} page {} missing {}",
+                self.config.tts.active_latency_budget_ms,
+                self.tts_profile.prepare_cache_hits,
+                self.tts_profile.stale_worker_results,
+                self.tts_profile.exact_sync_count,
+                self.tts_profile.fuzzy_sync_count,
+                self.tts_profile.block_sync_count,
+                self.tts_profile.page_sync_count,
+                self.tts_profile.missing_sync_count
             ));
 
             if ui
@@ -2066,10 +2175,12 @@ impl PdfizerApp {
         response: &egui::Response,
         image: &ColorImage,
     ) {
-        let Some(target) = self.tts_sync_targets.get(&self.tts_active_sentence_index) else {
+        let Some(target) = self.effective_sync_target(self.tts_active_sentence_index) else {
             return;
         };
-        if target.page_index != Some(page_index) {
+        if target.page_index != Some(page_index)
+            || target.confidence == SentenceSyncConfidence::Missing
+        {
             return;
         }
 
@@ -2528,6 +2639,55 @@ struct PixelSample {
     x: usize,
     y: usize,
     rgba: [u8; 4],
+}
+
+#[derive(Debug, Clone, Default)]
+struct TtsPerformanceProfile {
+    prepare: RollingStat,
+    sync: RollingStat,
+    activation: RollingStat,
+    prepare_cache_hits: u64,
+    stale_worker_results: u64,
+    exact_sync_count: u64,
+    fuzzy_sync_count: u64,
+    block_sync_count: u64,
+    page_sync_count: u64,
+    missing_sync_count: u64,
+}
+
+impl TtsPerformanceProfile {
+    fn record_sync_confidence(&mut self, confidence: SentenceSyncConfidence) {
+        match confidence {
+            SentenceSyncConfidence::ExactSentence => self.exact_sync_count += 1,
+            SentenceSyncConfidence::FuzzySentence => self.fuzzy_sync_count += 1,
+            SentenceSyncConfidence::BlockFallback => self.block_sync_count += 1,
+            SentenceSyncConfidence::PageFallback => self.page_sync_count += 1,
+            SentenceSyncConfidence::Missing => self.missing_sync_count += 1,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct RollingStat {
+    samples: u64,
+    total_ms: f64,
+    max_ms: f64,
+}
+
+impl RollingStat {
+    fn record(&mut self, elapsed_ms: f64) {
+        self.samples += 1;
+        self.total_ms += elapsed_ms;
+        self.max_ms = self.max_ms.max(elapsed_ms);
+    }
+
+    fn average_ms(&self) -> f64 {
+        if self.samples == 0 {
+            0.0
+        } else {
+            self.total_ms / self.samples as f64
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

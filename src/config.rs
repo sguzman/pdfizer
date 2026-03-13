@@ -757,6 +757,7 @@ mod tests {
         assert_eq!(config.mode, AppMode::Prod);
         assert!(config.tts.enabled);
         assert_eq!(config.tts.sentence_prefetch, 8);
+        assert_eq!(config.tts.ocr_policy, TtsOcrPolicy::Deferred);
     }
 
     #[test]
@@ -786,6 +787,7 @@ mod tests {
                 sentence_prefetch = 12
                 language = "es"
                 engine = "dry_run"
+                ocr_policy = "disabled"
             "##,
         )
         .unwrap();
@@ -799,6 +801,7 @@ mod tests {
         assert_eq!(config.tts.sentence_prefetch, 12);
         assert_eq!(config.tts.language, "es");
         assert_eq!(config.tts.engine, "dry_run");
+        assert_eq!(config.tts.ocr_policy, TtsOcrPolicy::Disabled);
     }
 
     #[test]

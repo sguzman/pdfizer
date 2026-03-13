@@ -1,0 +1,64 @@
+version = 1
+
+[[fixtures]]
+id = "minimal_blank"
+class = "render_smoke"
+status = "ready"
+path = "minimal.pdf"
+notes = "Blank PDF smoke fixture used to verify discovery and repo wiring."
+
+[[fixtures]]
+id = "clean_selectable_seed"
+class = "clean_selectable_text"
+status = "seeded"
+path = "minimal.pdf"
+notes = "Temporary seed fixture until a richer book-style selectable text sample is checked in."
+
+[[fixtures]]
+id = "header_footer_seed"
+class = "repeated_headers_and_footers"
+status = "seeded"
+path = "minimal.pdf"
+notes = "Corpus slot reserved for normalization regressions around repeated edge text."
+
+[[fixtures]]
+id = "two_column_target"
+class = "academic_two_column"
+status = "planned"
+notes = "Needed for reading-order and sentence sync degradation checks."
+
+[[fixtures]]
+id = "footnotes_target"
+class = "footnotes_and_captions"
+status = "planned"
+notes = "Needed for sentence segmentation and overlay correctness."
+
+[[fixtures]]
+id = "table_heavy_target"
+class = "table_heavy"
+status = "planned"
+notes = "Needed for normalization and fallback policy tests."
+
+[[fixtures]]
+id = "rotated_text_target"
+class = "rotated_pages_and_text"
+status = "planned"
+notes = "Needed for geometry trust and no-false-precision acceptance."
+
+[[fixtures]]
+id = "scanned_target"
+class = "scanned_image_pdf"
+status = "planned"
+notes = "Needed to validate deferred OCR policy and playback gating."
+
+[[fixtures]]
+id = "mixed_ocr_target"
+class = "mixed_ocr_plus_embedded_text"
+status = "planned"
+notes = "Needed to validate honest degradation from sentence sync to page follow."
+
+[[fixtures]]
+id = "duplicate_text_target"
+class = "corrupted_duplicate_text_layer"
+status = "planned"
+notes = "Needed to validate duplicate suppression and fallback diagnostics."

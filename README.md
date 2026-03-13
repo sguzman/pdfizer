@@ -4,7 +4,7 @@
 
 The current build is no longer just a minimal viewer. It includes thumbnail navigation, cached page renders, large-page tiled rendering, comparison presets, a pixel inspector, benchmark export, persisted session state, layered TOML config, and file-backed tracing.
 
-It also now includes the first PDF TTS groundwork tranche, a completed playback/runtime tranche, and a first geometry-sync tranche: canonical PDF text analysis, normalization, sentence planning, trust classification, persisted TTS-sidecar artifacts, a tone-preview playback backend, ahead-of-time clip preparation, cached sentence-to-PDF sync targets, confidence-scored overlays, and in-app diagnostics. OCR-backed sync and stronger alignment remain future work.
+It also now includes the first four PDF TTS tranches: canonical PDF text analysis, normalization, sentence planning, trust classification, a tone-preview playback backend, ahead-of-time clip preparation, cached sentence-to-PDF sync targets, confidence-scored overlays, OCR/degraded-mode runtime policy, viewport-local TTS budgeting, and tranche-level diagnostics. OCR-backed text extraction and stronger alignment still remain future work.
 
 ## Stack
 
@@ -30,6 +30,8 @@ It also now includes the first PDF TTS groundwork tranche, a completed playback/
 - Build and inspect canonical PDF TTS analysis artifacts in the background when a document opens
 - Exercise a tone-preview TTS runtime with play/pause, sentence stepping, direct sentence seek, follow mode, and cached prepared clips
 - Highlight the active spoken sentence on the PDF with exact, fuzzy, block, or page-level fallback behavior
+- Apply OCR/degraded-mode policy so scan-first PDFs degrade honestly instead of pretending sentence-accurate sync exists
+- Track TTS prep, sync, activation latency, and cache-hit diagnostics while keeping runtime state bounded around the viewport
 
 ## Pdfium Runtime
 
@@ -107,3 +109,4 @@ RUST_LOG=pdfizer=trace cargo run
 
 The active implementation checklist lives in [docs/roadmap.md](/win/linux/Code/rust/pdfizer/docs/roadmap.md).
 The PDF-specific TTS integration plan lives in [docs/roadmaps/pdf-tts-integration-roadmap.md](/win/linux/Code/rust/pdfizer/docs/roadmaps/pdf-tts-integration-roadmap.md).
+Manual QA gates for PDF TTS live in [docs/qa/pdf-tts-manual-checklist.md](/win/linux/Code/rust/pdfizer/docs/qa/pdf-tts-manual-checklist.md) and [docs/qa/pdf-tts-acceptance-gates.md](/win/linux/Code/rust/pdfizer/docs/qa/pdf-tts-acceptance-gates.md).

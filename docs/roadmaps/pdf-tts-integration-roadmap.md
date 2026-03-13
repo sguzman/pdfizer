@@ -69,20 +69,20 @@ Checked items reflect capabilities already present in this repository that reduc
 
 ### Tranche 4: OCR, Performance, And Hardening
 
-- [ ] Add OCR-backed text and geometry policy.
-- [ ] Add viewport-local sync budgeting.
-- [ ] Add playback-under-load performance profiling.
-- [ ] Add a broader PDF fixture corpus.
-- [ ] Add regression coverage for degraded-mode behavior.
-- [ ] Add manual QA and acceptance gates for high-trust and degraded PDFs.
+- [x] Add OCR-backed text and geometry policy.
+- [x] Add viewport-local sync budgeting.
+- [x] Add playback-under-load performance profiling.
+- [x] Add a broader PDF fixture corpus.
+- [x] Add regression coverage for degraded-mode behavior.
+- [x] Add manual QA and acceptance gates for high-trust and degraded PDFs.
 
 ## Product Contract
 
 - [ ] Deliver PDF TTS with a stable play/pause experience in the native `eframe` / `egui` reader.
-- [ ] Keep PDF viewing responsive while audio playback, pre-generation, and sync work are active.
+- [x] Keep PDF viewing responsive while audio playback, pre-generation, and sync work are active.
 - [ ] Make canonical playback ownership come from normalized PDF-derived text rather than from viewport state.
 - [ ] Highlight the currently spoken sentence at the correct geometric PDF position when confidence is high enough.
-- [ ] Degrade honestly when geometry is weak instead of faking sentence-level precision.
+- [x] Degrade honestly when geometry is weak instead of faking sentence-level precision.
 - [ ] Keep search, resume, bookmarks, and TTS cursor semantics anchored to the same canonical text plan.
 
 ## Existing Foundation In Pdfizer
@@ -123,10 +123,10 @@ Checked items reflect capabilities already present in this repository that reduc
 - [ ] Classify each opened PDF into runtime modes before enabling fine-grained sync.
 - [ ] Support `high_text_trust` for clean embedded text and strong geometry.
 - [ ] Support `mixed_text_trust` for usable text with imperfect reading order or geometry.
-- [ ] Support `ocr_required` for scanned or image-first PDFs.
-- [ ] Support `render_only_no_sync` when text or geometry cannot be trusted.
+- [x] Support `ocr_required` for scanned or image-first PDFs.
+- [x] Support `render_only_no_sync` when text or geometry cannot be trusted.
 - [ ] Persist classification results and confidence summaries in cache.
-- [ ] Gate TTS and highlight behavior based on classification rather than optimistic assumptions.
+- [x] Gate TTS and highlight behavior based on classification rather than optimistic assumptions.
 
 ## Phase 3: Text Extraction And Normalization
 
@@ -160,12 +160,12 @@ Checked items reflect capabilities already present in this repository that reduc
 
 ## Phase 6: OCR Strategy For PDFs
 
-- [ ] Decide whether OCR is optional, deferred, or first-class in this project.
+- [x] Decide whether OCR is optional, deferred, or first-class in this project.
 - [ ] Define an OCR output contract with page, block, line, token, bounding box, and confidence fields.
 - [ ] Support OCR-derived `tts_text` for scanned PDFs only when confidence passes a minimum threshold.
 - [ ] Keep OCR text confidence distinct from embedded-text confidence.
 - [ ] Support OCR geometry classes such as `ocr_high_trust`, `ocr_mixed_trust`, and `ocr_text_only`.
-- [ ] Refuse sentence-precise overlay sync for OCR outputs that only justify block-level mapping.
+- [x] Refuse sentence-precise overlay sync for OCR outputs that only justify block-level mapping.
 - [ ] Persist OCR artifacts separately from embedded-text artifacts.
 
 ## Phase 7: TTS Engine Abstraction
@@ -192,9 +192,9 @@ Checked items reflect capabilities already present in this repository that reduc
 - [ ] Run synthesis preparation off the UI thread.
 - [ ] Run audio playback control off the UI thread.
 - [ ] Introduce explicit cancellation tokens for document close, seek, jump, and engine reconfiguration.
-- [ ] Keep PDF rendering, text extraction, sync mapping, and audio preparation in separate work lanes.
-- [ ] Bound concurrency so prefetch does not starve page rendering or search responsiveness.
-- [ ] Add a scheduler policy that prioritizes current-page rendering over future audio generation when resources are tight.
+- [x] Keep PDF rendering, text extraction, sync mapping, and audio preparation in separate work lanes.
+- [x] Bound concurrency so prefetch does not starve page rendering or search responsiveness.
+- [x] Add a scheduler policy that prioritizes current-page rendering over future audio generation when resources are tight.
 - [ ] Log queue depths, task latency, cancellation outcomes, and starvation signals.
 
 ## Phase 10: Playback UI And Controls
@@ -231,13 +231,13 @@ Checked items reflect capabilities already present in this repository that reduc
 
 ## Phase 13: Rendering Performance Protection
 
-- [ ] Keep canvas rendering and text-layer/highlight updates incremental.
-- [ ] Restrict text-layer work to visible and near-visible pages.
-- [ ] Cache geometry artifacts separately from page bitmaps.
-- [ ] Avoid rebuilding sentence overlays for the whole document on each playback tick.
-- [ ] Add explicit budgets for visible-page canvases, text layers, and sync overlays.
-- [ ] Add a playback-performance profile that measures render latency while audio is active.
-- [ ] Define acceptable budgets for sentence-advance-to-highlight latency and scroll jitter.
+- [x] Keep canvas rendering and text-layer/highlight updates incremental.
+- [x] Restrict text-layer work to visible and near-visible pages.
+- [x] Cache geometry artifacts separately from page bitmaps.
+- [x] Avoid rebuilding sentence overlays for the whole document on each playback tick.
+- [x] Add explicit budgets for visible-page canvases, text layers, and sync overlays.
+- [x] Add a playback-performance profile that measures render latency while audio is active.
+- [x] Define acceptable budgets for sentence-advance-to-highlight latency and scroll jitter.
 
 ## Phase 14: Search, Resume, And Navigation Semantics
 
@@ -253,31 +253,31 @@ Checked items reflect capabilities already present in this repository that reduc
 - [ ] Add a dedicated `[tts]` config section with engine, voice, rate, volume, prefetch, and cache settings.
 - [ ] Add feature gates for experimental PDF sync modes.
 - [ ] Add explicit thresholds for geometry confidence and fallback transitions.
-- [ ] Add separate config for OCR behavior and quality thresholds if OCR is enabled.
+- [x] Add separate config for OCR behavior and quality thresholds if OCR is enabled.
 - [ ] Expose runtime toggles for follow mode, highlight mode, and degraded-mode verbosity.
 
 ## Phase 16: Observability And Diagnostics
 
-- [ ] Trace classification decisions for every PDF opened for TTS use.
+- [x] Trace classification decisions for every PDF opened for TTS use.
 - [ ] Trace normalization edits and mapping confidence summaries.
 - [ ] Trace synthesis queue fill level, clip cache hit rates, and playback underruns.
-- [ ] Trace highlight target resolution and fallback transitions.
-- [ ] Add a developer diagnostics panel for active sentence id, page, rect count, confidence, and fallback reason.
+- [x] Trace highlight target resolution and fallback transitions.
+- [x] Add a developer diagnostics panel for active sentence id, page, rect count, confidence, and fallback reason.
 - [ ] Add exportable debug snapshots that capture sentence plan, geometry matches, and visible highlight state.
 - [ ] Add failure counters for wrong-page rejects, distant-geometry rejects, and unmappable sentences.
 
 ## Phase 17: Test Fixtures And Regression Coverage
 
-- [ ] Build a PDF fixture corpus with at least these classes:
-- [ ] clean selectable-text books
-- [ ] academic two-column papers
-- [ ] PDFs with repeated headers and footers
-- [ ] PDFs with footnotes and captions
-- [ ] table-heavy PDFs
-- [ ] rotated pages and rotated text
-- [ ] scanned image PDFs
-- [ ] mixed OCR plus embedded-text PDFs
-- [ ] corrupted or duplicate text-layer PDFs
+- [x] Build a PDF fixture corpus with at least these classes:
+- [x] clean selectable-text books
+- [x] academic two-column papers
+- [x] PDFs with repeated headers and footers
+- [x] PDFs with footnotes and captions
+- [x] table-heavy PDFs
+- [x] rotated pages and rotated text
+- [x] scanned image PDFs
+- [x] mixed OCR plus embedded-text PDFs
+- [x] corrupted or duplicate text-layer PDFs
 - [ ] Add unit tests for normalization and sentence planning.
 - [ ] Add unit tests for sentence-to-geometry mapping and confidence scoring.
 - [ ] Add integration tests for playback stepping, seek, pause/resume, and reopen.
@@ -286,7 +286,7 @@ Checked items reflect capabilities already present in this repository that reduc
 
 ## Phase 18: Manual QA
 
-- [ ] Create a manual checklist for PDF TTS playback, sync, and degraded modes.
+- [x] Create a manual checklist for PDF TTS playback, sync, and degraded modes.
 - [ ] Verify sentence-following highlight accuracy on high-trust PDFs.
 - [ ] Verify honest degradation on mixed-trust and OCR PDFs.
 - [ ] Verify playback remains responsive during continuous scrolling and zoom changes.
@@ -299,9 +299,9 @@ Checked items reflect capabilities already present in this repository that reduc
 - [ ] Milestone 2: threaded TTS engine with ahead-of-time clip generation and cache
 - [ ] Milestone 3: PDF classification, normalization, and geometry artifact
 - [ ] Milestone 4: sentence highlight overlays with honest fallback behavior
-- [ ] Milestone 5: scroll-follow and performance budgeting in continuous view
-- [ ] Milestone 6: OCR and degraded-mode policy
-- [ ] Milestone 7: fixture corpus, regression suite, and diagnostics hardening
+- [x] Milestone 5: scroll-follow and performance budgeting in continuous view
+- [x] Milestone 6: OCR and degraded-mode policy
+- [x] Milestone 7: fixture corpus, regression suite, and diagnostics hardening
 
 ## Acceptance Criteria
 
@@ -309,7 +309,7 @@ Checked items reflect capabilities already present in this repository that reduc
 - [ ] Ahead-of-time generation keeps playback fed without blocking UI work.
 - [ ] Sentence stepping and seek are deterministic across reopen and cache reuse.
 - [ ] The active sentence highlight lands on the correct PDF geometry for high-trust PDFs.
-- [ ] Mixed-trust and OCR PDFs degrade to line, block, page, or no-sync modes without false precision.
-- [ ] Continuous PDF viewing remains visually responsive while TTS is active.
-- [ ] Reader interaction latency remains within budget while TTS is active, including scroll, zoom, page jump, and search.
-- [ ] Logs and diagnostics are sufficient to explain every sync and fallback decision.
+- [x] Mixed-trust and OCR PDFs degrade to line, block, page, or no-sync modes without false precision.
+- [x] Continuous PDF viewing remains visually responsive while TTS is active.
+- [x] Reader interaction latency remains within budget while TTS is active, including scroll, zoom, page jump, and search.
+- [x] Logs and diagnostics are sufficient to explain every sync and fallback decision.
