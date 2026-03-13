@@ -159,9 +159,26 @@ impl AppConfig {
             .set_default("tts.voice", defaults.tts.voice.clone())?
             .set_default("tts.rate", f64::from(defaults.tts.rate))?
             .set_default("tts.volume", f64::from(defaults.tts.volume))?
+            .set_default("tts.ocr_policy", defaults.tts.ocr_policy.as_str())?
+            .set_default(
+                "tts.ocr_min_confidence",
+                f64::from(defaults.tts.ocr_min_confidence),
+            )?
             .set_default(
                 "tts.sentence_prefetch",
                 defaults.tts.sentence_prefetch as i64,
+            )?
+            .set_default(
+                "tts.clip_budget_sentences",
+                defaults.tts.clip_budget_sentences as i64,
+            )?
+            .set_default(
+                "tts.sync_budget_sentences",
+                defaults.tts.sync_budget_sentences as i64,
+            )?
+            .set_default(
+                "tts.active_latency_budget_ms",
+                defaults.tts.active_latency_budget_ms as i64,
             )?
             .set_default("tts.audio_cache_dir", defaults.tts.audio_cache_dir.clone())?
             .set_default("tts.artifacts_dir", defaults.tts.artifacts_dir.clone())?
@@ -570,7 +587,12 @@ pub struct TtsConfig {
     pub voice: String,
     pub rate: f32,
     pub volume: f32,
+    pub ocr_policy: TtsOcrPolicy,
+    pub ocr_min_confidence: f32,
     pub sentence_prefetch: usize,
+    pub clip_budget_sentences: usize,
+    pub sync_budget_sentences: usize,
+    pub active_latency_budget_ms: u64,
     pub audio_cache_dir: String,
     pub artifacts_dir: String,
     pub experimental_pdf_sync: bool,
@@ -597,7 +619,12 @@ impl Default for TtsConfig {
             voice: "default".into(),
             rate: 1.0,
             volume: 1.0,
+            ocr_policy: TtsOcrPolicy::Deferred,
+            ocr_min_confidence: 0.85,
             sentence_prefetch: 8,
+            clip_budget_sentences: 16,
+            sync_budget_sentences: 12,
+            active_latency_budget_ms: 120,
             audio_cache_dir: "tts/audio".into(),
             artifacts_dir: "tts/artifacts".into(),
             experimental_pdf_sync: false,
@@ -622,6 +649,30 @@ impl Default for TtsConfig {
                 "i.e.".into(),
             ],
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TtsOcrPolicy {
+    Disabled,
+    Deferred,
+    RequireArtifacts,
+}
+
+impl TtsOcrPolicy {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Disabled => "disabled",
+            Self::Deferred => "deferred",
+            Self::RequireArtifacts => "require_artifacts",
+        }
+    }
+}
+
+impl Default for TtsOcrPolicy {
+    fn default() -> Self {
+        Self::Deferred
     }
 }
 

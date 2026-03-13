@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{info, instrument};
 
 use crate::{
-    config::AppConfig,
+    config::{AppConfig, TtsOcrPolicy},
     pdf::{PdfDocument, PdfRectData, PdfRuntime},
 };
 
@@ -140,6 +140,15 @@ pub struct SentenceSyncTarget {
     pub score: f32,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TtsRuntimePolicy {
+    pub allow_playback: bool,
+    pub allow_rect_highlights: bool,
+    pub allow_sync_prefetch: bool,
+    pub max_sync_confidence: SentenceSyncConfidence,
+    pub reason: String,
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum TtsEngineKind {
@@ -198,6 +207,8 @@ pub struct PreparedSentenceClip {
     pub word_count: usize,
     pub rate: f32,
     pub generated_at_unix_secs: u64,
+    #[serde(default)]
+    pub cache_hit: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -241,20 +252,24 @@ pub enum TtsWorkerMessage {
     PrefetchCompleted {
         request_id: u64,
         clip: PreparedSentenceClip,
+        elapsed_ms: u64,
     },
     PrefetchFailed {
         request_id: u64,
         sentence_index: usize,
         error: String,
+        elapsed_ms: u64,
     },
     SyncCompleted {
         request_id: u64,
         target: SentenceSyncTarget,
+        elapsed_ms: u64,
     },
     SyncFailed {
         request_id: u64,
         sentence_index: usize,
         error: String,
+        elapsed_ms: u64,
     },
 }
 
@@ -317,6 +332,123 @@ pub fn build_sync_prefetch_plan(
     build_prefetch_plan(analysis, start_sentence_index, sentence_count)
 }
 
+pub fn sentence_budget_window(
+    active_sentence_index: usize,
+    sentence_count: usize,
+    radius: usize,
+) -> HashSet<usize> {
+    if sentence_count == 0 {
+        return HashSet::new();
+    }
+
+    let start = active_sentence_index.saturating_sub(radius);
+    let end = (active_sentence_index + radius + 1).min(sentence_count);
+    (start..end).collect()
+}
+
+#[instrument(skip(config, analysis))]
+pub fn evaluate_runtime_policy(
+    config: &AppConfig,
+    analysis: &TtsAnalysisArtifacts,
+) -> TtsRuntimePolicy {
+    let policy = match analysis.mode {
+        PdfTtsMode::HighTextTrust | PdfTtsMode::MixedTextTrust => TtsRuntimePolicy {
+            allow_playback: !analysis.sentences.is_empty(),
+            allow_rect_highlights: true,
+            allow_sync_prefetch: true,
+            max_sync_confidence: SentenceSyncConfidence::ExactSentence,
+            reason: "embedded_text_sync_allowed".into(),
+        },
+        PdfTtsMode::OcrRequired => match config.tts.ocr_policy {
+            TtsOcrPolicy::Disabled => TtsRuntimePolicy {
+                allow_playback: false,
+                allow_rect_highlights: false,
+                allow_sync_prefetch: false,
+                max_sync_confidence: SentenceSyncConfidence::Missing,
+                reason: "ocr_required_but_ocr_policy_disabled".into(),
+            },
+            TtsOcrPolicy::Deferred => TtsRuntimePolicy {
+                allow_playback: !analysis.sentences.is_empty(),
+                allow_rect_highlights: false,
+                allow_sync_prefetch: false,
+                max_sync_confidence: SentenceSyncConfidence::PageFallback,
+                reason: format!(
+                    "ocr_required_with_deferred_policy_min_confidence_{:.2}",
+                    config.tts.ocr_min_confidence
+                ),
+            },
+            TtsOcrPolicy::RequireArtifacts => TtsRuntimePolicy {
+                allow_playback: false,
+                allow_rect_highlights: false,
+                allow_sync_prefetch: false,
+                max_sync_confidence: SentenceSyncConfidence::Missing,
+                reason: "ocr_artifacts_not_integrated_yet".into(),
+            },
+        },
+        PdfTtsMode::RenderOnlyNoSync => TtsRuntimePolicy {
+            allow_playback: !analysis.sentences.is_empty(),
+            allow_rect_highlights: false,
+            allow_sync_prefetch: false,
+            max_sync_confidence: SentenceSyncConfidence::PageFallback,
+            reason: "render_only_page_level_follow".into(),
+        },
+    };
+
+    info!(
+        mode = %analysis.mode.label(),
+        ocr_policy = %config.tts.ocr_policy.as_str(),
+        allow_playback = policy.allow_playback,
+        allow_rect_highlights = policy.allow_rect_highlights,
+        allow_sync_prefetch = policy.allow_sync_prefetch,
+        max_sync_confidence = %policy.max_sync_confidence.label(),
+        reason = %policy.reason,
+        "evaluated PDF TTS runtime policy"
+    );
+
+    policy
+}
+
+pub fn apply_runtime_policy(
+    target: &SentenceSyncTarget,
+    policy: &TtsRuntimePolicy,
+) -> SentenceSyncTarget {
+    if !policy.allow_rect_highlights {
+        return SentenceSyncTarget {
+            sentence_index: target.sentence_index,
+            sentence_id: target.sentence_id,
+            confidence: if policy.max_sync_confidence == SentenceSyncConfidence::Missing {
+                SentenceSyncConfidence::Missing
+            } else if target.page_index.is_some() {
+                SentenceSyncConfidence::PageFallback
+            } else {
+                SentenceSyncConfidence::Missing
+            },
+            page_index: target.page_index,
+            rects: Vec::new(),
+            fallback_reason: policy.reason.clone(),
+            score: target.score,
+        };
+    }
+
+    if sync_confidence_rank(target.confidence) <= sync_confidence_rank(policy.max_sync_confidence) {
+        return target.clone();
+    }
+
+    SentenceSyncTarget {
+        sentence_index: target.sentence_index,
+        sentence_id: target.sentence_id,
+        confidence: policy.max_sync_confidence,
+        page_index: target.page_index,
+        rects: if policy.max_sync_confidence == SentenceSyncConfidence::PageFallback {
+            Vec::new()
+        } else {
+            target.rects.clone()
+        },
+        fallback_reason: format!("{}; {}", target.fallback_reason, policy.reason),
+        score: target.score,
+    }
+}
+
 pub fn prepare_sentence_clip(
     config: &AppConfig,
     analysis: &TtsAnalysisArtifacts,
@@ -345,10 +477,11 @@ pub fn prepare_sentence_clip(
     if manifest_path.exists() {
         let contents = fs::read_to_string(&manifest_path)
             .with_context(|| format!("failed to read {}", manifest_path.display()))?;
-        let cached = toml::from_str::<PreparedSentenceClip>(&contents)
+        let mut cached = toml::from_str::<PreparedSentenceClip>(&contents)
             .with_context(|| format!("failed to parse {}", manifest_path.display()))?;
         let audio_ok = cached.audio_path.as_ref().is_none_or(|path| path.exists());
         if (cached.rate - config.tts.rate).abs() < f32::EPSILON && audio_ok {
+            cached.cache_hit = true;
             return Ok(cached);
         }
     }
@@ -375,6 +508,7 @@ pub fn prepare_sentence_clip(
         word_count: sentence.text.split_whitespace().count(),
         rate: config.tts.rate,
         generated_at_unix_secs: unix_timestamp_secs(),
+        cache_hit: false,
     };
 
     fs::write(&manifest_path, toml::to_string_pretty(&clip)?)
@@ -573,6 +707,16 @@ fn token_coverage_score(sentence_tokens: &[String], text: &str) -> f32 {
         .filter(|token| normalized_text.contains(token.as_str()))
         .count();
     hits as f32 / sentence_tokens.len() as f32
+}
+
+fn sync_confidence_rank(confidence: SentenceSyncConfidence) -> u8 {
+    match confidence {
+        SentenceSyncConfidence::ExactSentence => 0,
+        SentenceSyncConfidence::FuzzySentence => 1,
+        SentenceSyncConfidence::BlockFallback => 2,
+        SentenceSyncConfidence::PageFallback => 3,
+        SentenceSyncConfidence::Missing => 4,
+    }
 }
 
 fn build_sync_tokens(text: &str) -> Vec<String> {
@@ -1381,5 +1525,91 @@ mod tests {
             SentenceSyncConfidence::BlockFallback | SentenceSyncConfidence::FuzzySentence
         ));
         assert_eq!(target.page_index, Some(0));
+    }
+
+    #[test]
+    fn sentence_budget_window_keeps_local_radius() {
+        let window = sentence_budget_window(5, 12, 2);
+        assert_eq!(window, HashSet::from([3, 4, 5, 6, 7]));
+
+        let near_start = sentence_budget_window(0, 3, 2);
+        assert_eq!(near_start, HashSet::from([0, 1, 2]));
+    }
+
+    #[test]
+    fn deferred_ocr_policy_degrades_to_page_follow() {
+        let mut config = AppConfig::default();
+        config.tts.ocr_policy = TtsOcrPolicy::Deferred;
+        let analysis = TtsAnalysisArtifacts {
+            source_path: PathBuf::from("fixture.pdf"),
+            source_fingerprint: "abc".into(),
+            generated_at_unix_secs: 0,
+            mode: PdfTtsMode::OcrRequired,
+            confidence: 0.2,
+            tts_text: "Scanned fallback".into(),
+            sentences: vec![SentencePlan {
+                id: 1,
+                text: "Scanned fallback".into(),
+                range: TextRange { start: 0, end: 16 },
+                page_range: PageRange {
+                    start_page: 0,
+                    end_page: 0,
+                },
+            }],
+            pages: Vec::new(),
+            stats: NormalizationStats::default(),
+            artifact_path: None,
+        };
+
+        let policy = evaluate_runtime_policy(&config, &analysis);
+        assert!(policy.allow_playback);
+        assert!(!policy.allow_rect_highlights);
+        assert!(!policy.allow_sync_prefetch);
+        assert_eq!(
+            policy.max_sync_confidence,
+            SentenceSyncConfidence::PageFallback
+        );
+
+        let adapted = apply_runtime_policy(
+            &SentenceSyncTarget {
+                sentence_index: 0,
+                sentence_id: 1,
+                confidence: SentenceSyncConfidence::ExactSentence,
+                page_index: Some(0),
+                rects: vec![PdfRectData {
+                    left: 1.0,
+                    right: 2.0,
+                    top: 3.0,
+                    bottom: 0.5,
+                }],
+                fallback_reason: "exact_substring_match".into(),
+                score: 1.0,
+            },
+            &policy,
+        );
+        assert_eq!(adapted.confidence, SentenceSyncConfidence::PageFallback);
+        assert!(adapted.rects.is_empty());
+    }
+
+    #[test]
+    fn disabled_ocr_policy_blocks_playback() {
+        let mut config = AppConfig::default();
+        config.tts.ocr_policy = TtsOcrPolicy::Disabled;
+        let analysis = TtsAnalysisArtifacts {
+            source_path: PathBuf::from("fixture.pdf"),
+            source_fingerprint: "abc".into(),
+            generated_at_unix_secs: 0,
+            mode: PdfTtsMode::OcrRequired,
+            confidence: 0.1,
+            tts_text: String::new(),
+            sentences: Vec::new(),
+            pages: Vec::new(),
+            stats: NormalizationStats::default(),
+            artifact_path: None,
+        };
+
+        let policy = evaluate_runtime_policy(&config, &analysis);
+        assert!(!policy.allow_playback);
+        assert_eq!(policy.max_sync_confidence, SentenceSyncConfidence::Missing);
     }
 }

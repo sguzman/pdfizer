@@ -66,6 +66,7 @@ pub struct PdfizerApp {
     current_document_path: Option<PathBuf>,
     tts_analysis: Option<TtsAnalysisArtifacts>,
     tts_analysis_status: TtsAnalysisStatus,
+    tts_policy: Option<tts::TtsRuntimePolicy>,
     tts_worker_tx: Option<Sender<TtsWorkerMessage>>,
     tts_worker_rx: Option<Receiver<TtsWorkerMessage>>,
     tts_request_id: u64,
@@ -82,10 +83,12 @@ pub struct PdfizerApp {
     tts_prefetch_request_id: u64,
     tts_prefetch_in_flight: usize,
     tts_started_at: Option<Instant>,
+    tts_activation_requested_at: Option<Instant>,
     tts_elapsed_before_pause: Duration,
     tts_current_duration: Duration,
     tts_output: Option<MixerDeviceSink>,
     tts_player: Option<Player>,
+    tts_profile: TtsPerformanceProfile,
 }
 
 impl PdfizerApp {
@@ -161,6 +164,7 @@ impl PdfizerApp {
             } else {
                 TtsAnalysisStatus::Disabled
             },
+            tts_policy: None,
             tts_worker_tx: None,
             tts_worker_rx: None,
             tts_request_id: 0,
@@ -177,10 +181,12 @@ impl PdfizerApp {
             tts_prefetch_request_id: 0,
             tts_prefetch_in_flight: 0,
             tts_started_at: None,
+            tts_activation_requested_at: None,
             tts_elapsed_before_pause: Duration::ZERO,
             tts_current_duration: Duration::ZERO,
             tts_output: None,
             tts_player: None,
+            tts_profile: TtsPerformanceProfile::default(),
         };
 
         app.restore_session(&cc.egui_ctx);
@@ -221,6 +227,7 @@ impl PdfizerApp {
                 } else {
                     TtsAnalysisStatus::Disabled
                 };
+                self.tts_policy = None;
                 self.reset_tts_runtime();
                 self.single_scroll_offset = Vec2::ZERO;
                 self.continuous_scroll_offset = Vec2::ZERO;
@@ -287,6 +294,7 @@ impl PdfizerApp {
                     request_id,
                     artifacts,
                 }) if request_id == self.tts_request_id => {
+                    let policy = tts::evaluate_runtime_policy(&self.config, &artifacts);
                     if artifacts.mode != PdfTtsMode::HighTextTrust
                         && self.config.tts.verbose_degraded_logging
                     {
@@ -298,10 +306,12 @@ impl PdfizerApp {
                         );
                     }
                     self.status_message = Some(format!(
-                        "TTS analysis ready: {} sentences ({})",
+                        "TTS analysis ready: {} sentences ({}, {})",
                         artifacts.sentences.len(),
-                        artifacts.mode.label()
+                        artifacts.mode.label(),
+                        policy.reason
                     ));
+                    self.tts_policy = Some(policy);
                     self.tts_analysis = Some(artifacts);
                     self.tts_analysis_status = TtsAnalysisStatus::Ready;
                     self.sync_tts_sentence_to_current_page();
@@ -313,19 +323,30 @@ impl PdfizerApp {
                     self.last_error = Some(format!("TTS analysis failed: {error}"));
                     self.tts_analysis_status = TtsAnalysisStatus::Failed(error);
                 }
-                Ok(TtsWorkerMessage::PrefetchCompleted { request_id, clip })
+                Ok(TtsWorkerMessage::PrefetchCompleted {
+                    request_id,
+                    clip,
+                    elapsed_ms,
+                })
                     if request_id == self.tts_prefetch_request_id =>
                 {
+                    self.tts_profile.prepare.record(elapsed_ms as f64);
+                    if clip.cache_hit {
+                        self.tts_profile.prepare_cache_hits += 1;
+                    }
                     self.tts_prepared_clips.insert(clip.sentence_index, clip);
                     self.tts_prefetch_queue
                         .retain(|index| !self.tts_prepared_clips.contains_key(index));
                     self.tts_prefetch_in_flight = self.tts_prefetch_in_flight.saturating_sub(1);
+                    self.enforce_tts_runtime_budget();
                 }
                 Ok(TtsWorkerMessage::PrefetchFailed {
                     request_id,
                     sentence_index,
                     error,
+                    elapsed_ms,
                 }) if request_id == self.tts_prefetch_request_id => {
+                    self.tts_profile.prepare.record(elapsed_ms as f64);
                     self.tts_prefetch_queue
                         .retain(|index| *index != sentence_index);
                     self.tts_prefetch_in_flight = self.tts_prefetch_in_flight.saturating_sub(1);
@@ -333,23 +354,34 @@ impl PdfizerApp {
                         .insert(sentence_index, error.clone());
                     warn!(sentence_index, error = %error, "TTS prefetch failed");
                 }
-                Ok(TtsWorkerMessage::SyncCompleted { request_id, target })
+                Ok(TtsWorkerMessage::SyncCompleted {
+                    request_id,
+                    target,
+                    elapsed_ms,
+                })
                     if request_id == self.tts_prefetch_request_id =>
                 {
+                    self.tts_profile.sync.record(elapsed_ms as f64);
+                    self.tts_profile.record_sync_confidence(target.confidence);
                     self.tts_sync_targets.insert(target.sentence_index, target);
                     self.tts_sync_queue
                         .retain(|index| !self.tts_sync_targets.contains_key(index));
+                    self.enforce_tts_runtime_budget();
                 }
                 Ok(TtsWorkerMessage::SyncFailed {
                     request_id,
                     sentence_index,
                     error,
+                    elapsed_ms,
                 }) if request_id == self.tts_prefetch_request_id => {
+                    self.tts_profile.sync.record(elapsed_ms as f64);
                     self.tts_sync_queue.retain(|index| *index != sentence_index);
                     self.tts_failed_sync.insert(sentence_index, error.clone());
                     warn!(sentence_index, error = %error, "TTS sync computation failed");
                 }
-                Ok(_) => {}
+                Ok(_) => {
+                    self.tts_profile.stale_worker_results += 1;
+                }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
                     self.tts_analysis_status = TtsAnalysisStatus::Failed(
@@ -375,9 +407,11 @@ impl PdfizerApp {
         self.tts_failed_sync.clear();
         self.tts_prefetch_in_flight = 0;
         self.tts_started_at = None;
+        self.tts_activation_requested_at = None;
         self.tts_elapsed_before_pause = Duration::ZERO;
         self.tts_current_duration = Duration::ZERO;
         self.tts_prefetch_request_id = self.tts_prefetch_request_id.wrapping_add(1);
+        self.tts_profile = TtsPerformanceProfile::default();
         if let Some(player) = &self.tts_player {
             player.clear();
             player.stop();
@@ -388,6 +422,16 @@ impl PdfizerApp {
         self.tts_analysis
             .as_ref()
             .and_then(|analysis| analysis.sentences.get(self.tts_active_sentence_index))
+    }
+
+    fn active_tts_policy(&self) -> Option<&tts::TtsRuntimePolicy> {
+        self.tts_policy.as_ref()
+    }
+
+    fn effective_sync_target(&self, sentence_index: usize) -> Option<SentenceSyncTarget> {
+        let target = self.tts_sync_targets.get(&sentence_index)?;
+        let policy = self.active_tts_policy()?;
+        Some(tts::apply_runtime_policy(target, policy))
     }
 
     fn sync_tts_sentence_to_current_page(&mut self) {
@@ -406,6 +450,9 @@ impl PdfizerApp {
         let Some(analysis) = self.tts_analysis.clone() else {
             return;
         };
+        let Some(policy) = self.tts_policy.clone() else {
+            return;
+        };
 
         self.tts_prefetch_request_id = self.tts_prefetch_request_id.wrapping_add(1);
         let request_id = self.tts_prefetch_request_id;
@@ -422,9 +469,12 @@ impl PdfizerApp {
             .collect();
         self.tts_failed_prefetch.clear();
         self.tts_prefetch_in_flight = self.tts_prefetch_queue.len();
+        self.enforce_tts_runtime_budget();
 
         if self.tts_prefetch_queue.is_empty() {
-            return;
+            if !policy.allow_sync_prefetch {
+                self.tts_sync_queue.clear();
+            }
         }
 
         let sender = self.ensure_tts_worker_channel();
@@ -434,17 +484,28 @@ impl PdfizerApp {
             let sender = sender.clone();
             let engine = self.tts_engine;
             thread::spawn(move || {
+                let started = Instant::now();
                 let message =
                     match tts::prepare_sentence_clip(&config, &analysis, sentence_index, engine) {
-                        Ok(clip) => TtsWorkerMessage::PrefetchCompleted { request_id, clip },
+                        Ok(clip) => TtsWorkerMessage::PrefetchCompleted {
+                            request_id,
+                            clip,
+                            elapsed_ms: started.elapsed().as_millis() as u64,
+                        },
                         Err(err) => TtsWorkerMessage::PrefetchFailed {
                             request_id,
                             sentence_index,
                             error: err.to_string(),
+                            elapsed_ms: started.elapsed().as_millis() as u64,
                         },
                     };
                 let _ = sender.send(message);
             });
+        }
+
+        if !policy.allow_sync_prefetch {
+            self.tts_sync_queue.clear();
+            return;
         }
 
         self.tts_sync_queue = tts::build_sync_prefetch_plan(
@@ -461,12 +522,18 @@ impl PdfizerApp {
             let analysis = analysis.clone();
             let sender = sender.clone();
             thread::spawn(move || {
+                let started = Instant::now();
                 let message = match tts::compute_sentence_sync(&config, &analysis, sentence_index) {
-                    Ok(target) => TtsWorkerMessage::SyncCompleted { request_id, target },
+                    Ok(target) => TtsWorkerMessage::SyncCompleted {
+                        request_id,
+                        target,
+                        elapsed_ms: started.elapsed().as_millis() as u64,
+                    },
                     Err(err) => TtsWorkerMessage::SyncFailed {
                         request_id,
                         sentence_index,
                         error: err.to_string(),
+                        elapsed_ms: started.elapsed().as_millis() as u64,
                     },
                 };
                 let _ = sender.send(message);
@@ -483,8 +550,17 @@ impl PdfizerApp {
             self.last_error = Some("TTS analysis is not ready yet".into());
             return;
         }
+        let Some(policy) = self.active_tts_policy() else {
+            self.last_error = Some("TTS runtime policy is unavailable".into());
+            return;
+        };
+        if !policy.allow_playback {
+            self.last_error = Some(format!("TTS playback is blocked: {}", policy.reason));
+            return;
+        }
 
         self.tts_playback_state = TtsPlaybackState::Preparing;
+        self.tts_activation_requested_at = Some(Instant::now());
         self.start_tts_prefetch();
         self.try_activate_current_sentence(ctx);
     }
@@ -531,6 +607,7 @@ impl PdfizerApp {
         if self.tts_active_sentence_index + 1 < analysis.sentences.len() {
             self.tts_active_sentence_index += 1;
             self.tts_started_at = None;
+            self.tts_activation_requested_at = Some(Instant::now());
             self.start_tts_prefetch();
             self.try_activate_current_sentence(ctx);
         } else {
@@ -542,6 +619,7 @@ impl PdfizerApp {
         if self.tts_active_sentence_index > 0 {
             self.tts_active_sentence_index -= 1;
             self.tts_started_at = None;
+            self.tts_activation_requested_at = Some(Instant::now());
             self.start_tts_prefetch();
             self.try_activate_current_sentence(ctx);
         }
@@ -561,6 +639,11 @@ impl PdfizerApp {
                 self.last_error = Some(format!("TTS playback failed: {err}"));
                 self.tts_playback_state = TtsPlaybackState::Failed;
                 return;
+            }
+            if let Some(requested_at) = self.tts_activation_requested_at.take() {
+                self.tts_profile
+                    .activation
+                    .record(requested_at.elapsed().as_secs_f64() * 1000.0);
             }
             self.focus_active_sentence(ctx);
             self.status_message = Some(format!(
@@ -623,6 +706,7 @@ impl PdfizerApp {
         }
         self.tts_active_sentence_index = target_sentence_index;
         self.tts_started_at = None;
+        self.tts_activation_requested_at = Some(Instant::now());
         self.tts_elapsed_before_pause = Duration::ZERO;
         self.start_tts_prefetch();
         self.try_activate_current_sentence(ctx);
