@@ -101,6 +101,9 @@ mod config {
         assert_eq!(first, second);
         let path_text = first.to_string_lossy();
         assert!(path_text.contains(".cache/pdfizer/documents"));
-        assert!(path_text.ends_with("/artifacts/analysis.toml") || path_text.ends_with("\\artifacts\\analysis.toml"));
+        assert!(
+            path_text.ends_with("/artifacts/analysis.toml")
+                || path_text.ends_with("\\artifacts\\analysis.toml")
+        );
     }
 }

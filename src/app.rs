@@ -150,6 +150,7 @@ enum PlaybackEvent {
 
 #[derive(Debug, Clone, Copy)]
 enum TtsAnalysisRequest {
+    Startup,
     Windowed,
     FullDocument,
 }
@@ -366,7 +367,7 @@ impl PdfizerApp {
                 self.continuous_scroll_offset = Vec2::ZERO;
                 self.render_current_page(ctx);
                 if !self.try_load_cached_tts_analysis() {
-                    self.start_tts_analysis(path, TtsAnalysisRequest::Windowed);
+                    self.start_tts_analysis(path, TtsAnalysisRequest::Startup);
                 }
                 self.persist_session();
             }
@@ -495,7 +496,10 @@ impl PdfizerApp {
         };
         self.cancel_tts_work("rebuild_analysis");
         self.start_tts_analysis(path, TtsAnalysisRequest::Windowed);
-        self.status_message = Some("Rebuilding TTS analysis".into());
+        self.status_message = Some(format!(
+            "Rebuilding TTS analysis for a {}-page window",
+            self.config.tts.analysis_max_pages.max(1)
+        ));
     }
 
     fn rebuild_tts_analysis_full(&mut self) {
@@ -515,12 +519,22 @@ impl PdfizerApp {
         }
 
         let page_count = document.metadata.page_count;
-        let max_pages = self.config.tts.analysis_max_pages.max(1);
+        let max_pages = match request {
+            TtsAnalysisRequest::Startup => self.config.tts.startup_analysis_pages.max(1),
+            TtsAnalysisRequest::Windowed => self.config.tts.analysis_max_pages.max(1),
+            TtsAnalysisRequest::FullDocument => page_count.max(1),
+        };
         if page_count <= max_pages {
             return None;
         }
 
-        let radius = self.config.tts.analysis_window_radius.max(max_pages / 2);
+        let radius = match request {
+            TtsAnalysisRequest::Startup => max_pages / 2,
+            TtsAnalysisRequest::Windowed => {
+                self.config.tts.analysis_window_radius.max(max_pages / 2)
+            }
+            TtsAnalysisRequest::FullDocument => 0,
+        };
         let mut start = self.current_page.saturating_sub(radius);
         let mut end = (self.current_page + radius).min(page_count.saturating_sub(1));
         let window_len = end - start + 1;
@@ -1266,7 +1280,11 @@ impl PdfizerApp {
         if self.tts_analysis.is_none() {
             self.last_error = Some(match &self.tts_analysis_status {
                 TtsAnalysisStatus::Analyzing => {
-                    "TTS analysis is still running. Use Rebuild TTS for a fast page window or Analyze Full TTS for the whole document.".into()
+                    format!(
+                        "TTS analysis is still running. Startup only needs about {} pages before playback is available. Use Rebuild TTS for a {}-page window or Analyze Full TTS for the whole document.",
+                        self.config.tts.startup_analysis_pages.max(1),
+                        self.config.tts.analysis_max_pages.max(1)
+                    )
                 }
                 TtsAnalysisStatus::Failed(message) => {
                     format!("TTS analysis failed: {message}")
