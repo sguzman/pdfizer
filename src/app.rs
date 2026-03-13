@@ -401,6 +401,78 @@ impl PdfizerApp {
         self.persist_session();
     }
 
+    fn scroll_source_for_input(&self, ctx: &egui::Context) -> egui::scroll_area::ScrollSource {
+        if ctx.input(|input| input.modifiers.ctrl) {
+            egui::scroll_area::ScrollSource {
+                mouse_wheel: false,
+                ..egui::scroll_area::ScrollSource::ALL
+            }
+        } else {
+            egui::scroll_area::ScrollSource::ALL
+        }
+    }
+
+    fn navigate_to_page(
+        &mut self,
+        page_index: usize,
+        focus_rect: Option<PdfRectData>,
+        ctx: &egui::Context,
+    ) {
+        self.current_page = page_index;
+
+        match self.view_mode {
+            ViewMode::SinglePage => {
+                let size = self.page_image_size(page_index).unwrap_or(Vec2::ZERO);
+                let target = focus_rect
+                    .and_then(|rect| self.page_focus_offset(page_index, rect))
+                    .unwrap_or(Vec2::ZERO);
+                self.single_scroll_offset = Vec2::new(
+                    target.x.clamp(0.0, size.x.max(0.0)),
+                    target.y.clamp(0.0, size.y.max(0.0)),
+                );
+                self.render_current_page(ctx);
+            }
+            ViewMode::Continuous => {
+                let y = focus_rect
+                    .and_then(|rect| self.continuous_focus_offset(page_index, rect))
+                    .unwrap_or_else(|| self.continuous_page_top(page_index));
+                self.continuous_scroll_offset = Vec2::new(0.0, y.max(0.0));
+                self.render_current_page(ctx);
+            }
+        }
+
+        self.persist_session();
+        ctx.request_repaint();
+    }
+
+    fn page_focus_offset(&self, page_index: usize, rect: PdfRectData) -> Option<Vec2> {
+        let size = self.page_image_size(page_index)?;
+        let document = self.document.as_ref()?;
+        let page_size = document.page_size(page_index)?;
+        let x = size.x * (rect.left / page_size.width) - 40.0;
+        let y = size.y * (1.0 - (rect.top / page_size.height)) - 40.0;
+        Some(Vec2::new(x.max(0.0), y.max(0.0)))
+    }
+
+    fn continuous_focus_offset(&self, page_index: usize, rect: PdfRectData) -> Option<f32> {
+        let page_top = self.continuous_page_top(page_index);
+        let size = self.page_image_size(page_index)?;
+        let document = self.document.as_ref()?;
+        let page_size = document.page_size(page_index)?;
+        let y_in_page = size.y * (1.0 - (rect.top / page_size.height)) - 40.0;
+        Some((page_top + y_in_page).max(0.0))
+    }
+
+    fn continuous_page_top(&self, page_index: usize) -> f32 {
+        let mut offset = 0.0;
+        for index in 0..page_index {
+            if let Some(size) = self.page_image_size(index) {
+                offset += size.y + 14.0;
+            }
+        }
+        offset
+    }
+
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
         let open_shortcut = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, Key::O);
         let save_shortcut = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, Key::S);
@@ -717,9 +789,7 @@ impl PdfizerApp {
                             ))
                             .clicked()
                         {
-                            self.current_page = page;
-                            self.render_current_page(ctx);
-                            self.persist_session();
+                            self.navigate_to_page(page, None, ctx);
                         }
                         ui.label(format!("Page {}", page + 1));
                     });
@@ -959,9 +1029,8 @@ impl PdfizerApp {
     fn activate_search_result(&mut self, index: usize, ctx: &egui::Context) {
         if let Some(result) = self.search_results.get(index) {
             self.active_search_result = Some(index);
-            self.current_page = result.page_index;
-            self.render_current_page(ctx);
-            self.persist_session();
+            let focus_rect = result.rects.first().copied();
+            self.navigate_to_page(result.page_index, focus_rect, ctx);
         }
     }
 
@@ -1053,6 +1122,7 @@ impl PdfizerApp {
         let output = ScrollArea::both()
             .id_salt("continuous_document")
             .scroll_offset(self.continuous_scroll_offset)
+            .scroll_source(self.scroll_source_for_input(ctx))
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 let clip_rect = ui.clip_rect();
@@ -1177,6 +1247,7 @@ impl PdfizerApp {
                 let output = ScrollArea::both()
                     .id_salt("single_page_view")
                     .scroll_offset(self.single_scroll_offset)
+                    .scroll_source(self.scroll_source_for_input(ctx))
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
                         let image_size =
