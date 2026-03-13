@@ -128,6 +128,67 @@ impl PdfDocument<'_> {
         self.page_sizes.get(page_index).copied()
     }
 
+    pub fn extract_text_in_rect(&self, page_index: usize, rect: PdfRectData) -> Result<String> {
+        let page = self
+            .document
+            .pages()
+            .get(page_index as u16)
+            .with_context(|| format!("page index {page_index} is out of bounds"))?;
+        let text = page
+            .text()
+            .map_err(|err| anyhow!("failed to load page text: {err}"))?;
+
+        Ok(text.inside_rect(rect.to_pdf_rect()))
+    }
+
+    pub fn search_page(
+        &self,
+        page_index: usize,
+        query: &str,
+        match_case: bool,
+        match_whole_word: bool,
+    ) -> Result<Vec<SearchHit>> {
+        let page = self
+            .document
+            .pages()
+            .get(page_index as u16)
+            .with_context(|| format!("page index {page_index} is out of bounds"))?;
+        let text = page
+            .text()
+            .map_err(|err| anyhow!("failed to load page text: {err}"))?;
+        let search = text
+            .search(
+                query,
+                &PdfSearchOptions::new()
+                    .match_case(match_case)
+                    .match_whole_word(match_whole_word),
+            )
+            .map_err(|err| anyhow!("failed to search page text: {err}"))?;
+        let mut hits = Vec::new();
+
+        for segments in search.iter(PdfSearchDirection::SearchForward) {
+            let mut rects = Vec::new();
+            let mut snippet = String::new();
+
+            for segment in segments.iter() {
+                let segment_text = segment.text();
+                if !snippet.is_empty() {
+                    snippet.push(' ');
+                }
+                snippet.push_str(segment_text.trim());
+                rects.push(PdfRectData::from_pdf_rect(segment.bounds()));
+            }
+
+            hits.push(SearchHit {
+                page_index,
+                snippet: snippet.trim().to_owned(),
+                rects,
+            });
+        }
+
+        Ok(hits)
+    }
+
     #[instrument(skip(self))]
     pub fn render_page_image(&self, request: &RenderRequest) -> Result<RenderedPageImage> {
         let started = Instant::now();
@@ -366,6 +427,36 @@ pub struct PdfMetadata {
 pub struct PageSizePoints {
     pub width: f32,
     pub height: f32,
+}
+
+#[derive(Debug, Clone)]
+pub struct SearchHit {
+    pub page_index: usize,
+    pub snippet: String,
+    pub rects: Vec<PdfRectData>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PdfRectData {
+    pub bottom: f32,
+    pub left: f32,
+    pub top: f32,
+    pub right: f32,
+}
+
+impl PdfRectData {
+    pub fn from_pdf_rect(rect: PdfRect) -> Self {
+        Self {
+            bottom: rect.bottom().value,
+            left: rect.left().value,
+            top: rect.top().value,
+            right: rect.right().value,
+        }
+    }
+
+    pub fn to_pdf_rect(self) -> PdfRect {
+        PdfRect::new_from_values(self.bottom, self.left, self.top, self.right)
+    }
 }
 
 #[derive(Debug, Clone)]

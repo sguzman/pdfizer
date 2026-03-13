@@ -17,8 +17,8 @@ use tracing::{debug, error, info, instrument, warn};
 use crate::{
     config::AppConfig,
     pdf::{
-        PageSizePoints, PdfDocument, PdfMetadata, PdfRuntime, RenderMode, RenderPreset,
-        RenderRequest, RenderedPageImage, TileRenderRequest,
+        PageSizePoints, PdfDocument, PdfMetadata, PdfRectData, PdfRuntime, RenderMode,
+        RenderPreset, RenderRequest, RenderedPageImage, SearchHit, TileRenderRequest,
     },
 };
 
@@ -30,6 +30,7 @@ pub struct PdfizerApp {
     last_error: Option<String>,
     current_page: usize,
     zoom: f32,
+    view_mode: ViewMode,
     current_preset: RenderPreset,
     compare_enabled: bool,
     compare_preset: RenderPreset,
@@ -46,6 +47,14 @@ pub struct PdfizerApp {
     pixel_sample: Option<PixelSample>,
     selection_anchor: Option<Pos2>,
     selection_rect: Option<Rect>,
+    selected_text: String,
+    selected_text_page: Option<usize>,
+    selected_pdf_rect: Option<PdfRectData>,
+    search_query: String,
+    search_match_case: bool,
+    search_whole_word: bool,
+    search_results: Vec<SearchHit>,
+    active_search_result: Option<usize>,
 }
 
 impl PdfizerApp {
@@ -65,6 +74,7 @@ impl PdfizerApp {
 
         let mut app = Self {
             zoom: config.rendering.initial_zoom,
+            view_mode: ViewMode::SinglePage,
             current_preset: RenderPreset::from_name(&config.rendering.default_preset),
             compare_enabled: config.ui.compare_mode_default,
             compare_preset: config
@@ -92,6 +102,14 @@ impl PdfizerApp {
             pixel_sample: None,
             selection_anchor: None,
             selection_rect: None,
+            selected_text: String::new(),
+            selected_text_page: None,
+            selected_pdf_rect: None,
+            search_query: String::new(),
+            search_match_case: false,
+            search_whole_word: false,
+            search_results: Vec::new(),
+            active_search_result: None,
         };
 
         app.restore_session(&cc.egui_ctx);
@@ -121,7 +139,11 @@ impl PdfizerApp {
                 self.primary_tile_job = None;
                 self.compare_tile_job = None;
                 self.selection_rect = None;
+                self.selected_pdf_rect = None;
+                self.selected_text.clear();
                 self.pixel_sample = None;
+                self.search_results.clear();
+                self.active_search_result = None;
                 self.render_current_page(ctx);
                 self.persist_session();
             }
@@ -392,6 +414,24 @@ impl PdfizerApp {
             self.render_current_page(ctx);
             self.persist_session();
         }
+
+        let ctrl_scroll = ctx.input(|input| {
+            if input.modifiers.ctrl {
+                input.raw_scroll_delta.y
+            } else {
+                0.0
+            }
+        });
+
+        if ctrl_scroll.abs() > f32::EPSILON {
+            let factor = if ctrl_scroll > 0.0 { 1.1 } else { 1.0 / 1.1 };
+            self.zoom = (self.zoom * factor).clamp(
+                self.config.rendering.min_zoom,
+                self.config.rendering.max_zoom,
+            );
+            self.render_current_page(ctx);
+            self.persist_session();
+        }
     }
 
     fn top_bar(&mut self, ctx: &egui::Context, ui: &mut Ui) {
@@ -456,6 +496,24 @@ impl PdfizerApp {
         }
 
         ui.separator();
+        ui.label("View");
+        egui::ComboBox::from_id_salt("view_mode")
+            .selected_text(self.view_mode.label())
+            .show_ui(ui, |ui| {
+                for mode in [ViewMode::SinglePage, ViewMode::Continuous] {
+                    if ui
+                        .selectable_value(&mut self.view_mode, mode, mode.label())
+                        .changed()
+                    {
+                        if self.view_mode == ViewMode::Continuous {
+                            self.compare_enabled = false;
+                        }
+                        self.render_current_page(ctx);
+                    }
+                }
+            });
+
+        ui.separator();
         ui.label("Preset");
         egui::ComboBox::from_id_salt("primary_preset")
             .selected_text(self.current_preset.label())
@@ -471,8 +529,10 @@ impl PdfizerApp {
                 }
             });
 
-        ui.checkbox(&mut self.compare_enabled, "Compare");
-        if self.compare_enabled {
+        ui.add_enabled_ui(self.view_mode == ViewMode::SinglePage, |ui| {
+            ui.checkbox(&mut self.compare_enabled, "Compare");
+        });
+        if self.view_mode == ViewMode::SinglePage && self.compare_enabled {
             egui::ComboBox::from_id_salt("compare_preset")
                 .selected_text(self.compare_preset.label())
                 .show_ui(ui, |ui| {
@@ -491,6 +551,22 @@ impl PdfizerApp {
         if ui.button("Re-render").clicked() {
             self.render_current_page(ctx);
         }
+
+        ui.separator();
+        ui.label("Search");
+        let response = ui.add(
+            egui::TextEdit::singleline(&mut self.search_query)
+                .desired_width(180.0)
+                .hint_text("Find text"),
+        );
+        if response.lost_focus() && ui.input(|input| input.key_pressed(Key::Enter)) {
+            self.run_search();
+        }
+        if ui.button("Find").clicked() {
+            self.run_search();
+        }
+        ui.checkbox(&mut self.search_match_case, "Aa");
+        ui.checkbox(&mut self.search_whole_word, "Word");
 
         if let Some(document) = &self.document {
             ui.separator();
@@ -654,6 +730,58 @@ impl PdfizerApp {
             ));
         }
 
+        ui.separator();
+        ui.collapsing("Selected text", |ui| {
+            if self.selected_text.is_empty() {
+                ui.label("Drag a rectangle over a page to extract selectable text.");
+            } else {
+                ui.label(format!(
+                    "Page {}",
+                    self.selected_text_page.map(|page| page + 1).unwrap_or(0)
+                ));
+                ui.add(
+                    egui::TextEdit::multiline(&mut self.selected_text)
+                        .font(egui::TextStyle::Monospace)
+                        .desired_rows(6),
+                );
+            }
+        });
+
+        ui.collapsing("Search results", |ui| {
+            if self.search_results.is_empty() {
+                ui.label("No active results.");
+            } else {
+                let ctx = ctx.clone();
+                ScrollArea::vertical().max_height(180.0).show(ui, |ui| {
+                    let results: Vec<(usize, String, usize)> = self
+                        .search_results
+                        .iter()
+                        .enumerate()
+                        .map(|(index, hit)| {
+                            (
+                                index,
+                                if hit.snippet.is_empty() {
+                                    self.search_query.clone()
+                                } else {
+                                    hit.snippet.clone()
+                                },
+                                hit.page_index,
+                            )
+                        })
+                        .collect();
+                    for (index, snippet, page_index) in results {
+                        let selected = Some(index) == self.active_search_result;
+                        if ui
+                            .selectable_label(selected, format!("p{}: {}", page_index + 1, snippet))
+                            .clicked()
+                        {
+                            self.activate_search_result(index, &ctx);
+                        }
+                    }
+                });
+            }
+        });
+
         ui.horizontal(|ui| {
             if ui.button("Export benchmark snapshot").clicked() {
                 match self.export_benchmark_snapshot() {
@@ -745,7 +873,95 @@ impl PdfizerApp {
         Ok(())
     }
 
+    fn run_search(&mut self) {
+        let Some(document) = &self.document else {
+            self.last_error = Some("open a PDF before searching".into());
+            return;
+        };
+
+        let query = self.search_query.trim();
+        if query.is_empty() {
+            self.search_results.clear();
+            self.active_search_result = None;
+            return;
+        }
+
+        let mut results = Vec::new();
+        for page_index in 0..document.metadata.page_count {
+            match document.search_page(
+                page_index,
+                query,
+                self.search_match_case,
+                self.search_whole_word,
+            ) {
+                Ok(mut hits) => results.append(&mut hits),
+                Err(err) => {
+                    self.last_error =
+                        Some(format!("search failed on page {}: {err}", page_index + 1));
+                    return;
+                }
+            }
+        }
+
+        self.search_results = results;
+        self.active_search_result = (!self.search_results.is_empty()).then_some(0);
+        if let Some(index) = self.active_search_result {
+            self.current_page = self.search_results[index].page_index;
+        }
+        self.status_message = Some(format!("Found {} result(s)", self.search_results.len()));
+    }
+
+    fn activate_search_result(&mut self, index: usize, ctx: &egui::Context) {
+        if let Some(result) = self.search_results.get(index) {
+            self.active_search_result = Some(index);
+            self.current_page = result.page_index;
+            self.render_current_page(ctx);
+            self.persist_session();
+        }
+    }
+
+    fn ensure_page_view_cached(
+        &mut self,
+        ctx: &egui::Context,
+        page_index: usize,
+        preset: RenderPreset,
+    ) -> Option<RenderView> {
+        let document = self.document.as_ref()?;
+        let key = RenderCacheKey::new(page_index, self.zoom, preset, ViewSlot::Primary);
+
+        if let Some(cached) = self.render_cache.get(&key).cloned() {
+            return Some(RenderView::from_cached(cached));
+        }
+
+        let rendered = document
+            .render_page_image(&RenderRequest {
+                page_index,
+                zoom: self.zoom,
+                preset,
+            })
+            .ok()?;
+        let texture = ctx.load_texture(
+            key.texture_name(),
+            rendered.image.clone(),
+            self.config.rendering.texture_filter.to_texture_options(),
+        );
+        let cached = CachedRender {
+            texture,
+            image: rendered.image,
+            elapsed_ms: rendered.elapsed.as_secs_f64() * 1000.0,
+            mode: rendered.mode,
+        };
+        self.render_cache.insert(key, cached.clone());
+        Some(RenderView::from_cached(cached))
+    }
+
     fn central_panel(&mut self, ui: &mut Ui) {
+        let ctx = ui.ctx().clone();
+        if self.view_mode == ViewMode::Continuous {
+            self.render_continuous_panel(&ctx, ui);
+            return;
+        }
+
         match (
             self.primary_view.clone(),
             self.compare_enabled,
@@ -753,12 +969,26 @@ impl PdfizerApp {
         ) {
             (Some(primary), true, Some(compare)) => {
                 ui.columns(2, |columns| {
-                    self.render_view_panel(&mut columns[0], "Primary", &primary, true);
-                    self.render_view_panel(&mut columns[1], "Compare", &compare, false);
+                    self.render_view_panel(
+                        &ctx,
+                        &mut columns[0],
+                        "Primary",
+                        self.current_page,
+                        &primary,
+                        true,
+                    );
+                    self.render_view_panel(
+                        &ctx,
+                        &mut columns[1],
+                        "Compare",
+                        self.current_page,
+                        &compare,
+                        false,
+                    );
                 });
             }
             (Some(primary), _, _) => {
-                self.render_view_panel(ui, "Primary", &primary, true);
+                self.render_view_panel(&ctx, ui, "Primary", self.current_page, &primary, true);
             }
             _ => {
                 ui.centered_and_justified(|ui| {
@@ -768,14 +998,44 @@ impl PdfizerApp {
         }
     }
 
+    fn render_continuous_panel(&mut self, ctx: &egui::Context, ui: &mut Ui) {
+        let Some(document) = &self.document else {
+            ui.centered_and_justified(|ui| ui.label("Open a PDF to render it."));
+            return;
+        };
+
+        let page_count = document.metadata.page_count;
+        ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                for page_index in 0..page_count {
+                    ui.group(|ui| {
+                        ui.label(format!("Page {}", page_index + 1));
+                        if let Some(view) =
+                            self.ensure_page_view_cached(ctx, page_index, self.current_preset)
+                        {
+                            self.render_view_panel(ctx, ui, "Continuous", page_index, &view, true);
+                        } else {
+                            ui.label("Rendering failed");
+                        }
+                    });
+                    ui.add_space(12.0);
+                }
+            });
+    }
+
     fn render_view_panel(
         &mut self,
+        ctx: &egui::Context,
         ui: &mut Ui,
         label: &str,
+        page_index: usize,
         view: &RenderView,
         enable_inspector: bool,
     ) {
-        ui.heading(label);
+        if label != "Continuous" {
+            ui.heading(label);
+        }
         egui::Frame::default()
             .fill(self.config.background_color())
             .show(ui, |ui| {
@@ -795,6 +1055,7 @@ impl PdfizerApp {
 
                             if response.drag_started() {
                                 self.selection_anchor = response.interact_pointer_pos();
+                                self.selected_text_page = Some(page_index);
                             }
 
                             if response.dragged() {
@@ -806,11 +1067,153 @@ impl PdfizerApp {
                             }
 
                             if response.drag_stopped() {
+                                self.capture_selection_for_page(page_index, &response, &view.image);
                                 self.selection_anchor = None;
                             }
                         }
+
+                        self.paint_search_highlights(ui, page_index, &response, &view.image);
+                        self.paint_selection_highlight(ui, page_index, &response, &view.image);
+
+                        if response.clicked() {
+                            self.current_page = page_index;
+                            self.persist_session();
+                        }
+
+                        if response.hovered() && ctx.input(|input| input.raw_scroll_delta.y != 0.0)
+                        {
+                            self.current_page = page_index;
+                        }
                     });
             });
+    }
+
+    fn capture_selection_for_page(
+        &mut self,
+        page_index: usize,
+        response: &egui::Response,
+        image: &ColorImage,
+    ) {
+        let Some(screen_rect) = self.selection_rect else {
+            return;
+        };
+
+        let Some(pdf_rect) =
+            self.page_screen_rect_to_pdf_rect(page_index, response.rect, screen_rect, image)
+        else {
+            return;
+        };
+
+        let Some(document) = &self.document else {
+            return;
+        };
+
+        match document.extract_text_in_rect(page_index, pdf_rect) {
+            Ok(text) => {
+                self.selected_text = text;
+                self.selected_text_page = Some(page_index);
+                self.selected_pdf_rect = Some(pdf_rect);
+            }
+            Err(err) => self.last_error = Some(err.to_string()),
+        }
+    }
+
+    fn paint_search_highlights(
+        &self,
+        ui: &Ui,
+        page_index: usize,
+        response: &egui::Response,
+        image: &ColorImage,
+    ) {
+        let Some(document) = &self.document else {
+            return;
+        };
+        let Some(page_size) = document.page_size(page_index) else {
+            return;
+        };
+
+        for (result_index, hit) in self.search_results.iter().enumerate() {
+            if hit.page_index != page_index {
+                continue;
+            }
+            let stroke_color = if Some(result_index) == self.active_search_result {
+                Color32::from_rgb(255, 160, 0)
+            } else {
+                Color32::from_rgb(255, 220, 0)
+            };
+            for rect in &hit.rects {
+                let highlight = pdf_rect_to_screen_rect(*rect, page_size, response.rect, image);
+                ui.painter().rect_stroke(
+                    highlight,
+                    0.0,
+                    egui::Stroke::new(2.0, stroke_color),
+                    egui::StrokeKind::Outside,
+                );
+            }
+        }
+    }
+
+    fn paint_selection_highlight(
+        &self,
+        ui: &Ui,
+        page_index: usize,
+        response: &egui::Response,
+        image: &ColorImage,
+    ) {
+        let Some(selected_page) = self.selected_text_page else {
+            return;
+        };
+        if selected_page != page_index {
+            return;
+        }
+        let Some(document) = &self.document else {
+            return;
+        };
+        let Some(page_size) = document.page_size(page_index) else {
+            return;
+        };
+        let Some(rect) = self.selected_pdf_rect else {
+            return;
+        };
+
+        let screen_rect = pdf_rect_to_screen_rect(rect, page_size, response.rect, image);
+        ui.painter().rect_stroke(
+            screen_rect,
+            0.0,
+            egui::Stroke::new(2.0, Color32::from_rgb(100, 180, 255)),
+            egui::StrokeKind::Outside,
+        );
+    }
+
+    fn page_screen_rect_to_pdf_rect(
+        &self,
+        page_index: usize,
+        image_rect: Rect,
+        selected_rect: Rect,
+        image: &ColorImage,
+    ) -> Option<PdfRectData> {
+        let document = self.document.as_ref()?;
+        let page_size = document.page_size(page_index)?;
+        let clipped = selected_rect.intersect(image_rect);
+        if clipped.width() <= 1.0 || clipped.height() <= 1.0 {
+            return None;
+        }
+
+        let left_ratio =
+            ((clipped.left() - image_rect.left()) / image_rect.width()).clamp(0.0, 1.0);
+        let right_ratio =
+            ((clipped.right() - image_rect.left()) / image_rect.width()).clamp(0.0, 1.0);
+        let top_ratio = ((clipped.top() - image_rect.top()) / image_rect.height()).clamp(0.0, 1.0);
+        let bottom_ratio =
+            ((clipped.bottom() - image_rect.top()) / image_rect.height()).clamp(0.0, 1.0);
+
+        let _ = image; // ratio uses displayed image dimensions only
+        Some(PdfRectData {
+            left: page_size.width * left_ratio,
+            right: page_size.width * right_ratio,
+            top: page_size.height * (1.0 - top_ratio),
+            bottom: page_size.height * (1.0 - bottom_ratio),
+        })
     }
 
     fn update_inspector_from_response(&mut self, response: &egui::Response, image: &ColorImage) {
@@ -844,6 +1247,10 @@ impl PdfizerApp {
             last_page: self.current_page,
             zoom: self.zoom,
             preset: self.current_preset.as_str().into(),
+            view_mode: match self.view_mode {
+                ViewMode::SinglePage => "single".into(),
+                ViewMode::Continuous => "continuous".into(),
+            },
             compare_enabled: self.compare_enabled,
             compare_preset: self.compare_preset.as_str().into(),
         };
@@ -882,6 +1289,11 @@ impl PdfizerApp {
             self.config.rendering.max_zoom,
         );
         self.current_preset = RenderPreset::from_name(&session.preset);
+        self.view_mode = if session.view_mode == "continuous" {
+            ViewMode::Continuous
+        } else {
+            ViewMode::SinglePage
+        };
         self.compare_enabled = session.compare_enabled;
         self.compare_preset = RenderPreset::from_name(&session.compare_preset);
 
@@ -1094,12 +1506,28 @@ struct PixelSample {
     rgba: [u8; 4],
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ViewMode {
+    SinglePage,
+    Continuous,
+}
+
+impl ViewMode {
+    fn label(&self) -> &'static str {
+        match self {
+            Self::SinglePage => "Single",
+            Self::Continuous => "Continuous",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
 struct SessionState {
     last_document: Option<PathBuf>,
     last_page: usize,
     zoom: f32,
     preset: String,
+    view_mode: String,
     compare_enabled: bool,
     compare_preset: String,
 }
@@ -1163,6 +1591,19 @@ fn scaled_page_width(size: PageSizePoints, zoom: f32) -> i32 {
 
 fn scaled_page_height(size: PageSizePoints, zoom: f32) -> i32 {
     ((size.height * zoom).round() as i32).max(1)
+}
+
+fn pdf_rect_to_screen_rect(
+    rect: PdfRectData,
+    page_size: PageSizePoints,
+    image_rect: Rect,
+    _image: &ColorImage,
+) -> Rect {
+    let left = image_rect.left() + image_rect.width() * (rect.left / page_size.width);
+    let right = image_rect.left() + image_rect.width() * (rect.right / page_size.width);
+    let top = image_rect.top() + image_rect.height() * (1.0 - (rect.top / page_size.height));
+    let bottom = image_rect.top() + image_rect.height() * (1.0 - (rect.bottom / page_size.height));
+    Rect::from_min_max(Pos2::new(left, top), Pos2::new(right, bottom))
 }
 
 fn build_tiles(full_width: i32, full_height: i32, tile_size: i32) -> Vec<TileSpec> {
