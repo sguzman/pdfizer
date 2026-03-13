@@ -189,6 +189,23 @@ impl PdfDocument<'_> {
         Ok(hits)
     }
 
+    pub fn text_rects_for_page(&self, page_index: usize) -> Result<Vec<PdfRectData>> {
+        let page = self
+            .document
+            .pages()
+            .get(page_index as u16)
+            .with_context(|| format!("page index {page_index} is out of bounds"))?;
+        let text = page
+            .text()
+            .map_err(|err| anyhow!("failed to load page text: {err}"))?;
+
+        Ok(text
+            .segments()
+            .iter()
+            .map(|segment| PdfRectData::from_pdf_rect(segment.bounds()))
+            .collect())
+    }
+
     #[instrument(skip(self))]
     pub fn render_page_image(&self, request: &RenderRequest) -> Result<RenderedPageImage> {
         let started = Instant::now();

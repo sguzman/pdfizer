@@ -55,6 +55,10 @@ pub struct PdfizerApp {
     search_whole_word: bool,
     search_results: Vec<SearchHit>,
     active_search_result: Option<usize>,
+    single_scroll_offset: Vec2,
+    continuous_scroll_offset: Vec2,
+    highlight_text: bool,
+    text_rect_cache: HashMap<usize, Vec<PdfRectData>>,
 }
 
 impl PdfizerApp {
@@ -110,6 +114,10 @@ impl PdfizerApp {
             search_whole_word: false,
             search_results: Vec::new(),
             active_search_result: None,
+            single_scroll_offset: Vec2::ZERO,
+            continuous_scroll_offset: Vec2::ZERO,
+            highlight_text: false,
+            text_rect_cache: HashMap::new(),
         };
 
         app.restore_session(&cc.egui_ctx);
@@ -144,6 +152,9 @@ impl PdfizerApp {
                 self.pixel_sample = None;
                 self.search_results.clear();
                 self.active_search_result = None;
+                self.text_rect_cache.clear();
+                self.single_scroll_offset = Vec2::ZERO;
+                self.continuous_scroll_offset = Vec2::ZERO;
                 self.render_current_page(ctx);
                 self.persist_session();
             }
@@ -372,6 +383,24 @@ impl PdfizerApp {
         }
     }
 
+    fn apply_zoom(&mut self, ctx: &egui::Context, new_zoom: f32) {
+        let clamped = new_zoom.clamp(
+            self.config.rendering.min_zoom,
+            self.config.rendering.max_zoom,
+        );
+
+        if (clamped - self.zoom).abs() < f32::EPSILON {
+            return;
+        }
+
+        let factor = clamped / self.zoom.max(0.0001);
+        self.zoom = clamped;
+        self.single_scroll_offset *= factor;
+        self.continuous_scroll_offset *= factor;
+        self.render_current_page(ctx);
+        self.persist_session();
+    }
+
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
         let open_shortcut = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, Key::O);
         let save_shortcut = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, Key::S);
@@ -396,23 +425,15 @@ impl PdfizerApp {
         }
 
         if ctx.input(|input| input.key_pressed(Key::Plus) || input.key_pressed(Key::Equals)) {
-            self.zoom = (self.zoom + self.config.rendering.cache_zoom_bucket)
-                .min(self.config.rendering.max_zoom);
-            self.render_current_page(ctx);
-            self.persist_session();
+            self.apply_zoom(ctx, self.zoom + self.config.rendering.cache_zoom_bucket);
         }
 
         if ctx.input(|input| input.key_pressed(Key::Minus)) {
-            self.zoom = (self.zoom - self.config.rendering.cache_zoom_bucket)
-                .max(self.config.rendering.min_zoom);
-            self.render_current_page(ctx);
-            self.persist_session();
+            self.apply_zoom(ctx, self.zoom - self.config.rendering.cache_zoom_bucket);
         }
 
         if ctx.input(|input| input.key_pressed(Key::Num0)) {
-            self.zoom = self.config.rendering.initial_zoom;
-            self.render_current_page(ctx);
-            self.persist_session();
+            self.apply_zoom(ctx, self.config.rendering.initial_zoom);
         }
 
         let ctrl_scroll = ctx.input(|input| {
@@ -425,12 +446,7 @@ impl PdfizerApp {
 
         if ctrl_scroll.abs() > f32::EPSILON {
             let factor = if ctrl_scroll > 0.0 { 1.1 } else { 1.0 / 1.1 };
-            self.zoom = (self.zoom * factor).clamp(
-                self.config.rendering.min_zoom,
-                self.config.rendering.max_zoom,
-            );
-            self.render_current_page(ctx);
-            self.persist_session();
+            self.apply_zoom(ctx, self.zoom * factor);
         }
     }
 
@@ -480,6 +496,7 @@ impl PdfizerApp {
 
         ui.separator();
 
+        let zoom_before = self.zoom;
         let zoom_response = ui.add_enabled(
             has_document,
             Slider::new(
@@ -491,8 +508,9 @@ impl PdfizerApp {
         );
 
         if zoom_response.changed() {
-            self.render_current_page(ctx);
-            self.persist_session();
+            let zoom_after = self.zoom;
+            self.zoom = zoom_before;
+            self.apply_zoom(ctx, zoom_after);
         }
 
         ui.separator();
@@ -565,8 +583,35 @@ impl PdfizerApp {
         if ui.button("Find").clicked() {
             self.run_search();
         }
+        if ui
+            .add_enabled(
+                !self.search_results.is_empty(),
+                egui::Button::new("Prev hit"),
+            )
+            .clicked()
+        {
+            let next_index = match self.active_search_result {
+                Some(0) | None => self.search_results.len().saturating_sub(1),
+                Some(index) => index.saturating_sub(1),
+            };
+            self.activate_search_result(next_index, ctx);
+        }
+        if ui
+            .add_enabled(
+                !self.search_results.is_empty(),
+                egui::Button::new("Next hit"),
+            )
+            .clicked()
+        {
+            let next_index = match self.active_search_result {
+                Some(index) => (index + 1) % self.search_results.len(),
+                None => 0,
+            };
+            self.activate_search_result(next_index, ctx);
+        }
         ui.checkbox(&mut self.search_match_case, "Aa");
         ui.checkbox(&mut self.search_whole_word, "Word");
+        ui.checkbox(&mut self.highlight_text, "Highlight text");
 
         if let Some(document) = &self.document {
             ui.separator();
@@ -1005,7 +1050,9 @@ impl PdfizerApp {
         };
 
         let page_count = document.metadata.page_count;
-        ScrollArea::both()
+        let output = ScrollArea::both()
+            .id_salt("continuous_document")
+            .scroll_offset(self.continuous_scroll_offset)
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 let clip_rect = ui.clip_rect();
@@ -1058,6 +1105,7 @@ impl PdfizerApp {
                     ui.add_space(14.0);
                 }
             });
+        self.continuous_scroll_offset = output.state.offset;
     }
 
     fn render_continuous_page(
@@ -1097,6 +1145,7 @@ impl PdfizerApp {
             }
         }
 
+        self.paint_text_region_highlights(ui, page_index, &response, &view.image);
         self.paint_search_highlights(ui, page_index, &response, &view.image);
         self.paint_selection_highlight(ui, page_index, &response, &view.image);
 
@@ -1125,7 +1174,9 @@ impl PdfizerApp {
         egui::Frame::default()
             .fill(self.config.background_color())
             .show(ui, |ui| {
-                ScrollArea::both()
+                let output = ScrollArea::both()
+                    .id_salt("single_page_view")
+                    .scroll_offset(self.single_scroll_offset)
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
                         let image_size =
@@ -1158,6 +1209,7 @@ impl PdfizerApp {
                             }
                         }
 
+                        self.paint_text_region_highlights(ui, page_index, &response, &view.image);
                         self.paint_search_highlights(ui, page_index, &response, &view.image);
                         self.paint_selection_highlight(ui, page_index, &response, &view.image);
 
@@ -1171,6 +1223,7 @@ impl PdfizerApp {
                             self.current_page = page_index;
                         }
                     });
+                self.single_scroll_offset = output.state.offset;
             });
     }
 
@@ -1236,6 +1289,45 @@ impl PdfizerApp {
                     egui::StrokeKind::Outside,
                 );
             }
+        }
+    }
+
+    fn paint_text_region_highlights(
+        &mut self,
+        ui: &Ui,
+        page_index: usize,
+        response: &egui::Response,
+        image: &ColorImage,
+    ) {
+        if !self.highlight_text {
+            return;
+        }
+
+        if !self.text_rect_cache.contains_key(&page_index) {
+            if let Some(document) = &self.document {
+                if let Ok(rects) = document.text_rects_for_page(page_index) {
+                    self.text_rect_cache.insert(page_index, rects);
+                }
+            }
+        }
+
+        let Some(document) = &self.document else {
+            return;
+        };
+        let Some(page_size) = document.page_size(page_index) else {
+            return;
+        };
+        let Some(rects) = self.text_rect_cache.get(&page_index) else {
+            return;
+        };
+
+        for rect in rects {
+            let highlight = pdf_rect_to_screen_rect(*rect, page_size, response.rect, image);
+            ui.painter().rect_filled(
+                highlight,
+                0.0,
+                Color32::from_rgba_premultiplied(90, 170, 255, 24),
+            );
         }
     }
 
