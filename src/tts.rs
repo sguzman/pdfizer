@@ -1509,14 +1509,22 @@ pub fn build_artifacts_from_document_with_scope(
     start_page: usize,
     end_page: usize,
 ) -> Result<TtsAnalysisArtifacts> {
-    let fingerprint = fingerprint_document_path(source_path)?;
-    let repeated_edge_lines = collect_repeated_edge_lines(config, document)?;
-    let mut stats = NormalizationStats::default();
-    let mut full_text = String::new();
     let page_count = document.metadata.page_count;
     let start_page = start_page.min(page_count.saturating_sub(1));
     let end_page = end_page.min(page_count.saturating_sub(1)).max(start_page);
     let scoped_page_count = end_page - start_page + 1;
+    let fingerprint = fingerprint_document_path(source_path)?;
+    info!(
+        path = %source_path.display(),
+        analysis_start_page = start_page,
+        analysis_end_page = end_page,
+        scoped_page_count,
+        "starting PDF TTS analysis build"
+    );
+    let repeated_edge_lines =
+        collect_repeated_edge_lines_for_scope(config, document, start_page, end_page)?;
+    let mut stats = NormalizationStats::default();
+    let mut full_text = String::new();
     let mut pages = Vec::with_capacity(scoped_page_count);
     let mut canonical_pages = Vec::with_capacity(scoped_page_count);
     let mut block_count = 0usize;
@@ -2707,13 +2715,18 @@ fn is_sidenote_like_block(block: &NormalizedBlockText) -> bool {
             .all(|line| line.split_whitespace().count() <= 6)
 }
 
-fn collect_repeated_edge_lines(
+fn collect_repeated_edge_lines_for_scope(
     config: &AppConfig,
     document: &PdfDocument<'_>,
+    start_page: usize,
+    end_page: usize,
 ) -> Result<HashSet<String>> {
     let mut counts: HashMap<String, HashSet<usize>> = HashMap::new();
+    let page_count = document.metadata.page_count;
+    let start_page = start_page.min(page_count.saturating_sub(1));
+    let end_page = end_page.min(page_count.saturating_sub(1)).max(start_page);
 
-    for page_index in 0..document.metadata.page_count {
+    for page_index in start_page..=end_page {
         let page_text = document.full_text_for_page(page_index)?;
         let lines = page_text
             .lines()
@@ -2733,14 +2746,23 @@ fn collect_repeated_edge_lines(
         }
     }
 
-    Ok(counts
+    let repeated = counts
         .into_iter()
         .filter(|(line, pages)| {
             pages.len() >= config.tts.repeated_edge_line_min_pages
                 && line.chars().count() <= config.tts.max_edge_line_length
         })
         .map(|(line, _)| line)
-        .collect())
+        .collect::<HashSet<_>>();
+
+    debug!(
+        analysis_start_page = start_page,
+        analysis_end_page = end_page,
+        repeated_edge_line_count = repeated.len(),
+        "collected repeated edge lines for scoped PDF TTS analysis"
+    );
+
+    Ok(repeated)
 }
 
 fn fingerprint_document_path(path: &Path) -> Result<String> {
