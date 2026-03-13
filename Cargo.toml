@@ -9,11 +9,13 @@ config = { version = "0.15.21", default-features = false, features = ["toml"] }
 directories = "6.0.0"
 eframe = "0.33.3"
 egui = "0.33.3"
+image = "0.25.8"
 pdfium-render = "0.8.37"
 rfd = "0.17.2"
 serde = { version = "1.0.228", features = ["derive"] }
 toml = "0.9.7"
 tracing = "0.1.44"
+tracing-appender = "0.2.4"
 tracing-subscriber = { version = "0.3.22", features = ["env-filter", "fmt"] }
 
 [dev-dependencies]

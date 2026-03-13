@@ -6,12 +6,12 @@ use anyhow::{Result, anyhow};
 use app::PdfizerApp;
 use config::AppConfig;
 use tracing::{debug, info};
-use tracing_subscriber::EnvFilter;
+use tracing_appender::non_blocking::WorkerGuard;
+use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
 fn main() -> Result<()> {
-    init_tracing();
-
     let config = AppConfig::load()?;
+    let _guard = init_tracing(&config)?;
     info!(?config, "loaded application configuration");
 
     let native_options = config.to_native_options();
@@ -30,13 +30,42 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn init_tracing() {
-    let filter =
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("pdfizer=debug,info"));
+fn init_tracing(config: &AppConfig) -> Result<Option<WorkerGuard>> {
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new(format!("pdfizer={},info", config.logging.level)));
 
-    tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_target(true)
-        .compact()
-        .init();
+    let stdout_layer = tracing_subscriber::fmt::layer().compact().with_target(true);
+
+    if config.logging.write_to_file {
+        let path = config.log_file_path()?;
+        let directory = path
+            .parent()
+            .ok_or_else(|| anyhow!("invalid log file path {}", path.display()))?;
+        let file_name = path
+            .file_name()
+            .ok_or_else(|| anyhow!("invalid log file name {}", path.display()))?
+            .to_string_lossy()
+            .to_string();
+        let appender = tracing_appender::rolling::never(directory, file_name);
+        let (non_blocking, guard) = tracing_appender::non_blocking(appender);
+        let file_layer = tracing_subscriber::fmt::layer()
+            .compact()
+            .with_ansi(false)
+            .with_writer(non_blocking);
+
+        tracing_subscriber::registry()
+            .with(filter)
+            .with(stdout_layer)
+            .with(file_layer)
+            .init();
+
+        Ok(Some(guard))
+    } else {
+        tracing_subscriber::registry()
+            .with(filter)
+            .with(stdout_layer)
+            .init();
+
+        Ok(None)
+    }
 }

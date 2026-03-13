@@ -1,4 +1,7 @@
-use std::path::{Path, PathBuf};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
 
 use anyhow::{Context, Result};
 use config::{Config, Environment, File};
@@ -16,6 +19,7 @@ pub struct AppConfig {
     pub rendering: RenderingConfig,
     pub ui: UiConfig,
     pub logging: LoggingConfig,
+    pub storage: StorageConfig,
 }
 
 impl Default for AppConfig {
@@ -27,6 +31,7 @@ impl Default for AppConfig {
             rendering: RenderingConfig::default(),
             ui: UiConfig::default(),
             logging: LoggingConfig::default(),
+            storage: StorageConfig::default(),
         }
     }
 }
@@ -37,41 +42,108 @@ impl AppConfig {
     }
 
     pub fn load_from_paths(paths: Vec<PathBuf>) -> Result<Self> {
-        let window = WindowConfig::default();
-        let startup = StartupConfig::default();
-        let pdfium = PdfiumConfig::default();
-        let rendering = RenderingConfig::default();
-        let ui = UiConfig::default();
-        let logging = LoggingConfig::default();
+        let defaults = Self::default();
 
         let mut builder = Config::builder()
-            .set_default("window.title", window.title)?
-            .set_default("window.width", f64::from(window.width))?
-            .set_default("window.height", f64::from(window.height))?
-            .set_default("window.min_width", f64::from(window.min_width))?
-            .set_default("window.min_height", f64::from(window.min_height))?
-            .set_default("startup.open_last_document", startup.open_last_document)?
-            .set_default("startup.restore_last_page", startup.restore_last_page)?
+            .set_default("window.title", defaults.window.title.clone())?
+            .set_default("window.width", f64::from(defaults.window.width))?
+            .set_default("window.height", f64::from(defaults.window.height))?
+            .set_default("window.min_width", f64::from(defaults.window.min_width))?
+            .set_default("window.min_height", f64::from(defaults.window.min_height))?
+            .set_default(
+                "startup.open_last_document",
+                defaults.startup.open_last_document,
+            )?
+            .set_default(
+                "startup.restore_last_page",
+                defaults.startup.restore_last_page,
+            )?
             .set_default(
                 "startup.preferred_config_name",
-                startup.preferred_config_name,
+                defaults.startup.preferred_config_name.clone(),
             )?
-            .set_default("pdfium.library_path", pdfium.library_path)?
-            .set_default("pdfium.library_env_var", pdfium.library_env_var)?
-            .set_default("rendering.initial_zoom", f64::from(rendering.initial_zoom))?
-            .set_default("rendering.max_zoom", f64::from(rendering.max_zoom))?
-            .set_default("rendering.min_zoom", f64::from(rendering.min_zoom))?
+            .set_default(
+                "startup.reopen_last_document_on_launch",
+                defaults.startup.reopen_last_document_on_launch,
+            )?
+            .set_default("pdfium.library_path", defaults.pdfium.library_path.clone())?
+            .set_default(
+                "pdfium.library_env_var",
+                defaults.pdfium.library_env_var.clone(),
+            )?
+            .set_default(
+                "rendering.initial_zoom",
+                f64::from(defaults.rendering.initial_zoom),
+            )?
+            .set_default("rendering.max_zoom", f64::from(defaults.rendering.max_zoom))?
+            .set_default("rendering.min_zoom", f64::from(defaults.rendering.min_zoom))?
             .set_default(
                 "rendering.texture_filter",
-                rendering.texture_filter.as_str(),
+                defaults.rendering.texture_filter.as_str(),
             )?
-            .set_default("rendering.preferred_bg_hex", rendering.preferred_bg_hex)?
-            .set_default("ui.left_panel_width", f64::from(ui.left_panel_width))?
-            .set_default("ui.bottom_panel_height", f64::from(ui.bottom_panel_height))?
-            .set_default("ui.show_metrics", ui.show_metrics)?
-            .set_default("ui.show_logs_hint", ui.show_logs_hint)?
-            .set_default("logging.level", logging.level)?
-            .set_default("logging.span_events", logging.span_events)?;
+            .set_default(
+                "rendering.preferred_bg_hex",
+                defaults.rendering.preferred_bg_hex.clone(),
+            )?
+            .set_default(
+                "rendering.thumbnail_size",
+                defaults.rendering.thumbnail_size,
+            )?
+            .set_default("rendering.tile_size", defaults.rendering.tile_size)?
+            .set_default(
+                "rendering.tile_render_min_width",
+                defaults.rendering.tile_render_min_width,
+            )?
+            .set_default(
+                "rendering.cache_zoom_bucket",
+                f64::from(defaults.rendering.cache_zoom_bucket),
+            )?
+            .set_default(
+                "rendering.default_preset",
+                defaults.rendering.default_preset.clone(),
+            )?
+            .set_default(
+                "rendering.compare_presets",
+                defaults.rendering.compare_presets.clone(),
+            )?
+            .set_default(
+                "ui.left_panel_width",
+                f64::from(defaults.ui.left_panel_width),
+            )?
+            .set_default(
+                "ui.bottom_panel_height",
+                f64::from(defaults.ui.bottom_panel_height),
+            )?
+            .set_default(
+                "ui.thumbnail_panel_width",
+                f64::from(defaults.ui.thumbnail_panel_width),
+            )?
+            .set_default("ui.show_metrics", defaults.ui.show_metrics)?
+            .set_default("ui.show_logs_hint", defaults.ui.show_logs_hint)?
+            .set_default("ui.show_thumbnails", defaults.ui.show_thumbnails)?
+            .set_default(
+                "ui.enable_pixel_inspector",
+                defaults.ui.enable_pixel_inspector,
+            )?
+            .set_default("ui.compare_mode_default", defaults.ui.compare_mode_default)?
+            .set_default("logging.level", defaults.logging.level.clone())?
+            .set_default("logging.span_events", defaults.logging.span_events)?
+            .set_default("logging.write_to_file", defaults.logging.write_to_file)?
+            .set_default("logging.file_name", defaults.logging.file_name.clone())?
+            .set_default("storage.persist_session", defaults.storage.persist_session)?
+            .set_default(
+                "storage.session_file",
+                defaults.storage.session_file.clone(),
+            )?
+            .set_default(
+                "storage.benchmark_dir",
+                defaults.storage.benchmark_dir.clone(),
+            )?
+            .set_default(
+                "storage.benchmark_prefix",
+                defaults.storage.benchmark_prefix.clone(),
+            )?
+            .set_default("storage.log_dir", defaults.storage.log_dir.clone())?;
 
         for path in paths {
             builder = builder.add_source(File::from(path).required(false));
@@ -89,19 +161,55 @@ impl AppConfig {
 
     pub fn candidate_paths() -> Vec<PathBuf> {
         let mut paths = vec![
-            PathBuf::from("config/pdfizer.toml"),
             PathBuf::from("config/default.toml"),
+            PathBuf::from("config/pdfizer.toml"),
         ];
 
-        if let Some(project_dirs) = ProjectDirs::from("dev", "pdfizer", "pdfizer") {
+        if let Some(project_dirs) = Self::project_dirs() {
             paths.push(project_dirs.config_dir().join("pdfizer.toml"));
         }
 
         paths
     }
 
+    pub fn project_dirs() -> Option<ProjectDirs> {
+        ProjectDirs::from("dev", "pdfizer", "pdfizer")
+    }
+
     pub fn config_preview(&self) -> String {
         toml::to_string_pretty(self).unwrap_or_else(|_| "<failed to serialize config>".into())
+    }
+
+    pub fn preferred_config_path(&self) -> Result<PathBuf> {
+        let path = PathBuf::from(&self.startup.preferred_config_name);
+
+        if path.is_absolute() {
+            return Ok(path);
+        }
+
+        Ok(std::env::current_dir()
+            .context("failed to get current directory for config save path")?
+            .join(path))
+    }
+
+    pub fn session_path(&self) -> Result<PathBuf> {
+        let path = self.resolve_storage_path(&self.storage.session_file)?;
+        ensure_parent_dir(&path)?;
+        Ok(path)
+    }
+
+    pub fn benchmark_dir(&self) -> Result<PathBuf> {
+        let path = self.resolve_storage_dir(&self.storage.benchmark_dir)?;
+        fs::create_dir_all(&path)
+            .with_context(|| format!("failed to create benchmark directory {}", path.display()))?;
+        Ok(path)
+    }
+
+    pub fn log_file_path(&self) -> Result<PathBuf> {
+        let dir = self.resolve_storage_dir(&self.storage.log_dir)?;
+        fs::create_dir_all(&dir)
+            .with_context(|| format!("failed to create log directory {}", dir.display()))?;
+        Ok(dir.join(&self.logging.file_name))
     }
 
     pub fn to_native_options(&self) -> eframe::NativeOptions {
@@ -116,6 +224,38 @@ impl AppConfig {
 
     pub fn background_color(&self) -> Color32 {
         parse_hex_color(&self.rendering.preferred_bg_hex).unwrap_or(Color32::from_gray(30))
+    }
+
+    fn resolve_storage_dir(&self, value: &str) -> Result<PathBuf> {
+        let path = PathBuf::from(value);
+
+        if path.is_absolute() {
+            return Ok(path);
+        }
+
+        if let Some(project_dirs) = Self::project_dirs() {
+            return Ok(project_dirs.data_local_dir().join(path));
+        }
+
+        Ok(std::env::current_dir()
+            .context("failed to get current directory for storage path")?
+            .join(path))
+    }
+
+    fn resolve_storage_path(&self, value: &str) -> Result<PathBuf> {
+        let path = PathBuf::from(value);
+
+        if path.is_absolute() {
+            return Ok(path);
+        }
+
+        if let Some(project_dirs) = Self::project_dirs() {
+            return Ok(project_dirs.data_local_dir().join(path));
+        }
+
+        Ok(std::env::current_dir()
+            .context("failed to get current directory for storage file path")?
+            .join(path))
     }
 }
 
@@ -145,6 +285,7 @@ pub struct StartupConfig {
     pub open_last_document: bool,
     pub restore_last_page: bool,
     pub preferred_config_name: String,
+    pub reopen_last_document_on_launch: bool,
 }
 
 impl Default for StartupConfig {
@@ -153,6 +294,7 @@ impl Default for StartupConfig {
             open_last_document: false,
             restore_last_page: false,
             preferred_config_name: "config/pdfizer.toml".into(),
+            reopen_last_document_on_launch: true,
         }
     }
 }
@@ -179,6 +321,12 @@ pub struct RenderingConfig {
     pub max_zoom: f32,
     pub texture_filter: TextureFilterName,
     pub preferred_bg_hex: String,
+    pub thumbnail_size: i32,
+    pub tile_size: i32,
+    pub tile_render_min_width: i32,
+    pub cache_zoom_bucket: f32,
+    pub default_preset: String,
+    pub compare_presets: Vec<String>,
 }
 
 impl Default for RenderingConfig {
@@ -189,6 +337,12 @@ impl Default for RenderingConfig {
             max_zoom: 4.0,
             texture_filter: TextureFilterName::Linear,
             preferred_bg_hex: "#1f1f24".into(),
+            thumbnail_size: 180,
+            tile_size: 512,
+            tile_render_min_width: 2200,
+            cache_zoom_bucket: 0.05,
+            default_preset: "balanced".into(),
+            compare_presets: vec!["balanced".into(), "crisp".into()],
         }
     }
 }
@@ -220,17 +374,25 @@ impl TextureFilterName {
 pub struct UiConfig {
     pub left_panel_width: f32,
     pub bottom_panel_height: f32,
+    pub thumbnail_panel_width: f32,
     pub show_metrics: bool,
     pub show_logs_hint: bool,
+    pub show_thumbnails: bool,
+    pub enable_pixel_inspector: bool,
+    pub compare_mode_default: bool,
 }
 
 impl Default for UiConfig {
     fn default() -> Self {
         Self {
             left_panel_width: 280.0,
-            bottom_panel_height: 180.0,
+            bottom_panel_height: 220.0,
+            thumbnail_panel_width: 220.0,
             show_metrics: true,
             show_logs_hint: true,
+            show_thumbnails: true,
+            enable_pixel_inspector: true,
+            compare_mode_default: false,
         }
     }
 }
@@ -239,6 +401,8 @@ impl Default for UiConfig {
 pub struct LoggingConfig {
     pub level: String,
     pub span_events: bool,
+    pub write_to_file: bool,
+    pub file_name: String,
 }
 
 impl Default for LoggingConfig {
@@ -246,6 +410,29 @@ impl Default for LoggingConfig {
         Self {
             level: "debug".into(),
             span_events: false,
+            write_to_file: true,
+            file_name: "pdfizer.log".into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+pub struct StorageConfig {
+    pub persist_session: bool,
+    pub session_file: String,
+    pub benchmark_dir: String,
+    pub benchmark_prefix: String,
+    pub log_dir: String,
+}
+
+impl Default for StorageConfig {
+    fn default() -> Self {
+        Self {
+            persist_session: true,
+            session_file: "session.toml".into(),
+            benchmark_dir: "benchmarks".into(),
+            benchmark_prefix: "render-snapshot".into(),
+            log_dir: "logs".into(),
         }
     }
 }
@@ -258,6 +445,7 @@ fn parse_hex_color(value: &str) -> Option<Color32> {
     }
 
     let bytes = u32::from_str_radix(trimmed, 16).ok()?;
+
     Some(Color32::from_rgb(
         ((bytes >> 16) & 0xff) as u8,
         ((bytes >> 8) & 0xff) as u8,
@@ -279,6 +467,15 @@ pub fn library_path_from_config_or_env(config: &PdfiumConfig) -> Option<PathBuf>
         })
 }
 
+fn ensure_parent_dir(path: &Path) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -291,6 +488,7 @@ mod tests {
 
         assert!(config.rendering.min_zoom < config.rendering.initial_zoom);
         assert!(config.rendering.initial_zoom < config.rendering.max_zoom);
+        assert_eq!(config.rendering.compare_presets.len(), 2);
     }
 
     #[test]
@@ -309,6 +507,12 @@ mod tests {
                 max_zoom = 5.0
                 texture_filter = "nearest"
                 preferred_bg_hex = "#ffffff"
+                thumbnail_size = 128
+                tile_size = 256
+                tile_render_min_width = 1024
+                cache_zoom_bucket = 0.1
+                default_preset = "crisp"
+                compare_presets = ["balanced", "grayscale"]
             "##,
         )
         .unwrap();
@@ -318,6 +522,7 @@ mod tests {
         assert_eq!(config.window.title, "Lab Build");
         assert_eq!(config.rendering.initial_zoom, 2.0);
         assert_eq!(config.rendering.texture_filter, TextureFilterName::Nearest);
+        assert_eq!(config.rendering.default_preset, "crisp");
     }
 
     #[test]
@@ -325,5 +530,6 @@ mod tests {
         let preview = AppConfig::default().config_preview();
         assert!(preview.contains("[window]"));
         assert!(preview.contains("[rendering]"));
+        assert!(preview.contains("[storage]"));
     }
 }

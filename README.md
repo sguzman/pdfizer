@@ -1,32 +1,37 @@
 # Pdfizer
 
-`Pdfizer` is a native Rust PDF exploration app focused on studying fast PDF rendering behavior with `eframe`/`egui` and PDFium.
+`Pdfizer` is a native Rust PDF exploration app for studying PDF rendering behavior with `eframe` / `egui` and PDFium.
 
-The current build is intentionally narrow: it opens local PDFs, renders pages through PDFium, exposes render timing and bitmap dimensions, surfaces document metadata, and keeps runtime behavior configurable with layered TOML plus environment overrides. The reference note in `tmp/project.md` is treated as direction, not as a fixed spec.
+The current build is no longer just a minimal viewer. It includes thumbnail navigation, cached page renders, large-page tiled rendering, comparison presets, a pixel inspector, benchmark export, persisted session state, layered TOML config, and file-backed tracing.
 
 ## Stack
 
 - Rust 2024
-- `eframe` / `egui` for the desktop shell
-- `pdfium-render` for PDFium bindings
-- `tracing` + `tracing-subscriber` for instrumentation
-- `config` + `serde` + TOML for runtime configuration
+- `eframe` / `egui`
+- `pdfium-render`
+- `tracing`, `tracing-subscriber`, `tracing-appender`
+- `config`, `serde`, TOML
 
-## What It Does
+## Features
 
-- Opens local PDF files with a native file picker
-- Renders pages with PDFium into the `egui` viewport
-- Supports previous/next navigation and zoom control
-- Shows document metadata when the PDF provides it
-- Displays render timing and raster dimensions for quick inspection
-- Emits tracing around runtime init, document load, and page rendering
+- Open local PDFs with a native file picker
+- Render pages with PDFium into `egui`
+- Navigate with buttons, thumbnails, arrow keys, and page keys
+- Zoom interactively and cache render results across zoom levels
+- Use tiled rendering for very large pages
+- Compare two render presets side by side
+- Inspect hovered pixels and drag out a selection rectangle
+- Show document metadata, render timing, and aggregate render statistics
+- Persist session state and save edited config back to disk
+- Export benchmark snapshots as CSV
+- Write logs to stdout and a file sink
 
-## Pdfium Runtime Requirement
+## Pdfium Runtime
 
-This app binds PDFium dynamically at runtime. You need a Pdfium shared library available either:
+This app binds PDFium dynamically at runtime. Provide a shared library either with:
 
-- via `PDFIUM_DYNAMIC_LIB_PATH`
-- or via `pdfium.library_path` in `config/pdfizer.toml`
+- `PDFIUM_DYNAMIC_LIB_PATH`
+- `pdfium.library_path` in [config/pdfizer.toml](/win/linux/Code/rust/pdfizer/config/pdfizer.toml)
 
 Examples:
 
@@ -39,25 +44,35 @@ $env:PDFIUM_DYNAMIC_LIB_PATH="C:\path\to\pdfium.dll"
 cargo run
 ```
 
-If PDFium is not available, the app still starts and shows a runtime help message instead of crashing immediately.
+If Pdfium is missing, the app still starts and shows runtime guidance in the UI.
 
 ## Configuration
 
-The app reads configuration in this order:
+Configuration is layered in this order:
 
 1. built-in defaults
-2. `config/pdfizer.toml`
-3. `config/default.toml`
+2. [config/default.toml](/win/linux/Code/rust/pdfizer/config/default.toml)
+3. [config/pdfizer.toml](/win/linux/Code/rust/pdfizer/config/pdfizer.toml)
 4. user config directory `pdfizer.toml`
 5. environment variables with the prefix `PDFIZER__`
-
-The included sample config lives at [config/default.toml](/win/linux/Code/rust/pdfizer/config/default.toml).
 
 Example override:
 
 ```bash
 PDFIZER__RENDERING__INITIAL_ZOOM=1.75 cargo run
 ```
+
+The in-app config editor saves to `startup.preferred_config_name`.
+
+## Logging And Artifacts
+
+- Render/session/benchmark artifacts are written under the app data directory by default.
+- Benchmark snapshots export as CSV.
+- Logs are written to both stdout and `logs/pdfizer.log` unless disabled in config.
+
+## Packaging
+
+Packaging and Pdfium distribution notes are in [docs/packaging.md](/win/linux/Code/rust/pdfizer/docs/packaging.md).
 
 ## Development
 
@@ -75,6 +90,4 @@ Useful tracing:
 RUST_LOG=pdfizer=trace cargo run
 ```
 
-## Next Work
-
-The active implementation roadmap is tracked in [docs/roadmap.md](/win/linux/Code/rust/pdfizer/docs/roadmap.md). That file is meant to be updated as feature dimensions evolve.
+The active implementation checklist lives in [docs/roadmap.md](/win/linux/Code/rust/pdfizer/docs/roadmap.md).
