@@ -168,6 +168,10 @@ impl AppConfig {
             .set_default("tts.rate", f64::from(defaults.tts.rate))?
             .set_default("tts.volume", f64::from(defaults.tts.volume))?
             .set_default(
+                "tts.analysis_progress_log_interval_secs",
+                f64::from(defaults.tts.analysis_progress_log_interval_secs),
+            )?
+            .set_default(
                 "tts.sentence_boundary_markers",
                 defaults.tts.sentence_boundary_markers.clone(),
             )?
@@ -745,6 +749,7 @@ pub struct TtsConfig {
     pub voice: String,
     pub rate: f32,
     pub volume: f32,
+    pub analysis_progress_log_interval_secs: f32,
     pub sentence_boundary_markers: Vec<String>,
     pub sentence_break_on_double_newline: bool,
     pub min_sentence_chars: usize,
@@ -807,6 +812,7 @@ impl Default for TtsConfig {
             voice: "default".into(),
             rate: 1.0,
             volume: 1.0,
+            analysis_progress_log_interval_secs: 5.0,
             sentence_boundary_markers: vec![".".into(), "!".into(), "?".into()],
             sentence_break_on_double_newline: true,
             min_sentence_chars: 8,

@@ -63,6 +63,7 @@ engine = "tone_preview"
 voice = "default"
 rate = 1.0
 volume = 1.0
+analysis_progress_log_interval_secs = 5.0
 sentence_boundary_markers = [".", "!", "?"]
 sentence_break_on_double_newline = true
 min_sentence_chars = 8

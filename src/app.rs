@@ -67,6 +67,8 @@ pub struct PdfizerApp {
     tts_analysis: Option<TtsAnalysisArtifacts>,
     tts_analysis_status: TtsAnalysisStatus,
     tts_analysis_progress: Option<String>,
+    tts_analysis_started_at: Option<Instant>,
+    tts_analysis_last_heartbeat_at: Option<Instant>,
     tts_policy: Option<tts::TtsRuntimePolicy>,
     pending_tts_sentence_id: Option<u64>,
     tts_worker_tx: Option<Sender<TtsWorkerMessage>>,
@@ -280,6 +282,8 @@ impl PdfizerApp {
                 TtsAnalysisStatus::Disabled
             },
             tts_analysis_progress: None,
+            tts_analysis_started_at: None,
+            tts_analysis_last_heartbeat_at: None,
             tts_policy: None,
             pending_tts_sentence_id: None,
             tts_worker_tx: None,
@@ -353,6 +357,8 @@ impl PdfizerApp {
                     TtsAnalysisStatus::Disabled
                 };
                 self.tts_analysis_progress = None;
+                self.tts_analysis_started_at = None;
+                self.tts_analysis_last_heartbeat_at = None;
                 self.tts_policy = None;
                 self.pending_tts_sentence_id = None;
                 self.reset_tts_runtime();
@@ -386,6 +392,8 @@ impl PdfizerApp {
         let tx = self.ensure_tts_worker_channel();
         self.tts_analysis_status = TtsAnalysisStatus::Analyzing;
         self.tts_analysis_progress = Some("Queued TTS analysis".into());
+        self.tts_analysis_started_at = Some(Instant::now());
+        self.tts_analysis_last_heartbeat_at = Some(Instant::now());
         let analysis_scope = self.planned_tts_analysis_scope(request);
 
         thread::spawn(move || {
@@ -513,6 +521,8 @@ impl PdfizerApp {
                     self.tts_analysis = Some(artifacts);
                     self.tts_analysis_status = TtsAnalysisStatus::Ready;
                     self.tts_analysis_progress = None;
+                    self.tts_analysis_started_at = None;
+                    self.tts_analysis_last_heartbeat_at = None;
                     if let Some(sentence_id) = self.pending_tts_sentence_id.take() {
                         if let Some(analysis) = &self.tts_analysis {
                             if let Some(index) = tts::sentence_index_for_id(analysis, sentence_id) {
@@ -532,6 +542,8 @@ impl PdfizerApp {
                     self.last_error = Some(format!("TTS analysis failed: {error}"));
                     self.tts_analysis_status = TtsAnalysisStatus::Failed(error);
                     self.tts_analysis_progress = None;
+                    self.tts_analysis_started_at = None;
+                    self.tts_analysis_last_heartbeat_at = None;
                 }
                 Ok(TtsWorkerMessage::AnalysisProgress {
                     request_id,
@@ -564,6 +576,7 @@ impl PdfizerApp {
                     };
                     debug!(request_id, %progress, "TTS analysis progress");
                     self.tts_analysis_progress = Some(progress.clone());
+                    self.tts_analysis_last_heartbeat_at = Some(Instant::now());
                     self.status_message = Some(format!("TTS analysis progress: {progress}"));
                 }
                 Ok(TtsWorkerMessage::PrefetchCompleted {
@@ -679,10 +692,43 @@ impl PdfizerApp {
         self.tts_worker_rx = Some(receiver);
     }
 
+    fn emit_tts_analysis_heartbeat(&mut self) {
+        if !matches!(self.tts_analysis_status, TtsAnalysisStatus::Analyzing) {
+            return;
+        }
+
+        let Some(started_at) = self.tts_analysis_started_at else {
+            return;
+        };
+
+        let now = Instant::now();
+        let interval =
+            Duration::from_secs_f32(self.config.tts.analysis_progress_log_interval_secs.max(0.5));
+        let should_emit = self
+            .tts_analysis_last_heartbeat_at
+            .is_none_or(|last| now.duration_since(last) >= interval);
+        if !should_emit {
+            return;
+        }
+
+        let elapsed = now.duration_since(started_at).as_secs_f32();
+        let stage = self
+            .tts_analysis_progress
+            .as_deref()
+            .unwrap_or("Queued TTS analysis");
+        let heartbeat = format!("still working after {:.1}s | {}", elapsed, stage);
+        info!(elapsed_secs = elapsed, stage = %stage, "TTS analysis heartbeat");
+        self.status_message = Some(format!("TTS analysis heartbeat: {heartbeat}"));
+        self.tts_analysis_last_heartbeat_at = Some(now);
+        self.tts_analysis_progress = Some(heartbeat);
+    }
+
     fn reset_tts_runtime(&mut self) {
         self.cancel_tts_work("reset_runtime");
         self.tts_playback_state = TtsPlaybackState::Stopped;
         self.tts_analysis_progress = None;
+        self.tts_analysis_started_at = None;
+        self.tts_analysis_last_heartbeat_at = None;
         self.tts_active_sentence_index = 0;
         self.tts_prepared_clips.clear();
         self.tts_sync_targets.clear();
@@ -1249,6 +1295,8 @@ impl PdfizerApp {
         });
         self.tts_playback_state = TtsPlaybackState::Stopped;
         self.tts_analysis_progress = None;
+        self.tts_analysis_started_at = None;
+        self.tts_analysis_last_heartbeat_at = None;
         self.tts_prepared_clips.clear();
         self.tts_sync_targets.clear();
         self.tts_prefetch_queue.clear();
@@ -2850,6 +2898,8 @@ impl PdfizerApp {
             TtsAnalysisStatus::Disabled
         };
         self.tts_analysis_progress = None;
+        self.tts_analysis_started_at = None;
+        self.tts_analysis_last_heartbeat_at = None;
 
         if tts_reconfigured {
             let cancel_token = self.cancel_tts_work("engine_reconfiguration");
@@ -3658,10 +3708,15 @@ impl eframe::App for PdfizerApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         ctx.set_pixels_per_point(1.0);
         self.poll_tts_analysis();
+        self.emit_tts_analysis_heartbeat();
         self.poll_playback_events();
         self.advance_tts_clock(ctx);
         self.handle_shortcuts(ctx);
         self.process_tiled_jobs(ctx);
+
+        if matches!(self.tts_analysis_status, TtsAnalysisStatus::Analyzing) {
+            ctx.request_repaint_after(Duration::from_millis(250));
+        }
 
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
             ui.horizontal_wrapped(|ui| self.top_bar(ctx, ui));
