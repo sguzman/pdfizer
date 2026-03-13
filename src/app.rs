@@ -540,7 +540,13 @@ impl PdfizerApp {
                     total_pages,
                     current_page,
                 }) if request_id == self.tts_request_id => {
-                    let progress = if let Some(page_index) = current_page {
+                    let progress = if total_pages == 0 {
+                        if let Some(page_index) = current_page {
+                            format!("{stage} (page {})", page_index + 1)
+                        } else {
+                            stage.clone()
+                        }
+                    } else if let Some(page_index) = current_page {
                         format!(
                             "{}: {}/{} pages (current page {})",
                             stage,

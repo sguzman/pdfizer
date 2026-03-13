@@ -769,8 +769,10 @@ pub fn analyze_pdf_for_tts_with_progress<F>(
 where
     F: FnMut(&str, usize, usize, Option<usize>),
 {
+    progress("binding Pdfium for TTS analysis", 0, 0, None);
     let runtime =
         PdfRuntime::new(config).context("failed to initialize Pdfium for TTS analysis")?;
+    progress("opening PDF for TTS analysis", 0, 0, None);
     let document = runtime
         .open_document(source_path)
         .with_context(|| format!("failed to open {} for TTS analysis", source_path.display()))?;
@@ -794,8 +796,10 @@ pub fn analyze_pdf_for_tts_in_scope_with_progress<F>(
 where
     F: FnMut(&str, usize, usize, Option<usize>),
 {
+    progress("binding Pdfium for TTS analysis", 0, 0, None);
     let runtime =
         PdfRuntime::new(config).context("failed to initialize Pdfium for TTS analysis")?;
+    progress("opening PDF for TTS analysis", 0, 0, None);
     let document = runtime
         .open_document(source_path)
         .with_context(|| format!("failed to open {} for TTS analysis", source_path.display()))?;
