@@ -36,7 +36,7 @@ fn init_tracing(config: &AppConfig) -> Result<Option<WorkerGuard>> {
 
     let stdout_layer = tracing_subscriber::fmt::layer().compact().with_target(true);
 
-    if config.logging.write_to_file {
+    if config.is_dev() || config.logging.write_to_file {
         let path = config.log_file_path()?;
         let directory = path
             .parent()

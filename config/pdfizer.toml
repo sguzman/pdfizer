@@ -1,3 +1,5 @@
+mode = "prod"
+
 [window]
 title = "Pdfizer"
 width = 1600.0

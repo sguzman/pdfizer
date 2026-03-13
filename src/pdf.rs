@@ -1,4 +1,5 @@
 use std::{
+    env,
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
@@ -16,15 +17,7 @@ pub struct PdfRuntime {
 
 impl PdfRuntime {
     pub fn new(config: &AppConfig) -> Result<Self> {
-        let bindings = if let Some(path) = library_path_from_config_or_env(&config.pdfium) {
-            info!(library = %path.display(), "binding Pdfium to configured library");
-            Pdfium::bind_to_library(Pdfium::pdfium_platform_library_name_at_path(&path))
-                .context("failed to bind Pdfium using configured library path")?
-        } else {
-            info!("binding Pdfium to system library");
-            Pdfium::bind_to_system_library()
-                .context("failed to bind Pdfium to a system library; set PDFIUM_DYNAMIC_LIB_PATH or pdfium.library_path")?
-        };
+        let bindings = bind_pdfium(config)?;
 
         Ok(Self {
             pdfium: Box::leak(Box::new(Pdfium::new(bindings))),
@@ -67,6 +60,61 @@ impl PdfRuntime {
             page_sizes,
         })
     }
+}
+
+fn bind_pdfium(config: &AppConfig) -> Result<Box<dyn PdfiumLibraryBindings>> {
+    if let Some(path) = library_path_from_config_or_env(&config.pdfium) {
+        info!(library = %path.display(), "binding Pdfium to configured library");
+        return bind_path(&path)
+            .with_context(|| format!("failed to bind Pdfium using {}", path.display()));
+    }
+
+    for candidate in pdfium_auto_discovery_candidates()? {
+        if candidate.exists() {
+            info!(library = %candidate.display(), "binding Pdfium to discovered local library");
+            if let Ok(bindings) = bind_path(&candidate) {
+                return Ok(bindings);
+            }
+        }
+    }
+
+    info!("binding Pdfium to system library");
+    Pdfium::bind_to_system_library().context(
+        "failed to bind Pdfium from configured path, discovered local paths, or system library",
+    )
+}
+
+fn bind_path(path: &Path) -> Result<Box<dyn PdfiumLibraryBindings>, PdfiumError> {
+    let resolved = if path.is_dir() {
+        Pdfium::pdfium_platform_library_name_at_path(path)
+    } else {
+        path.to_path_buf()
+    };
+
+    Pdfium::bind_to_library(resolved)
+}
+
+fn pdfium_auto_discovery_candidates() -> Result<Vec<PathBuf>> {
+    let mut candidates = Vec::new();
+    let lib_name = Pdfium::pdfium_platform_library_name();
+
+    let cwd = env::current_dir().context("failed to get current directory for Pdfium search")?;
+    candidates.push(cwd.join(&lib_name));
+    candidates.push(cwd.join("lib").join(&lib_name));
+    candidates.push(cwd.join("bin").join(&lib_name));
+
+    let exe_dir = env::current_exe()
+        .context("failed to get current executable for Pdfium search")?
+        .parent()
+        .map(Path::to_path_buf);
+
+    if let Some(exe_dir) = exe_dir {
+        candidates.push(exe_dir.join(&lib_name));
+        candidates.push(exe_dir.join("lib").join(&lib_name));
+        candidates.push(exe_dir.join("bin").join(&lib_name));
+    }
+
+    Ok(candidates)
 }
 
 pub struct PdfDocument<'a> {

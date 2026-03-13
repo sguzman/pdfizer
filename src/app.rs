@@ -100,6 +100,11 @@ impl PdfizerApp {
 
     #[instrument(skip(self, ctx))]
     fn open_pdf(&mut self, ctx: &egui::Context, path: PathBuf) {
+        if let Err(err) = self.ensure_runtime() {
+            self.last_error = Some(err.to_string());
+            return;
+        }
+
         let Some(runtime) = &self.runtime else {
             self.last_error = Some("Pdfium runtime is unavailable".into());
             return;
@@ -123,6 +128,25 @@ impl PdfizerApp {
             Err(err) => {
                 error!(path = %path.display(), error = %err, "failed to open PDF");
                 self.last_error = Some(err.to_string());
+            }
+        }
+    }
+
+    fn ensure_runtime(&mut self) -> Result<()> {
+        if self.runtime.is_some() {
+            return Ok(());
+        }
+
+        match PdfRuntime::new(&self.config) {
+            Ok(runtime) => {
+                self.runtime = Some(runtime);
+                self.runtime_error = None;
+                Ok(())
+            }
+            Err(err) => {
+                self.runtime = None;
+                self.runtime_error = Some(err.to_string());
+                Err(err)
             }
         }
     }
@@ -371,6 +395,27 @@ impl PdfizerApp {
     }
 
     fn top_bar(&mut self, ctx: &egui::Context, ui: &mut Ui) {
+        if self.runtime.is_none() && ui.button("Load Pdfium").clicked() {
+            if let Some(path) = FileDialog::new()
+                .add_filter("Shared Library", &["so", "dll", "dylib"])
+                .pick_file()
+            {
+                self.config.pdfium.library_path = Some(path.display().to_string());
+                self.config_preview = self.config.config_preview();
+                self.config_editor = self.config_preview.clone();
+                match self.ensure_runtime() {
+                    Ok(()) => {
+                        self.status_message =
+                            Some(format!("Loaded Pdfium from {}", path.display()));
+                        self.last_error = None;
+                    }
+                    Err(err) => {
+                        self.last_error = Some(err.to_string());
+                    }
+                }
+            }
+        }
+
         if ui.button("Open PDF").clicked() {
             if let Some(path) = FileDialog::new().add_filter("PDF", &["pdf"]).pick_file() {
                 self.open_pdf(ctx, path);
@@ -1108,7 +1153,7 @@ fn pdfium_help_text(config: &AppConfig) -> String {
     let env_var = &config.pdfium.library_env_var;
     warn!("Pdfium is not available yet; the UI will remain in help mode");
     format!(
-        "Pdfium failed to bind. Set {env_var} or pdfium.library_path in config/pdfizer.toml to your Pdfium shared library."
+        "Pdfium failed to bind. Use Load Pdfium, set {env_var}, or set pdfium.library_path in config/pdfizer.toml."
     )
 }
 

@@ -64,11 +64,21 @@ PDFIZER__RENDERING__INITIAL_ZOOM=1.75 cargo run
 
 The in-app config editor saves to `startup.preferred_config_name`.
 
+## Modes
+
+The top-level config field `mode` supports:
+
+- `prod`
+- `dev`
+
+When `mode = "dev"`, the app always writes timestamped logs to `./logs/` in the current working directory, for example `logs/pdfizer-<timestamp>.log`.
+
 ## Logging And Artifacts
 
 - Render/session/benchmark artifacts are written under the app data directory by default.
 - Benchmark snapshots export as CSV.
-- Logs are written to both stdout and `logs/pdfizer.log` unless disabled in config.
+- In `prod`, logs are written to stdout and the configured log sink when `logging.write_to_file = true`.
+- In `dev`, logs are always written to stdout plus timestamped files in `./logs/`.
 
 ## Packaging
 

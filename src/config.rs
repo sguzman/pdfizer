@@ -13,6 +13,7 @@ const ENV_PREFIX: &str = "PDFIZER";
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 pub struct AppConfig {
+    pub mode: AppMode,
     pub window: WindowConfig,
     pub startup: StartupConfig,
     pub pdfium: PdfiumConfig,
@@ -25,6 +26,7 @@ pub struct AppConfig {
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
+            mode: AppMode::default(),
             window: WindowConfig::default(),
             startup: StartupConfig::default(),
             pdfium: PdfiumConfig::default(),
@@ -45,6 +47,7 @@ impl AppConfig {
         let defaults = Self::default();
 
         let mut builder = Config::builder()
+            .set_default("mode", defaults.mode.as_str())?
             .set_default("window.title", defaults.window.title.clone())?
             .set_default("window.width", f64::from(defaults.window.width))?
             .set_default("window.height", f64::from(defaults.window.height))?
@@ -180,6 +183,10 @@ impl AppConfig {
         toml::to_string_pretty(self).unwrap_or_else(|_| "<failed to serialize config>".into())
     }
 
+    pub fn is_dev(&self) -> bool {
+        self.mode == AppMode::Dev
+    }
+
     pub fn preferred_config_path(&self) -> Result<PathBuf> {
         let path = PathBuf::from(&self.startup.preferred_config_name);
 
@@ -206,10 +213,23 @@ impl AppConfig {
     }
 
     pub fn log_file_path(&self) -> Result<PathBuf> {
-        let dir = self.resolve_storage_dir(&self.storage.log_dir)?;
+        let dir = if self.is_dev() {
+            std::env::current_dir()
+                .context("failed to get current directory for dev log path")?
+                .join("logs")
+        } else {
+            self.resolve_storage_dir(&self.storage.log_dir)?
+        };
         fs::create_dir_all(&dir)
             .with_context(|| format!("failed to create log directory {}", dir.display()))?;
-        Ok(dir.join(&self.logging.file_name))
+
+        let file_name = if self.is_dev() {
+            format!("pdfizer-{}.log", unix_timestamp_secs())
+        } else {
+            self.logging.file_name.clone()
+        };
+
+        Ok(dir.join(file_name))
     }
 
     pub fn to_native_options(&self) -> eframe::NativeOptions {
@@ -266,6 +286,23 @@ pub struct WindowConfig {
     pub height: f32,
     pub min_width: f32,
     pub min_height: f32,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum AppMode {
+    #[default]
+    Prod,
+    Dev,
+}
+
+impl AppMode {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Prod => "prod",
+            Self::Dev => "dev",
+        }
+    }
 }
 
 impl Default for WindowConfig {
@@ -476,6 +513,13 @@ fn ensure_parent_dir(path: &Path) -> Result<()> {
     Ok(())
 }
 
+fn unix_timestamp_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -489,6 +533,7 @@ mod tests {
         assert!(config.rendering.min_zoom < config.rendering.initial_zoom);
         assert!(config.rendering.initial_zoom < config.rendering.max_zoom);
         assert_eq!(config.rendering.compare_presets.len(), 2);
+        assert_eq!(config.mode, AppMode::Prod);
     }
 
     #[test]
@@ -528,8 +573,25 @@ mod tests {
     #[test]
     fn config_preview_is_toml() {
         let preview = AppConfig::default().config_preview();
+        assert!(preview.contains("mode = \"prod\""));
         assert!(preview.contains("[window]"));
         assert!(preview.contains("[rendering]"));
         assert!(preview.contains("[storage]"));
+    }
+
+    #[test]
+    fn dev_mode_uses_timestamped_log_name() {
+        let mut config = AppConfig::default();
+        config.mode = AppMode::Dev;
+
+        let path = config.log_file_path().unwrap();
+        let file_name = path.file_name().unwrap().to_string_lossy();
+
+        assert!(
+            path.to_string_lossy().contains("/logs/")
+                || path.to_string_lossy().contains("\\logs\\")
+        );
+        assert!(file_name.starts_with("pdfizer-"));
+        assert!(file_name.ends_with(".log"));
     }
 }
