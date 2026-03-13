@@ -885,6 +885,23 @@ pub fn persist_artifacts(config: &AppConfig, artifacts: &TtsAnalysisArtifacts) -
     Ok(path)
 }
 
+pub fn load_cached_artifacts(
+    config: &AppConfig,
+    source_path: &Path,
+) -> Result<Option<TtsAnalysisArtifacts>> {
+    let path = config.tts_artifact_path(source_path)?;
+    if !path.exists() {
+        return Ok(None);
+    }
+
+    let contents = fs::read_to_string(&path)
+        .with_context(|| format!("failed to read TTS artifacts from {}", path.display()))?;
+    let mut artifacts = toml::from_str::<TtsAnalysisArtifacts>(&contents)
+        .with_context(|| format!("failed to parse TTS artifacts from {}", path.display()))?;
+    artifacts.artifact_path = Some(path);
+    Ok(Some(artifacts))
+}
+
 pub fn load_ocr_artifacts(config: &AppConfig, source_path: &Path) -> Result<Option<OcrArtifacts>> {
     let path = config.tts_ocr_artifact_path(source_path)?;
     if !path.exists() {
@@ -1147,12 +1164,11 @@ pub fn prepare_sentence_clip(
         .with_context(|| format!("sentence index {sentence_index} is out of bounds"))?;
     let cache_key = backend.build_cache_key(analysis, sentence, &settings);
     let stem = cache_key.stem();
-    let manifest_path = config.tts_audio_cache_dir()?.join(format!("{stem}.toml"));
+    let audio_cache_dir = config.tts_audio_cache_dir(&analysis.source_path)?;
+    let manifest_path = audio_cache_dir.join(format!("{stem}.toml"));
     let audio_path = match backend.kind() {
         TtsEngineKind::DryRun => None,
-        TtsEngineKind::TonePreview => {
-            Some(config.tts_audio_cache_dir()?.join(format!("{stem}.wav")))
-        }
+        TtsEngineKind::TonePreview => Some(audio_cache_dir.join(format!("{stem}.wav"))),
     };
 
     if manifest_path.exists() {

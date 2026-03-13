@@ -365,7 +365,9 @@ impl PdfizerApp {
                 self.single_scroll_offset = Vec2::ZERO;
                 self.continuous_scroll_offset = Vec2::ZERO;
                 self.render_current_page(ctx);
-                self.start_tts_analysis(path, TtsAnalysisRequest::Windowed);
+                if !self.try_load_cached_tts_analysis() {
+                    self.start_tts_analysis(path, TtsAnalysisRequest::Windowed);
+                }
                 self.persist_session();
             }
             Err(err) => {
@@ -432,6 +434,58 @@ impl PdfizerApp {
             };
             let _ = tx.send(message);
         });
+    }
+
+    fn try_load_cached_tts_analysis(&mut self) -> bool {
+        let Some(path) = self.current_document_path.as_ref() else {
+            return false;
+        };
+
+        let artifacts = match tts::load_cached_artifacts(&self.config, path) {
+            Ok(Some(artifacts)) => artifacts,
+            Ok(None) => return false,
+            Err(err) => {
+                warn!(
+                    path = %path.display(),
+                    error = %err,
+                    "failed to load cached TTS analysis"
+                );
+                return false;
+            }
+        };
+
+        let policy = tts::evaluate_runtime_policy(&self.config, &artifacts);
+        self.status_message = Some(format!(
+            "Loaded cached TTS analysis: {} sentences ({}, {}, pages {}-{}{})",
+            artifacts.sentences.len(),
+            artifacts.mode.label(),
+            policy.reason,
+            artifacts.analysis_scope.start_page + 1,
+            artifacts.analysis_scope.end_page + 1,
+            if artifacts.analysis_scope.full_document {
+                ""
+            } else {
+                ", windowed"
+            }
+        ));
+        self.tts_policy = Some(policy);
+        self.tts_analysis = Some(artifacts);
+        self.tts_analysis_status = TtsAnalysisStatus::Ready;
+        self.tts_analysis_progress = None;
+        self.tts_analysis_started_at = None;
+        self.tts_analysis_last_heartbeat_at = None;
+        if let Some(sentence_id) = self.pending_tts_sentence_id.take() {
+            if let Some(analysis) = &self.tts_analysis {
+                if let Some(index) = tts::sentence_index_for_id(analysis, sentence_id) {
+                    self.tts_active_sentence_index = index;
+                } else {
+                    self.sync_tts_sentence_to_current_page();
+                }
+            }
+        } else {
+            self.sync_tts_sentence_to_current_page();
+        }
+        true
     }
 
     fn rebuild_tts_analysis(&mut self) {
@@ -2665,7 +2719,14 @@ impl PdfizerApp {
                 ui.label("No TTS analysis has been built for the current document yet.");
             }
 
-            if let Ok(audio_cache_dir) = self.config.tts_audio_cache_dir() {
+            if let Some(path) = &self.current_document_path {
+                if let Ok(cache_dir) = self.config.tts_document_cache_dir(path) {
+                    ui.label(format!("Document cache dir: {}", cache_dir.display()));
+                }
+            }
+            if let Some(analysis) = &self.tts_analysis
+                && let Ok(audio_cache_dir) = self.config.tts_audio_cache_dir(&analysis.source_path)
+            {
                 ui.label(format!("Audio cache dir: {}", audio_cache_dir.display()));
             }
             let snapshot = tts::prefetch_snapshot(
@@ -3626,7 +3687,10 @@ impl PdfizerApp {
             .context("TTS analysis is not available for snapshot export")?;
         let active_sentence = self.active_sentence();
         let active_target = self.effective_sync_target(self.tts_active_sentence_index);
-        let dir = self.config.tts_artifacts_dir()?.join("debug-snapshots");
+        let dir = self
+            .config
+            .tts_document_cache_dir(&analysis.source_path)?
+            .join("debug-snapshots");
         fs::create_dir_all(&dir).with_context(|| format!("failed to create {}", dir.display()))?;
         let timestamp = unix_timestamp_secs();
         let path = dir.join(format!("tts-debug-snapshot-{timestamp}.toml"));

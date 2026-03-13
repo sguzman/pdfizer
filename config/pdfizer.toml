@@ -48,10 +48,10 @@ file_name = "pdfizer.log"
 
 [storage]
 persist_session = true
-session_file = "session.toml"
-benchmark_dir = "benchmarks"
+session_file = ".cache/pdfizer/session.toml"
+benchmark_dir = ".cache/pdfizer/benchmarks"
 benchmark_prefix = "render-snapshot"
-log_dir = "logs"
+log_dir = ".cache/pdfizer/logs"
 
 [tts]
 enabled = true
@@ -90,10 +90,11 @@ follow_center_on_target = true
 exact_sync_min_score = 0.82
 fuzzy_sync_min_score = 0.58
 block_sync_min_score = 0.28
-audio_cache_dir = "tts/audio"
-artifacts_dir = "tts/artifacts"
-sync_artifacts_dir = "tts/sync"
-ocr_artifacts_dir = "tts/ocr"
+cache_root_dir = ".cache/pdfizer/documents"
+audio_cache_dir = "audio"
+artifacts_dir = "artifacts"
+sync_artifacts_dir = "sync"
+ocr_artifacts_dir = "ocr"
 highlight_exact_rgba = "#FF785038"
 highlight_fuzzy_rgba = "#FFB05030"
 highlight_block_rgba = "#FFDC502C"
