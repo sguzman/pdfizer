@@ -718,6 +718,13 @@ pub fn prefetch_snapshot(
 
 #[derive(Debug, Clone)]
 pub enum TtsWorkerMessage {
+    AnalysisProgress {
+        request_id: u64,
+        stage: String,
+        processed_pages: usize,
+        total_pages: usize,
+        current_page: Option<usize>,
+    },
     Completed {
         request_id: u64,
         artifacts: TtsAnalysisArtifacts,
@@ -777,6 +784,54 @@ pub fn analyze_pdf_for_tts_in_scope(
         .open_document(source_path)
         .with_context(|| format!("failed to open {} for TTS analysis", source_path.display()))?;
     build_artifacts_from_document_with_scope(config, source_path, &document, start_page, end_page)
+}
+
+pub fn analyze_pdf_for_tts_with_progress<F>(
+    config: &AppConfig,
+    source_path: &Path,
+    mut progress: F,
+) -> Result<TtsAnalysisArtifacts>
+where
+    F: FnMut(&str, usize, usize, Option<usize>),
+{
+    let runtime =
+        PdfRuntime::new(config).context("failed to initialize Pdfium for TTS analysis")?;
+    let document = runtime
+        .open_document(source_path)
+        .with_context(|| format!("failed to open {} for TTS analysis", source_path.display()))?;
+    build_artifacts_from_document_with_scope_and_progress(
+        config,
+        source_path,
+        &document,
+        0,
+        document.metadata.page_count.saturating_sub(1),
+        &mut progress,
+    )
+}
+
+pub fn analyze_pdf_for_tts_in_scope_with_progress<F>(
+    config: &AppConfig,
+    source_path: &Path,
+    start_page: usize,
+    end_page: usize,
+    mut progress: F,
+) -> Result<TtsAnalysisArtifacts>
+where
+    F: FnMut(&str, usize, usize, Option<usize>),
+{
+    let runtime =
+        PdfRuntime::new(config).context("failed to initialize Pdfium for TTS analysis")?;
+    let document = runtime
+        .open_document(source_path)
+        .with_context(|| format!("failed to open {} for TTS analysis", source_path.display()))?;
+    build_artifacts_from_document_with_scope_and_progress(
+        config,
+        source_path,
+        &document,
+        start_page,
+        end_page,
+        &mut progress,
+    )
 }
 
 pub fn compute_sentence_sync(
@@ -2124,6 +2179,28 @@ pub fn build_artifacts_from_document_with_scope(
     start_page: usize,
     end_page: usize,
 ) -> Result<TtsAnalysisArtifacts> {
+    build_artifacts_from_document_with_scope_and_progress(
+        config,
+        source_path,
+        document,
+        start_page,
+        end_page,
+        &mut |_, _, _, _| {},
+    )
+}
+
+#[instrument(skip(config, document, progress))]
+pub fn build_artifacts_from_document_with_scope_and_progress<F>(
+    config: &AppConfig,
+    source_path: &Path,
+    document: &PdfDocument<'_>,
+    start_page: usize,
+    end_page: usize,
+    progress: &mut F,
+) -> Result<TtsAnalysisArtifacts>
+where
+    F: FnMut(&str, usize, usize, Option<usize>),
+{
     let page_count = document.metadata.page_count;
     let start_page = start_page.min(page_count.saturating_sub(1));
     let end_page = end_page.min(page_count.saturating_sub(1)).max(start_page);
@@ -2136,6 +2213,7 @@ pub fn build_artifacts_from_document_with_scope(
         scoped_page_count,
         "starting PDF TTS analysis build"
     );
+    progress("collecting repeated edge lines", 0, scoped_page_count, None);
     let normalizer = PdfTextNormalizer::load_from_app_config(config);
     let repeated_edge_lines =
         collect_repeated_edge_lines_for_scope(config, document, start_page, end_page)?;
@@ -2147,7 +2225,13 @@ pub fn build_artifacts_from_document_with_scope(
     let mut line_count = 0usize;
     let mut token_count = 0usize;
 
-    for page_index in start_page..=end_page {
+    for (offset, page_index) in (start_page..=end_page).enumerate() {
+        progress(
+            "processing page text",
+            offset,
+            scoped_page_count,
+            Some(page_index),
+        );
         let segments = document.text_segments_for_page(page_index)?;
         let segment_count = segments.len();
         let extracted = extract_page_text_for_tts(&segments, config);
@@ -2229,6 +2313,12 @@ pub fn build_artifacts_from_document_with_scope(
         });
     }
 
+    progress(
+        "building sentence plan",
+        scoped_page_count,
+        scoped_page_count,
+        None,
+    );
     let canonical_text = CanonicalTtsTextArtifact {
         text: full_text.clone(),
         pages: canonical_pages,
@@ -2246,6 +2336,12 @@ pub fn build_artifacts_from_document_with_scope(
 
     let classification = classify_pdf_for_tts(scoped_page_count, &pages, &stats, config);
 
+    progress(
+        "classifying analysis artifacts",
+        scoped_page_count,
+        scoped_page_count,
+        None,
+    );
     let mut artifacts = TtsAnalysisArtifacts {
         source_path: source_path.to_path_buf(),
         source_fingerprint: fingerprint,
@@ -2304,6 +2400,12 @@ pub fn build_artifacts_from_document_with_scope(
         artifacts.stats.sentence_count = artifacts.sentences.len();
     }
 
+    progress(
+        "writing analysis artifacts",
+        scoped_page_count,
+        scoped_page_count,
+        None,
+    );
     let artifact_path = persist_artifacts(config, &artifacts)?;
     artifacts.artifact_path = Some(artifact_path.clone());
 

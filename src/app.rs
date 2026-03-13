@@ -66,6 +66,7 @@ pub struct PdfizerApp {
     current_document_path: Option<PathBuf>,
     tts_analysis: Option<TtsAnalysisArtifacts>,
     tts_analysis_status: TtsAnalysisStatus,
+    tts_analysis_progress: Option<String>,
     tts_policy: Option<tts::TtsRuntimePolicy>,
     pending_tts_sentence_id: Option<u64>,
     tts_worker_tx: Option<Sender<TtsWorkerMessage>>,
@@ -278,6 +279,7 @@ impl PdfizerApp {
             } else {
                 TtsAnalysisStatus::Disabled
             },
+            tts_analysis_progress: None,
             tts_policy: None,
             pending_tts_sentence_id: None,
             tts_worker_tx: None,
@@ -350,6 +352,7 @@ impl PdfizerApp {
                 } else {
                     TtsAnalysisStatus::Disabled
                 };
+                self.tts_analysis_progress = None;
                 self.tts_policy = None;
                 self.pending_tts_sentence_id = None;
                 self.reset_tts_runtime();
@@ -382,14 +385,32 @@ impl PdfizerApp {
         let config = self.config.clone();
         let tx = self.ensure_tts_worker_channel();
         self.tts_analysis_status = TtsAnalysisStatus::Analyzing;
+        self.tts_analysis_progress = Some("Queued TTS analysis".into());
         let analysis_scope = self.planned_tts_analysis_scope(request);
 
         thread::spawn(move || {
+            let progress_tx = tx.clone();
+            let send_progress = move |stage: &str,
+                                      processed_pages: usize,
+                                      total_pages: usize,
+                                      current_page: Option<usize>| {
+                let _ = progress_tx.send(TtsWorkerMessage::AnalysisProgress {
+                    request_id,
+                    stage: stage.to_string(),
+                    processed_pages,
+                    total_pages,
+                    current_page,
+                });
+            };
             let analysis_result = match analysis_scope {
-                Some((start_page, end_page)) => {
-                    tts::analyze_pdf_for_tts_in_scope(&config, &path, start_page, end_page)
-                }
-                None => tts::analyze_pdf_for_tts(&config, &path),
+                Some((start_page, end_page)) => tts::analyze_pdf_for_tts_in_scope_with_progress(
+                    &config,
+                    &path,
+                    start_page,
+                    end_page,
+                    send_progress,
+                ),
+                None => tts::analyze_pdf_for_tts_with_progress(&config, &path, send_progress),
             };
             let message = match analysis_result {
                 Ok(artifacts) => TtsWorkerMessage::Completed {
@@ -491,6 +512,7 @@ impl PdfizerApp {
                     self.tts_policy = Some(policy);
                     self.tts_analysis = Some(artifacts);
                     self.tts_analysis_status = TtsAnalysisStatus::Ready;
+                    self.tts_analysis_progress = None;
                     if let Some(sentence_id) = self.pending_tts_sentence_id.take() {
                         if let Some(analysis) = &self.tts_analysis {
                             if let Some(index) = tts::sentence_index_for_id(analysis, sentence_id) {
@@ -509,6 +531,34 @@ impl PdfizerApp {
                     error!(error = %error, "TTS analysis failed");
                     self.last_error = Some(format!("TTS analysis failed: {error}"));
                     self.tts_analysis_status = TtsAnalysisStatus::Failed(error);
+                    self.tts_analysis_progress = None;
+                }
+                Ok(TtsWorkerMessage::AnalysisProgress {
+                    request_id,
+                    stage,
+                    processed_pages,
+                    total_pages,
+                    current_page,
+                }) if request_id == self.tts_request_id => {
+                    let progress = if let Some(page_index) = current_page {
+                        format!(
+                            "{}: {}/{} pages (current page {})",
+                            stage,
+                            processed_pages.min(total_pages),
+                            total_pages,
+                            page_index + 1
+                        )
+                    } else {
+                        format!(
+                            "{}: {}/{} pages",
+                            stage,
+                            processed_pages.min(total_pages),
+                            total_pages
+                        )
+                    };
+                    debug!(request_id, %progress, "TTS analysis progress");
+                    self.tts_analysis_progress = Some(progress.clone());
+                    self.status_message = Some(format!("TTS analysis progress: {progress}"));
                 }
                 Ok(TtsWorkerMessage::PrefetchCompleted {
                     request_id,
@@ -626,6 +676,7 @@ impl PdfizerApp {
     fn reset_tts_runtime(&mut self) {
         self.cancel_tts_work("reset_runtime");
         self.tts_playback_state = TtsPlaybackState::Stopped;
+        self.tts_analysis_progress = None;
         self.tts_active_sentence_index = 0;
         self.tts_prepared_clips.clear();
         self.tts_sync_targets.clear();
@@ -1191,6 +1242,7 @@ impl PdfizerApp {
             cancel_token,
         });
         self.tts_playback_state = TtsPlaybackState::Stopped;
+        self.tts_analysis_progress = None;
         self.tts_prepared_clips.clear();
         self.tts_sync_targets.clear();
         self.tts_prefetch_queue.clear();
@@ -2410,6 +2462,9 @@ impl PdfizerApp {
 
         ui.collapsing("TTS diagnostics", |ui| {
             ui.label(format!("Status: {}", self.tts_analysis_status.label()));
+            if let Some(progress) = &self.tts_analysis_progress {
+                ui.label(format!("Progress: {progress}"));
+            }
             ui.label(format!(
                 "Playback: {} | engine: {} | active sentence: {} | follow: {} | pin: {} | highlight: {} | experimental sync: {}",
                 self.tts_playback_state.label(),
@@ -2788,6 +2843,7 @@ impl PdfizerApp {
         } else {
             TtsAnalysisStatus::Disabled
         };
+        self.tts_analysis_progress = None;
 
         if tts_reconfigured {
             let cancel_token = self.cancel_tts_work("engine_reconfiguration");
