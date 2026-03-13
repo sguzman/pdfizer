@@ -385,7 +385,107 @@ pub struct PreparedSentenceClip {
     pub generated_at_unix_secs: u64,
     #[serde(default)]
     pub cache_hit: bool,
+    pub cache_key: PreparedClipCacheKey,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PreparedClipCacheKey {
+    pub source_fingerprint: String,
+    pub sentence_id: u64,
+    pub engine: TtsEngineKind,
+    pub language: String,
+    pub voice: String,
+    pub rate_milli: u32,
+    pub sentence_pause_ms: u64,
+    pub text_hash: u64,
+}
+
+impl PreparedClipCacheKey {
+    pub fn stem(&self) -> String {
+        format!(
+            "{}-{}-{}-{}-{}-{}-{}",
+            self.source_fingerprint,
+            self.sentence_id,
+            self.engine.label(),
+            sanitize_cache_component(&self.language),
+            sanitize_cache_component(&self.voice),
+            self.rate_milli,
+            self.text_hash,
+        )
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TtsSynthesisSettings {
+    pub language: String,
+    pub voice: String,
+    pub rate: f32,
+    pub volume: f32,
+    pub sentence_pause_ms: u64,
+}
+
+impl TtsSynthesisSettings {
+    pub fn from_config(config: &AppConfig) -> Self {
+        Self {
+            language: config.tts.language.clone(),
+            voice: config.tts.voice.clone(),
+            rate: config.tts.rate,
+            volume: config.tts.volume,
+            sentence_pause_ms: config.tts.sentence_pause_ms,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct TtsPrefetchPlan {
+    pub sentence_indexes: Vec<usize>,
+    pub estimated_duration_ms_total: u64,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TtsRuntimeCommand {
+    Play,
+    Pause,
+    Resume,
+    Stop,
+    SeekToSentence,
+    NextSentence,
+    PreviousSentence,
+}
+
+impl TtsRuntimeCommand {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Play => "play",
+            Self::Pause => "pause",
+            Self::Resume => "resume",
+            Self::Stop => "stop",
+            Self::SeekToSentence => "seek_to_sentence",
+            Self::NextSentence => "next_sentence",
+            Self::PreviousSentence => "previous_sentence",
+        }
+    }
+}
+
+pub trait TtsEngine {
+    fn kind(&self) -> TtsEngineKind;
+    fn build_cache_key(
+        &self,
+        analysis: &TtsAnalysisArtifacts,
+        sentence: &SentencePlan,
+        settings: &TtsSynthesisSettings,
+    ) -> PreparedClipCacheKey;
+    fn synthesize_clip(
+        &self,
+        audio_path: &Path,
+        sentence: &SentencePlan,
+        settings: &TtsSynthesisSettings,
+    ) -> Result<Option<PathBuf>>;
+}
+
+struct DryRunEngine;
+struct TonePreviewEngine;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TtsPrefetchSnapshot {
@@ -550,6 +650,36 @@ pub fn build_prefetch_plan(
 ) -> Vec<usize> {
     let end = (start_sentence_index + sentence_count).min(analysis.sentences.len());
     (start_sentence_index..end).collect()
+}
+
+pub fn build_prefetch_plan_with_budget(
+    analysis: &TtsAnalysisArtifacts,
+    start_sentence_index: usize,
+    sentence_count: usize,
+    duration_budget_ms: u64,
+    settings: &TtsSynthesisSettings,
+) -> TtsPrefetchPlan {
+    let mut sentence_indexes = Vec::new();
+    let mut estimated_duration_ms_total = 0u64;
+
+    for sentence_index in build_prefetch_plan(analysis, start_sentence_index, sentence_count) {
+        let Some(sentence) = analysis.sentences.get(sentence_index) else {
+            continue;
+        };
+        let estimated = estimate_sentence_duration_ms(&sentence.text, settings);
+        if !sentence_indexes.is_empty()
+            && estimated_duration_ms_total.saturating_add(estimated) > duration_budget_ms
+        {
+            break;
+        }
+        sentence_indexes.push(sentence_index);
+        estimated_duration_ms_total = estimated_duration_ms_total.saturating_add(estimated);
+    }
+
+    TtsPrefetchPlan {
+        sentence_indexes,
+        estimated_duration_ms_total,
+    }
 }
 
 pub fn build_sync_prefetch_plan(
@@ -731,19 +861,16 @@ pub fn prepare_sentence_clip(
     sentence_index: usize,
     engine: TtsEngineKind,
 ) -> Result<PreparedSentenceClip> {
+    let backend = create_tts_engine(engine);
+    let settings = TtsSynthesisSettings::from_config(config);
     let sentence = analysis
         .sentences
         .get(sentence_index)
         .with_context(|| format!("sentence index {sentence_index} is out of bounds"))?;
-    let stem = format!(
-        "{}-{}-{}-{:.2}",
-        analysis.source_fingerprint,
-        sentence.id,
-        engine.label(),
-        config.tts.rate
-    );
+    let cache_key = backend.build_cache_key(analysis, sentence, &settings);
+    let stem = cache_key.stem();
     let manifest_path = config.tts_audio_cache_dir()?.join(format!("{stem}.toml"));
-    let audio_path = match engine {
+    let audio_path = match backend.kind() {
         TtsEngineKind::DryRun => None,
         TtsEngineKind::TonePreview => {
             Some(config.tts_audio_cache_dir()?.join(format!("{stem}.wav")))
@@ -756,7 +883,7 @@ pub fn prepare_sentence_clip(
         let mut cached = toml::from_str::<PreparedSentenceClip>(&contents)
             .with_context(|| format!("failed to parse {}", manifest_path.display()))?;
         let audio_ok = cached.audio_path.as_ref().is_none_or(|path| path.exists());
-        if (cached.rate - config.tts.rate).abs() < f32::EPSILON && audio_ok {
+        if cached.cache_key == cache_key && audio_ok {
             cached.cache_hit = true;
             return Ok(cached);
         }
@@ -767,9 +894,9 @@ pub fn prepare_sentence_clip(
             .with_context(|| format!("failed to create {}", parent.display()))?;
     }
 
-    let estimated_duration_ms = estimate_sentence_duration_ms(&sentence.text, config.tts.rate);
+    let estimated_duration_ms = estimate_sentence_duration_ms(&sentence.text, &settings);
     if let Some(audio_path) = &audio_path {
-        generate_tone_preview_clip(audio_path, sentence_index, estimated_duration_ms)?;
+        backend.synthesize_clip(audio_path, sentence, &settings)?;
     }
 
     let clip = PreparedSentenceClip {
@@ -782,9 +909,10 @@ pub fn prepare_sentence_clip(
         audio_path,
         estimated_duration_ms,
         word_count: sentence.text.split_whitespace().count(),
-        rate: config.tts.rate,
+        rate: settings.rate,
         generated_at_unix_secs: unix_timestamp_secs(),
         cache_hit: false,
+        cache_key,
     };
 
     fs::write(&manifest_path, toml::to_string_pretty(&clip)?)
@@ -793,15 +921,91 @@ pub fn prepare_sentence_clip(
     Ok(clip)
 }
 
-pub fn estimate_sentence_duration_ms(text: &str, rate: f32) -> u64 {
+pub fn estimate_sentence_duration_ms(text: &str, settings: &TtsSynthesisSettings) -> u64 {
     let word_count = text.split_whitespace().count().max(1) as u64;
     let punctuation_pause = text
         .chars()
         .filter(|ch| matches!(ch, '.' | ',' | ';' | ':' | '?' | '!'))
         .count() as u64
-        * 120;
+        * 120
+        + settings.sentence_pause_ms;
     let base = (word_count * 360 + punctuation_pause).clamp(900, 12_000) as f32;
-    (base / rate.max(0.25)).round() as u64
+    (base / settings.rate.max(0.25)).round() as u64
+}
+
+pub fn create_tts_engine(kind: TtsEngineKind) -> Box<dyn TtsEngine + Send + Sync> {
+    match kind {
+        TtsEngineKind::DryRun => Box::new(DryRunEngine),
+        TtsEngineKind::TonePreview => Box::new(TonePreviewEngine),
+    }
+}
+
+impl TtsEngine for DryRunEngine {
+    fn kind(&self) -> TtsEngineKind {
+        TtsEngineKind::DryRun
+    }
+
+    fn build_cache_key(
+        &self,
+        analysis: &TtsAnalysisArtifacts,
+        sentence: &SentencePlan,
+        settings: &TtsSynthesisSettings,
+    ) -> PreparedClipCacheKey {
+        PreparedClipCacheKey {
+            source_fingerprint: analysis.source_fingerprint.clone(),
+            sentence_id: sentence.id,
+            engine: self.kind(),
+            language: settings.language.clone(),
+            voice: settings.voice.clone(),
+            rate_milli: (settings.rate * 1000.0).round() as u32,
+            sentence_pause_ms: settings.sentence_pause_ms,
+            text_hash: stable_text_hash(&sentence.text),
+        }
+    }
+
+    fn synthesize_clip(
+        &self,
+        _audio_path: &Path,
+        _sentence: &SentencePlan,
+        _settings: &TtsSynthesisSettings,
+    ) -> Result<Option<PathBuf>> {
+        Ok(None)
+    }
+}
+
+impl TtsEngine for TonePreviewEngine {
+    fn kind(&self) -> TtsEngineKind {
+        TtsEngineKind::TonePreview
+    }
+
+    fn build_cache_key(
+        &self,
+        analysis: &TtsAnalysisArtifacts,
+        sentence: &SentencePlan,
+        settings: &TtsSynthesisSettings,
+    ) -> PreparedClipCacheKey {
+        PreparedClipCacheKey {
+            source_fingerprint: analysis.source_fingerprint.clone(),
+            sentence_id: sentence.id,
+            engine: self.kind(),
+            language: settings.language.clone(),
+            voice: settings.voice.clone(),
+            rate_milli: (settings.rate * 1000.0).round() as u32,
+            sentence_pause_ms: settings.sentence_pause_ms,
+            text_hash: stable_text_hash(&sentence.text),
+        }
+    }
+
+    fn synthesize_clip(
+        &self,
+        audio_path: &Path,
+        sentence: &SentencePlan,
+        settings: &TtsSynthesisSettings,
+    ) -> Result<Option<PathBuf>> {
+        let estimated_duration_ms = estimate_sentence_duration_ms(&sentence.text, settings);
+        generate_tone_preview_clip(audio_path, sentence.id as usize, estimated_duration_ms)?;
+        Ok(Some(audio_path.to_path_buf()))
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1210,6 +1414,25 @@ fn generate_tone_preview_clip(path: &Path, sentence_index: usize, duration_ms: u
 
     writer.finalize()?;
     Ok(())
+}
+
+fn sanitize_cache_component(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+fn stable_text_hash(text: &str) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    text.hash(&mut hasher);
+    hasher.finish()
 }
 
 #[instrument(skip(config, document))]
@@ -2523,6 +2746,16 @@ mod tests {
         }
     }
 
+    fn sample_settings() -> TtsSynthesisSettings {
+        TtsSynthesisSettings {
+            language: "en".into(),
+            voice: "default".into(),
+            rate: 1.0,
+            volume: 1.0,
+            sentence_pause_ms: 140,
+        }
+    }
+
     fn sample_ocr_artifacts(path: PathBuf) -> OcrArtifacts {
         OcrArtifacts {
             source_path: PathBuf::from("fixture.pdf"),
@@ -2744,12 +2977,75 @@ mod tests {
 
         assert_eq!(build_prefetch_plan(&analysis, 2, 2), vec![2, 3]);
         assert_eq!(build_prefetch_plan(&analysis, 4, 8), vec![4]);
+
+        let budgeted = build_prefetch_plan_with_budget(&analysis, 0, 5, 2_000, &sample_settings());
+        assert!(!budgeted.sentence_indexes.is_empty());
+        assert!(budgeted.estimated_duration_ms_total <= 2_000);
     }
 
     #[test]
     fn sentence_duration_estimate_has_reasonable_floor() {
-        assert!(estimate_sentence_duration_ms("Hi.", 1.0) >= 900);
-        assert!(estimate_sentence_duration_ms("This is a somewhat longer sentence.", 1.0) > 900);
+        let settings = sample_settings();
+        assert!(estimate_sentence_duration_ms("Hi.", &settings) >= 900);
+        assert!(
+            estimate_sentence_duration_ms("This is a somewhat longer sentence.", &settings) > 900
+        );
+    }
+
+    #[test]
+    fn engine_cache_key_changes_with_settings_and_text() {
+        let analysis = TtsAnalysisArtifacts {
+            source_path: PathBuf::from("fixture.pdf"),
+            source_fingerprint: "abc".into(),
+            generated_at_unix_secs: 0,
+            text_source: TtsTextSourceKind::Embedded,
+            ocr_trust: None,
+            ocr_confidence: None,
+            ocr_artifact_path: None,
+            mode: PdfTtsMode::HighTextTrust,
+            confidence: 0.9,
+            classification: sample_classification(PdfTtsMode::HighTextTrust, 0.9),
+            tts_text: "Sentence zero.".into(),
+            canonical_text: sample_canonical_text("Sentence zero."),
+            sentences: vec![SentencePlan {
+                id: 42,
+                text: "Sentence zero.".into(),
+                range: TextRange { start: 0, end: 14 },
+                page_range: PageRange {
+                    start_page: 0,
+                    end_page: 0,
+                },
+                unit_kind: SentenceUnitKind::Sentence,
+            }],
+            pages: Vec::new(),
+            stats: NormalizationStats::default(),
+            artifact_path: None,
+        };
+        let engine = create_tts_engine(TtsEngineKind::TonePreview);
+        let sentence = &analysis.sentences[0];
+        let key_a = engine.build_cache_key(&analysis, sentence, &sample_settings());
+        let mut changed_voice = sample_settings();
+        changed_voice.voice = "narrator".into();
+        let key_b = engine.build_cache_key(&analysis, sentence, &changed_voice);
+        let mut changed_rate = sample_settings();
+        changed_rate.rate = 1.15;
+        let key_c = engine.build_cache_key(&analysis, sentence, &changed_rate);
+
+        assert_ne!(key_a, key_b);
+        assert_ne!(key_a, key_c);
+        assert!(key_a.stem().contains("tone_preview"));
+    }
+
+    #[test]
+    fn create_tts_engine_returns_expected_backend_kind() {
+        assert_eq!(
+            create_tts_engine(TtsEngineKind::DryRun).kind(),
+            TtsEngineKind::DryRun
+        );
+        assert_eq!(
+            create_tts_engine(TtsEngineKind::TonePreview).kind(),
+            TtsEngineKind::TonePreview
+        );
     }
 
     #[test]

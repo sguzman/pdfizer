@@ -220,6 +220,14 @@ impl AppConfig {
                 "tts.active_latency_budget_ms",
                 defaults.tts.active_latency_budget_ms as i64,
             )?
+            .set_default(
+                "tts.prefetch_duration_budget_ms",
+                defaults.tts.prefetch_duration_budget_ms as i64,
+            )?
+            .set_default(
+                "tts.sentence_pause_ms",
+                defaults.tts.sentence_pause_ms as i64,
+            )?
             .set_default("tts.audio_cache_dir", defaults.tts.audio_cache_dir.clone())?
             .set_default("tts.artifacts_dir", defaults.tts.artifacts_dir.clone())?
             .set_default(
@@ -687,6 +695,8 @@ pub struct TtsConfig {
     pub clip_budget_sentences: usize,
     pub sync_budget_sentences: usize,
     pub active_latency_budget_ms: u64,
+    pub prefetch_duration_budget_ms: u64,
+    pub sentence_pause_ms: u64,
     pub audio_cache_dir: String,
     pub artifacts_dir: String,
     pub sync_artifacts_dir: String,
@@ -731,6 +741,8 @@ impl Default for TtsConfig {
             clip_budget_sentences: 16,
             sync_budget_sentences: 12,
             active_latency_budget_ms: 120,
+            prefetch_duration_budget_ms: 30_000,
+            sentence_pause_ms: 140,
             audio_cache_dir: "tts/audio".into(),
             artifacts_dir: "tts/artifacts".into(),
             sync_artifacts_dir: "tts/sync".into(),

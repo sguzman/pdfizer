@@ -585,13 +585,17 @@ impl PdfizerApp {
 
         self.tts_prefetch_request_id = self.tts_prefetch_request_id.wrapping_add(1);
         let request_id = self.tts_prefetch_request_id;
-        let plan = tts::build_prefetch_plan(
+        let settings = tts::TtsSynthesisSettings::from_config(&self.config);
+        let plan = tts::build_prefetch_plan_with_budget(
             &analysis,
             self.tts_active_sentence_index,
             self.config.tts.sentence_prefetch,
+            self.config.tts.prefetch_duration_budget_ms,
+            &settings,
         );
 
         self.tts_prefetch_queue = plan
+            .sentence_indexes
             .iter()
             .copied()
             .filter(|index| !self.tts_prepared_clips.contains_key(index))
@@ -599,6 +603,14 @@ impl PdfizerApp {
         self.tts_failed_prefetch.clear();
         self.tts_prefetch_in_flight = self.tts_prefetch_queue.len();
         self.enforce_tts_runtime_budget();
+        debug!(
+            request_id,
+            active_sentence = self.tts_active_sentence_index,
+            queued = self.tts_prefetch_queue.len(),
+            duration_budget_ms = self.config.tts.prefetch_duration_budget_ms,
+            estimated_duration_ms_total = plan.estimated_duration_ms_total,
+            "planned TTS clip prefetch window"
+        );
 
         if self.tts_prefetch_queue.is_empty() {
             if !policy.allow_sync_prefetch {
@@ -688,6 +700,12 @@ impl PdfizerApp {
             return;
         }
 
+        info!(
+            command = %tts::TtsRuntimeCommand::Play.label(),
+            sentence_index = self.tts_active_sentence_index,
+            engine = %self.tts_engine.label(),
+            "received TTS runtime command"
+        );
         self.tts_playback_state = TtsPlaybackState::Preparing;
         self.tts_activation_requested_at = Some(Instant::now());
         self.start_tts_prefetch();
@@ -696,6 +714,11 @@ impl PdfizerApp {
 
     fn pause_tts_playback(&mut self) {
         if self.tts_playback_state == TtsPlaybackState::Playing {
+            info!(
+                command = %tts::TtsRuntimeCommand::Pause.label(),
+                sentence_index = self.tts_active_sentence_index,
+                "received TTS runtime command"
+            );
             if let Some(started_at) = self.tts_started_at.take() {
                 self.tts_elapsed_before_pause += started_at.elapsed();
             }
@@ -708,6 +731,11 @@ impl PdfizerApp {
 
     fn resume_tts_playback(&mut self, ctx: &egui::Context) {
         if self.tts_playback_state == TtsPlaybackState::Paused {
+            info!(
+                command = %tts::TtsRuntimeCommand::Resume.label(),
+                sentence_index = self.tts_active_sentence_index,
+                "received TTS runtime command"
+            );
             if let Some(player) = &self.tts_player {
                 player.play();
             }
@@ -720,6 +748,11 @@ impl PdfizerApp {
     }
 
     fn stop_tts_playback(&mut self) {
+        info!(
+            command = %tts::TtsRuntimeCommand::Stop.label(),
+            sentence_index = self.tts_active_sentence_index,
+            "received TTS runtime command"
+        );
         self.reset_tts_runtime();
         if self.config.tts.enabled {
             self.tts_analysis_status = if self.tts_analysis.is_some() {
@@ -735,6 +768,11 @@ impl PdfizerApp {
             return;
         };
         if self.tts_active_sentence_index + 1 < analysis.sentences.len() {
+            info!(
+                command = %tts::TtsRuntimeCommand::NextSentence.label(),
+                sentence_index = self.tts_active_sentence_index + 1,
+                "received TTS runtime command"
+            );
             self.set_tts_cursor_to_sentence_index(self.tts_active_sentence_index + 1);
             self.tts_started_at = None;
             self.tts_activation_requested_at = Some(Instant::now());
@@ -747,6 +785,11 @@ impl PdfizerApp {
 
     fn previous_tts_sentence(&mut self, ctx: &egui::Context) {
         if self.tts_active_sentence_index > 0 {
+            info!(
+                command = %tts::TtsRuntimeCommand::PreviousSentence.label(),
+                sentence_index = self.tts_active_sentence_index.saturating_sub(1),
+                "received TTS runtime command"
+            );
             self.set_tts_cursor_to_sentence_index(self.tts_active_sentence_index - 1);
             self.tts_started_at = None;
             self.tts_activation_requested_at = Some(Instant::now());
@@ -842,6 +885,11 @@ impl PdfizerApp {
         if target_sentence_index >= analysis.sentences.len() {
             return;
         }
+        info!(
+            command = %tts::TtsRuntimeCommand::SeekToSentence.label(),
+            sentence_index = target_sentence_index,
+            "received TTS runtime command"
+        );
         self.set_tts_cursor_to_sentence_index(target_sentence_index);
         self.tts_started_at = None;
         self.tts_activation_requested_at = Some(Instant::now());

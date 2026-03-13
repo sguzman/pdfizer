@@ -170,22 +170,22 @@ Checked items reflect capabilities already present in this repository that reduc
 
 ## Phase 7: TTS Engine Abstraction
 
-- [ ] Introduce a Rust-side `TtsEngine` abstraction decoupled from UI and PDF rendering code.
-- [ ] Support play, pause, resume, stop, seek-to-sentence, next-sentence, and previous-sentence operations.
-- [ ] Support pluggable backends so engine choice does not leak into the reader domain model.
-- [ ] Define output artifact policy for generated audio clips, durations, and cache keys.
-- [ ] Define voice, rate, volume, and sentence pause configuration in TOML.
-- [ ] Add tracing spans for engine startup, synthesis, playback state transitions, and errors.
+- [x] Introduce a Rust-side `TtsEngine` abstraction decoupled from UI and PDF rendering code.
+- [x] Support play, pause, resume, stop, seek-to-sentence, next-sentence, and previous-sentence operations.
+- [x] Support pluggable backends so engine choice does not leak into the reader domain model.
+- [x] Define output artifact policy for generated audio clips, durations, and cache keys.
+- [x] Define voice, rate, volume, and sentence pause configuration in TOML.
+- [x] Add tracing spans for engine startup, synthesis, playback state transitions, and errors.
 
 ## Phase 8: Ahead-Of-Time Audio Generation
 
-- [ ] Generate sentence audio ahead of current playback position.
-- [ ] Use a bounded prefetch window configurable by sentence count and audio duration budget.
-- [ ] Keep pre-generation cancellable when the user seeks, changes document, or changes voice/rate.
-- [ ] Persist generated audio clips in a cache keyed by source fingerprint, sentence id, voice, and synthesis settings.
-- [ ] Reuse generated clips across pause/resume and reopen when cache entries are still valid.
-- [ ] Avoid blocking UI rendering on synthesis completion.
-- [ ] Add cache invalidation rules for changed normalization, changed sentence plan, and changed TTS settings.
+- [x] Generate sentence audio ahead of current playback position.
+- [x] Use a bounded prefetch window configurable by sentence count and audio duration budget.
+- [x] Keep pre-generation cancellable when the user seeks, changes document, or changes voice/rate.
+- [x] Persist generated audio clips in a cache keyed by source fingerprint, sentence id, voice, and synthesis settings.
+- [x] Reuse generated clips across pause/resume and reopen when cache entries are still valid.
+- [x] Avoid blocking UI rendering on synthesis completion.
+- [x] Add cache invalidation rules for changed normalization, changed sentence plan, and changed TTS settings.
 
 ## Phase 9: Threading And Scheduling
 
