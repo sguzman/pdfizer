@@ -258,7 +258,15 @@ pub struct TtsAnalysisArtifacts {
     pub sentences: Vec<SentencePlan>,
     pub pages: Vec<PageTtsArtifact>,
     pub stats: NormalizationStats,
+    pub analysis_scope: AnalysisScope,
     pub artifact_path: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AnalysisScope {
+    pub start_page: usize,
+    pub end_page: usize,
+    pub full_document: bool,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -561,6 +569,21 @@ pub fn analyze_pdf_for_tts(config: &AppConfig, source_path: &Path) -> Result<Tts
         .open_document(source_path)
         .with_context(|| format!("failed to open {} for TTS analysis", source_path.display()))?;
     build_artifacts_from_document(config, source_path, &document)
+}
+
+#[instrument(skip(config))]
+pub fn analyze_pdf_for_tts_in_scope(
+    config: &AppConfig,
+    source_path: &Path,
+    start_page: usize,
+    end_page: usize,
+) -> Result<TtsAnalysisArtifacts> {
+    let runtime =
+        PdfRuntime::new(config).context("failed to initialize Pdfium for TTS analysis")?;
+    let document = runtime
+        .open_document(source_path)
+        .with_context(|| format!("failed to open {} for TTS analysis", source_path.display()))?;
+    build_artifacts_from_document_with_scope(config, source_path, &document, start_page, end_page)
 }
 
 pub fn compute_sentence_sync(
@@ -1469,17 +1492,38 @@ pub fn build_artifacts_from_document(
     source_path: &Path,
     document: &PdfDocument<'_>,
 ) -> Result<TtsAnalysisArtifacts> {
+    build_artifacts_from_document_with_scope(
+        config,
+        source_path,
+        document,
+        0,
+        document.metadata.page_count.saturating_sub(1),
+    )
+}
+
+#[instrument(skip(config, document))]
+pub fn build_artifacts_from_document_with_scope(
+    config: &AppConfig,
+    source_path: &Path,
+    document: &PdfDocument<'_>,
+    start_page: usize,
+    end_page: usize,
+) -> Result<TtsAnalysisArtifacts> {
     let fingerprint = fingerprint_document_path(source_path)?;
     let repeated_edge_lines = collect_repeated_edge_lines(config, document)?;
     let mut stats = NormalizationStats::default();
     let mut full_text = String::new();
-    let mut pages = Vec::with_capacity(document.metadata.page_count);
-    let mut canonical_pages = Vec::with_capacity(document.metadata.page_count);
+    let page_count = document.metadata.page_count;
+    let start_page = start_page.min(page_count.saturating_sub(1));
+    let end_page = end_page.min(page_count.saturating_sub(1)).max(start_page);
+    let scoped_page_count = end_page - start_page + 1;
+    let mut pages = Vec::with_capacity(scoped_page_count);
+    let mut canonical_pages = Vec::with_capacity(scoped_page_count);
     let mut block_count = 0usize;
     let mut line_count = 0usize;
     let mut token_count = 0usize;
 
-    for page_index in 0..document.metadata.page_count {
+    for page_index in start_page..=end_page {
         let segments = document.text_segments_for_page(page_index)?;
         let segment_count = segments.len();
         let extracted = extract_page_text_for_tts(&segments, config);
@@ -1575,7 +1619,7 @@ pub fn build_artifacts_from_document(
         .filter(|sentence| sentence.unit_kind == SentenceUnitKind::BlockFallback)
         .count();
 
-    let classification = classify_pdf_for_tts(document.metadata.page_count, &pages, &stats, config);
+    let classification = classify_pdf_for_tts(scoped_page_count, &pages, &stats, config);
 
     let mut artifacts = TtsAnalysisArtifacts {
         source_path: source_path.to_path_buf(),
@@ -1593,6 +1637,11 @@ pub fn build_artifacts_from_document(
         sentences,
         pages,
         stats,
+        analysis_scope: AnalysisScope {
+            start_page,
+            end_page,
+            full_document: start_page == 0 && end_page + 1 == page_count,
+        },
         artifact_path: None,
     };
 
@@ -1654,6 +1703,9 @@ pub fn build_artifacts_from_document(
         blocks = artifacts.canonical_text.block_count,
         lines = artifacts.canonical_text.line_count,
         tokens = artifacts.canonical_text.token_count,
+        analysis_start_page = artifacts.analysis_scope.start_page,
+        analysis_end_page = artifacts.analysis_scope.end_page,
+        full_document = artifacts.analysis_scope.full_document,
         column_reorders = artifacts.stats.column_reorders,
         rotated_segments_suppressed = artifacts.stats.rotated_segments_suppressed,
         duplicate_segments_suppressed = artifacts.stats.duplicate_segments_suppressed,
@@ -3015,6 +3067,11 @@ mod tests {
                 .collect(),
             pages: Vec::new(),
             stats: NormalizationStats::default(),
+            analysis_scope: AnalysisScope {
+                start_page: 0,
+                end_page: 0,
+                full_document: true,
+            },
             artifact_path: None,
         };
 
@@ -3062,6 +3119,11 @@ mod tests {
             }],
             pages: Vec::new(),
             stats: NormalizationStats::default(),
+            analysis_scope: AnalysisScope {
+                start_page: 0,
+                end_page: 0,
+                full_document: true,
+            },
             artifact_path: None,
         };
         let engine = create_tts_engine(TtsEngineKind::TonePreview);
@@ -3321,6 +3383,11 @@ mod tests {
             }],
             pages: Vec::new(),
             stats: NormalizationStats::default(),
+            analysis_scope: AnalysisScope {
+                start_page: 0,
+                end_page: 0,
+                full_document: true,
+            },
             artifact_path: None,
         };
 
@@ -3445,6 +3512,11 @@ mod tests {
             }],
             pages: Vec::new(),
             stats: NormalizationStats::default(),
+            analysis_scope: AnalysisScope {
+                start_page: 0,
+                end_page: 0,
+                full_document: true,
+            },
             artifact_path: None,
         };
 
@@ -3519,6 +3591,11 @@ mod tests {
             sentences: Vec::new(),
             pages: Vec::new(),
             stats: NormalizationStats::default(),
+            analysis_scope: AnalysisScope {
+                start_page: 0,
+                end_page: 0,
+                full_document: true,
+            },
             artifact_path: None,
         };
 
@@ -3580,6 +3657,11 @@ mod tests {
             }],
             pages: Vec::new(),
             stats: NormalizationStats::default(),
+            analysis_scope: AnalysisScope {
+                start_page: 0,
+                end_page: 0,
+                full_document: true,
+            },
             artifact_path: None,
         };
         let target = SentenceSyncTarget {

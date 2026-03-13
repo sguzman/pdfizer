@@ -229,6 +229,14 @@ impl AppConfig {
                 defaults.tts.sentence_pause_ms as i64,
             )?
             .set_default(
+                "tts.analysis_max_pages",
+                defaults.tts.analysis_max_pages as i64,
+            )?
+            .set_default(
+                "tts.analysis_window_radius",
+                defaults.tts.analysis_window_radius as i64,
+            )?
+            .set_default(
                 "tts.follow_visible_margin_ratio",
                 f64::from(defaults.tts.follow_visible_margin_ratio),
             )?
@@ -745,6 +753,8 @@ pub struct TtsConfig {
     pub active_latency_budget_ms: u64,
     pub prefetch_duration_budget_ms: u64,
     pub sentence_pause_ms: u64,
+    pub analysis_max_pages: usize,
+    pub analysis_window_radius: usize,
     pub follow_visible_margin_ratio: f32,
     pub follow_preload_page_radius: usize,
     pub follow_center_on_target: bool,
@@ -803,6 +813,8 @@ impl Default for TtsConfig {
             active_latency_budget_ms: 120,
             prefetch_duration_budget_ms: 30_000,
             sentence_pause_ms: 140,
+            analysis_max_pages: 96,
+            analysis_window_radius: 32,
             follow_visible_margin_ratio: 0.18,
             follow_preload_page_radius: 1,
             follow_center_on_target: true,

@@ -145,6 +145,12 @@ enum PlaybackEvent {
     },
 }
 
+#[derive(Debug, Clone, Copy)]
+enum TtsAnalysisRequest {
+    Windowed,
+    FullDocument,
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 struct ScrollViewport {
     offset: Vec2,
@@ -350,7 +356,7 @@ impl PdfizerApp {
                 self.single_scroll_offset = Vec2::ZERO;
                 self.continuous_scroll_offset = Vec2::ZERO;
                 self.render_current_page(ctx);
-                self.start_tts_analysis(path);
+                self.start_tts_analysis(path, TtsAnalysisRequest::Windowed);
                 self.persist_session();
             }
             Err(err) => {
@@ -360,7 +366,7 @@ impl PdfizerApp {
         }
     }
 
-    fn start_tts_analysis(&mut self, path: PathBuf) {
+    fn start_tts_analysis(&mut self, path: PathBuf, request: TtsAnalysisRequest) {
         if !self.config.tts.enabled {
             self.tts_analysis_status = TtsAnalysisStatus::Disabled;
             return;
@@ -376,9 +382,16 @@ impl PdfizerApp {
         let config = self.config.clone();
         let tx = self.ensure_tts_worker_channel();
         self.tts_analysis_status = TtsAnalysisStatus::Analyzing;
+        let analysis_scope = self.planned_tts_analysis_scope(request);
 
         thread::spawn(move || {
-            let message = match tts::analyze_pdf_for_tts(&config, &path) {
+            let analysis_result = match analysis_scope {
+                Some((start_page, end_page)) => {
+                    tts::analyze_pdf_for_tts_in_scope(&config, &path, start_page, end_page)
+                }
+                None => tts::analyze_pdf_for_tts(&config, &path),
+            };
+            let message = match analysis_result {
                 Ok(artifacts) => TtsWorkerMessage::Completed {
                     request_id,
                     artifacts,
@@ -398,8 +411,46 @@ impl PdfizerApp {
             return;
         };
         self.cancel_tts_work("rebuild_analysis");
-        self.start_tts_analysis(path);
+        self.start_tts_analysis(path, TtsAnalysisRequest::Windowed);
         self.status_message = Some("Rebuilding TTS analysis".into());
+    }
+
+    fn rebuild_tts_analysis_full(&mut self) {
+        let Some(path) = self.current_document_path.clone() else {
+            self.last_error = Some("open a PDF before rebuilding TTS analysis".into());
+            return;
+        };
+        self.cancel_tts_work("rebuild_analysis_full");
+        self.start_tts_analysis(path, TtsAnalysisRequest::FullDocument);
+        self.status_message = Some("Rebuilding full-document TTS analysis".into());
+    }
+
+    fn planned_tts_analysis_scope(&self, request: TtsAnalysisRequest) -> Option<(usize, usize)> {
+        let document = self.document.as_ref()?;
+        if matches!(request, TtsAnalysisRequest::FullDocument) {
+            return None;
+        }
+
+        let page_count = document.metadata.page_count;
+        let max_pages = self.config.tts.analysis_max_pages.max(1);
+        if page_count <= max_pages {
+            return None;
+        }
+
+        let radius = self.config.tts.analysis_window_radius.max(max_pages / 2);
+        let mut start = self.current_page.saturating_sub(radius);
+        let mut end = (self.current_page + radius).min(page_count.saturating_sub(1));
+        let window_len = end - start + 1;
+        if window_len > max_pages {
+            end = start + max_pages - 1;
+        } else if window_len < max_pages {
+            let missing = max_pages - window_len;
+            start = start.saturating_sub(missing / 2);
+            end = (start + max_pages - 1).min(page_count.saturating_sub(1));
+            start = end.saturating_sub(max_pages - 1);
+        }
+
+        Some((start, end))
     }
 
     fn poll_tts_analysis(&mut self) {
@@ -425,10 +476,17 @@ impl PdfizerApp {
                         );
                     }
                     self.status_message = Some(format!(
-                        "TTS analysis ready: {} sentences ({}, {})",
+                        "TTS analysis ready: {} sentences ({}, {}, pages {}-{}{})",
                         artifacts.sentences.len(),
                         artifacts.mode.label(),
-                        policy.reason
+                        policy.reason,
+                        artifacts.analysis_scope.start_page + 1,
+                        artifacts.analysis_scope.end_page + 1,
+                        if artifacts.analysis_scope.full_document {
+                            ""
+                        } else {
+                            ", windowed"
+                        }
                     ));
                     self.tts_policy = Some(policy);
                     self.tts_analysis = Some(artifacts);
@@ -1048,7 +1106,16 @@ impl PdfizerApp {
             return;
         }
         if self.tts_analysis.is_none() {
-            self.last_error = Some("TTS analysis is not ready yet".into());
+            self.last_error = Some(match &self.tts_analysis_status {
+                TtsAnalysisStatus::Analyzing => {
+                    "TTS analysis is still running. Use Rebuild TTS for a fast page window or Analyze Full TTS for the whole document.".into()
+                }
+                TtsAnalysisStatus::Failed(message) => {
+                    format!("TTS analysis failed: {message}")
+                }
+                TtsAnalysisStatus::Disabled => "TTS is disabled in config".into(),
+                _ => "TTS analysis is not ready yet".into(),
+            });
             return;
         }
         let Some(policy) = self.active_tts_policy() else {
@@ -1991,6 +2058,15 @@ impl PdfizerApp {
         {
             self.rebuild_tts_analysis();
         }
+        if ui
+            .add_enabled(
+                self.document.is_some() && self.config.tts.enabled,
+                egui::Button::new("Analyze Full TTS"),
+            )
+            .clicked()
+        {
+            self.rebuild_tts_analysis_full();
+        }
 
         ui.separator();
         ui.label("Search");
@@ -2351,6 +2427,16 @@ impl PdfizerApp {
                     analysis.mode.label(),
                     analysis.confidence * 100.0,
                     analysis.text_source
+                ));
+                ui.label(format!(
+                    "Analysis scope: pages {}-{}{}",
+                    analysis.analysis_scope.start_page + 1,
+                    analysis.analysis_scope.end_page + 1,
+                    if analysis.analysis_scope.full_document {
+                        " | full-document"
+                    } else {
+                        " | windowed"
+                    }
                 ));
                 if let Some(ocr_trust) = analysis.ocr_trust {
                     ui.label(format!(
