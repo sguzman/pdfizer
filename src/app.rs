@@ -1701,11 +1701,28 @@ impl PdfizerApp {
                     analysis.classification.reason
                 ));
                 ui.label(format!(
-                    "Normalization: ligatures {} | soft hyphens {} | duplicate lines {} | repeated edge lines {}",
+                    "Normalization: ligatures {} | soft hyphens {} | duplicate lines {} | repeated edge lines {} | joined hyphenations {}",
                     analysis.stats.ligatures_replaced,
                     analysis.stats.soft_hyphens_removed,
                     analysis.stats.duplicate_lines_removed,
-                    analysis.stats.repeated_edge_lines_removed
+                    analysis.stats.repeated_edge_lines_removed,
+                    analysis.stats.joined_hyphenations
+                ));
+                ui.label(format!(
+                    "Extraction: blocks {} | lines {} | column reorders {} | duplicate segments {} | rotated segments {}",
+                    analysis.stats.extracted_blocks,
+                    analysis.stats.extracted_lines,
+                    analysis.stats.column_reorders,
+                    analysis.stats.duplicate_segments_suppressed,
+                    analysis.stats.rotated_segments_suppressed
+                ));
+                ui.label(format!(
+                    "Structure heuristics: table-like {} | captions {} | footnotes {} | sidenotes {} | block fallbacks {}",
+                    analysis.stats.table_like_blocks,
+                    analysis.stats.caption_like_blocks,
+                    analysis.stats.footnote_like_blocks,
+                    analysis.stats.sidenote_like_blocks,
+                    analysis.stats.block_fallback_units
                 ));
                 if let Some(path) = &analysis.artifact_path {
                     ui.label(format!("Artifact: {}", path.display()));
@@ -1713,6 +1730,7 @@ impl PdfizerApp {
                 if let Some(sentence) = self.active_sentence() {
                     let mut sentence_text = sentence.text.clone();
                     ui.label(format!("Sentence id: {}", sentence.id));
+                    ui.label(format!("Sentence unit: {:?}", sentence.unit_kind));
                     ui.label(format!(
                         "Sentence page range: {}-{}",
                         sentence.page_range.start_page + 1,

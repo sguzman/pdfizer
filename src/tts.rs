@@ -118,6 +118,14 @@ pub struct SentencePlan {
     pub text: String,
     pub range: TextRange,
     pub page_range: PageRange,
+    pub unit_kind: SentenceUnitKind,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum SentenceUnitKind {
+    Sentence,
+    BlockFallback,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -145,6 +153,16 @@ pub struct NormalizationStats {
     pub repeated_edge_lines_removed: usize,
     pub joined_hyphenations: usize,
     pub collapsed_whitespace_runs: usize,
+    pub rotated_segments_suppressed: usize,
+    pub duplicate_segments_suppressed: usize,
+    pub column_reorders: usize,
+    pub extracted_blocks: usize,
+    pub extracted_lines: usize,
+    pub table_like_blocks: usize,
+    pub caption_like_blocks: usize,
+    pub footnote_like_blocks: usize,
+    pub sidenote_like_blocks: usize,
+    pub block_fallback_units: usize,
     pub sentence_count: usize,
 }
 
@@ -875,11 +893,12 @@ pub fn build_artifacts_from_document(
     let mut token_count = 0usize;
 
     for page_index in 0..document.metadata.page_count {
-        let page_text = document.full_text_for_page(page_index)?;
-        let segment_count = document.text_segments_for_page(page_index)?.len();
-        let normalized = normalize_page_text(&page_text, &repeated_edge_lines, config);
+        let segments = document.text_segments_for_page(page_index)?;
+        let segment_count = segments.len();
+        let extracted = extract_page_text_for_tts(&segments, config);
+        let normalized = normalize_page_text(&extracted.text, &repeated_edge_lines, config);
 
-        stats.original_chars += page_text.chars().count();
+        stats.original_chars += extracted.text.chars().count();
         stats.normalized_chars += normalized.text.chars().count();
         stats.ligatures_replaced += normalized.stats.ligatures_replaced;
         stats.soft_hyphens_removed += normalized.stats.soft_hyphens_removed;
@@ -888,12 +907,25 @@ pub fn build_artifacts_from_document(
         stats.repeated_edge_lines_removed += normalized.stats.repeated_edge_lines_removed;
         stats.joined_hyphenations += normalized.stats.joined_hyphenations;
         stats.collapsed_whitespace_runs += normalized.stats.collapsed_whitespace_runs;
+        stats.rotated_segments_suppressed += extracted.stats.rotated_segments_suppressed;
+        stats.duplicate_segments_suppressed += extracted.stats.duplicate_segments_suppressed;
+        stats.column_reorders += extracted.stats.column_reorders;
+        stats.extracted_blocks += normalized.blocks.len();
+        stats.extracted_lines += normalized
+            .blocks
+            .iter()
+            .map(|block| block.lines.len())
+            .sum::<usize>();
+        stats.table_like_blocks += normalized.stats.table_like_blocks;
+        stats.caption_like_blocks += normalized.stats.caption_like_blocks;
+        stats.footnote_like_blocks += normalized.stats.footnote_like_blocks;
+        stats.sidenote_like_blocks += normalized.stats.sidenote_like_blocks;
 
         if normalized.text.trim().is_empty() {
             stats.empty_pages += 1;
             pages.push(PageTtsArtifact {
                 page_index,
-                original_char_count: page_text.chars().count(),
+                original_char_count: extracted.text.chars().count(),
                 normalized_char_count: 0,
                 segment_count,
                 duplicate_lines_removed: normalized.stats.duplicate_lines_removed,
@@ -926,7 +958,7 @@ pub fn build_artifacts_from_document(
 
         pages.push(PageTtsArtifact {
             page_index,
-            original_char_count: page_text.chars().count(),
+            original_char_count: extracted.text.chars().count(),
             normalized_char_count: normalized.text.chars().count(),
             segment_count,
             duplicate_lines_removed: normalized.stats.duplicate_lines_removed,
@@ -951,6 +983,10 @@ pub fn build_artifacts_from_document(
 
     let sentences = build_sentence_plan(&canonical_text, &fingerprint, config);
     stats.sentence_count = sentences.len();
+    stats.block_fallback_units = sentences
+        .iter()
+        .filter(|sentence| sentence.unit_kind == SentenceUnitKind::BlockFallback)
+        .count();
 
     let classification = classify_pdf_for_tts(document.metadata.page_count, &pages, &stats, config);
 
@@ -981,6 +1017,10 @@ pub fn build_artifacts_from_document(
         blocks = artifacts.canonical_text.block_count,
         lines = artifacts.canonical_text.line_count,
         tokens = artifacts.canonical_text.token_count,
+        column_reorders = artifacts.stats.column_reorders,
+        rotated_segments_suppressed = artifacts.stats.rotated_segments_suppressed,
+        duplicate_segments_suppressed = artifacts.stats.duplicate_segments_suppressed,
+        block_fallback_units = artifacts.stats.block_fallback_units,
         classification_reason = %artifacts.classification.reason,
         artifact = %artifact_path.display(),
         "built PDF TTS analysis artifacts"
@@ -1088,23 +1128,69 @@ fn build_sentence_plan(
     fingerprint: &str,
     config: &AppConfig,
 ) -> Vec<SentencePlan> {
-    split_sentences(&canonical_text.text, &config.tts.abbreviations)
+    let mut sentences = split_sentences(&canonical_text.text, config)
         .into_iter()
-        .map(|(range, sentence)| {
-            let page_range = sentence_page_range(&range, &canonical_text.pages);
-            let mut hasher = DefaultHasher::new();
-            fingerprint.hash(&mut hasher);
-            range.start.hash(&mut hasher);
-            range.end.hash(&mut hasher);
-            sentence.hash(&mut hasher);
-            SentencePlan {
-                id: hasher.finish(),
-                text: sentence,
-                range,
-                page_range,
-            }
+        .filter(|(range, sentence)| {
+            sentence.chars().count() >= config.tts.min_sentence_chars && range.end > range.start
         })
-        .collect()
+        .map(|(range, sentence)| {
+            sentence_plan_entry(
+                range,
+                sentence,
+                SentenceUnitKind::Sentence,
+                &canonical_text.pages,
+                fingerprint,
+            )
+        })
+        .collect::<Vec<_>>();
+
+    if sentences.len() <= 1 {
+        let fallback = canonical_text
+            .pages
+            .iter()
+            .flat_map(|page| page.blocks.iter())
+            .filter_map(|block| {
+                let text = block.text.trim();
+                (text.chars().count() >= config.tts.block_fallback_min_chars).then(|| {
+                    sentence_plan_entry(
+                        block.range.clone(),
+                        text.to_string(),
+                        SentenceUnitKind::BlockFallback,
+                        &canonical_text.pages,
+                        fingerprint,
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        if !fallback.is_empty() {
+            sentences = fallback;
+        }
+    }
+
+    sentences
+}
+
+fn sentence_plan_entry(
+    range: TextRange,
+    sentence: String,
+    unit_kind: SentenceUnitKind,
+    pages: &[CanonicalPageArtifact],
+    fingerprint: &str,
+) -> SentencePlan {
+    let page_range = sentence_page_range(&range, pages);
+    let mut hasher = DefaultHasher::new();
+    fingerprint.hash(&mut hasher);
+    range.start.hash(&mut hasher);
+    range.end.hash(&mut hasher);
+    sentence.hash(&mut hasher);
+    unit_kind.hash(&mut hasher);
+    SentencePlan {
+        id: hasher.finish(),
+        text: sentence,
+        range,
+        page_range,
+        unit_kind,
+    }
 }
 
 fn sentence_page_range(range: &TextRange, pages: &[CanonicalPageArtifact]) -> PageRange {
@@ -1212,12 +1298,263 @@ fn append_page_to_canonical_text(
     blocks
 }
 
-fn split_sentences(text: &str, abbreviations: &[String]) -> Vec<(TextRange, String)> {
+fn extract_page_text_for_tts(
+    segments: &[crate::pdf::TextSegmentData],
+    config: &AppConfig,
+) -> ExtractedPageText {
+    let mut stats = PageExtractionStats::default();
+    let mut filtered = Vec::new();
+    let mut seen = HashSet::new();
+    let mut scratch = PageNormalizationStats::default();
+
+    for segment in segments {
+        let text = collapse_inline_whitespace(segment.text.trim(), &mut scratch);
+        if text.is_empty() {
+            continue;
+        }
+        let width = (segment.rect.right - segment.rect.left).abs();
+        let height = (segment.rect.top - segment.rect.bottom).abs();
+        if config.tts.suppress_rotated_narrow_segments
+            && height > 0.0
+            && width > 0.0
+            && (height / width.max(0.01)) >= config.tts.rotated_segment_aspect_ratio
+        {
+            stats.rotated_segments_suppressed += 1;
+            continue;
+        }
+
+        let key = (
+            text.to_ascii_lowercase(),
+            (segment.rect.left * 2.0).round() as i32,
+            (segment.rect.top * 2.0).round() as i32,
+            (segment.rect.right * 2.0).round() as i32,
+            (segment.rect.bottom * 2.0).round() as i32,
+        );
+        if !seen.insert(key) {
+            stats.duplicate_segments_suppressed += 1;
+            continue;
+        }
+
+        filtered.push(segment.clone());
+    }
+
+    let lines = group_segments_into_lines(&filtered, config);
+    let ordered = reorder_lines_by_columns(lines, config, &mut stats);
+    let blocks = build_blocks_from_lines(&ordered, config);
+    let text = blocks.join("\n\n");
+
+    ExtractedPageText { text, stats }
+}
+
+fn group_segments_into_lines(
+    segments: &[crate::pdf::TextSegmentData],
+    config: &AppConfig,
+) -> Vec<PositionedLine> {
+    let mut sorted = segments.to_vec();
+    sorted.sort_by(|a, b| {
+        b.rect
+            .top
+            .partial_cmp(&a.rect.top)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| {
+                a.rect
+                    .left
+                    .partial_cmp(&b.rect.left)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+    });
+
+    let mut lines: Vec<Vec<crate::pdf::TextSegmentData>> = Vec::new();
+    for segment in sorted {
+        let center = (segment.rect.top + segment.rect.bottom) * 0.5;
+        let mut placed = false;
+        for line in &mut lines {
+            let reference = line
+                .first()
+                .map(|entry| (entry.rect.top + entry.rect.bottom) * 0.5)
+                .unwrap_or(center);
+            let height = line
+                .first()
+                .map(|entry| (entry.rect.top - entry.rect.bottom).abs())
+                .unwrap_or(10.0);
+            let line_right = line
+                .iter()
+                .map(|entry| entry.rect.right)
+                .fold(f32::MIN, f32::max);
+            if (reference - center).abs()
+                <= height.max(6.0) * config.tts.line_merge_vertical_tolerance
+                && (segment.rect.left - line_right) <= config.tts.column_split_min_gap * 0.5
+            {
+                line.push(segment.clone());
+                placed = true;
+                break;
+            }
+        }
+        if !placed {
+            lines.push(vec![segment]);
+        }
+    }
+
+    lines
+        .into_iter()
+        .map(|mut line| {
+            line.sort_by(|a, b| {
+                a.rect
+                    .left
+                    .partial_cmp(&b.rect.left)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            let text = line
+                .iter()
+                .map(|segment| segment.text.trim())
+                .filter(|text| !text.is_empty())
+                .collect::<Vec<_>>()
+                .join(" ");
+            let left = line.first().map(|segment| segment.rect.left).unwrap_or(0.0);
+            let top = line
+                .iter()
+                .map(|segment| segment.rect.top)
+                .fold(f32::MIN, f32::max);
+            let bottom = line
+                .iter()
+                .map(|segment| segment.rect.bottom)
+                .fold(f32::MAX, f32::min);
+            PositionedLine {
+                text,
+                left,
+                top,
+                bottom,
+            }
+        })
+        .filter(|line| !line.text.trim().is_empty())
+        .collect()
+}
+
+fn reorder_lines_by_columns(
+    mut lines: Vec<PositionedLine>,
+    config: &AppConfig,
+    stats: &mut PageExtractionStats,
+) -> Vec<PositionedLine> {
+    if lines.len() < config.tts.column_detection_min_lines {
+        lines.sort_by(|a, b| {
+            b.top
+                .partial_cmp(&a.top)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| {
+                    a.left
+                        .partial_cmp(&b.left)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+        });
+        return lines;
+    }
+
+    let mut lefts = lines.iter().map(|line| line.left).collect::<Vec<_>>();
+    lefts.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let mut split_at = None;
+    let mut biggest_gap = 0.0f32;
+    for pair in lefts.windows(2) {
+        let gap = pair[1] - pair[0];
+        if gap > biggest_gap {
+            biggest_gap = gap;
+            split_at = Some(pair[0] + gap * 0.5);
+        }
+    }
+
+    if biggest_gap < config.tts.column_split_min_gap {
+        lines.sort_by(|a, b| {
+            b.top
+                .partial_cmp(&a.top)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| {
+                    a.left
+                        .partial_cmp(&b.left)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+        });
+        return lines;
+    }
+
+    let split = split_at.unwrap_or(0.0);
+    let mut left_column = lines
+        .iter()
+        .filter(|line| line.left <= split)
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut right_column = lines
+        .iter()
+        .filter(|line| line.left > split)
+        .cloned()
+        .collect::<Vec<_>>();
+    if left_column.len() < 2 || right_column.len() < 2 {
+        lines.sort_by(|a, b| {
+            b.top
+                .partial_cmp(&a.top)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| {
+                    a.left
+                        .partial_cmp(&b.left)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+        });
+        return lines;
+    }
+
+    left_column.sort_by(|a, b| {
+        b.top
+            .partial_cmp(&a.top)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    right_column.sort_by(|a, b| {
+        b.top
+            .partial_cmp(&a.top)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    stats.column_reorders += 1;
+    left_column.into_iter().chain(right_column).collect()
+}
+
+fn build_blocks_from_lines(lines: &[PositionedLine], config: &AppConfig) -> Vec<String> {
+    let mut blocks = Vec::new();
+    let mut current = Vec::new();
+    let mut previous: Option<&PositionedLine> = None;
+
+    for line in lines {
+        let should_break = previous.is_some_and(|prev| {
+            let gap = (prev.bottom - line.top).abs();
+            let height = (prev.top - prev.bottom).abs().max(8.0);
+            gap > height * config.tts.block_vertical_gap_multiplier
+                || (prev.left - line.left).abs() > config.tts.column_split_min_gap * 0.5
+        });
+        if should_break && !current.is_empty() {
+            blocks.push(current.join("\n"));
+            current.clear();
+        }
+        current.push(line.text.clone());
+        previous = Some(line);
+    }
+
+    if !current.is_empty() {
+        blocks.push(current.join("\n"));
+    }
+
+    blocks
+}
+
+fn split_sentences(text: &str, config: &AppConfig) -> Vec<(TextRange, String)> {
     let mut out = Vec::new();
-    let abbreviation_set: HashSet<String> = abbreviations
+    let abbreviation_set: HashSet<String> = config
+        .tts
+        .abbreviations
         .iter()
         .map(|value| value.trim().to_ascii_lowercase())
         .collect();
+    let boundary_markers = config
+        .tts
+        .sentence_boundary_markers
+        .iter()
+        .filter_map(|marker| marker.chars().next())
+        .collect::<HashSet<_>>();
     let bytes = text.as_bytes();
     let mut start = 0usize;
     let mut index = 0usize;
@@ -1226,7 +1563,7 @@ fn split_sentences(text: &str, abbreviations: &[String]) -> Vec<(TextRange, Stri
         let ch = text[index..].chars().next().unwrap_or_default();
         let ch_len = ch.len_utf8();
         let should_break = match ch {
-            '.' | '!' | '?' => {
+            marker if boundary_markers.contains(&marker) => {
                 let candidate = text[start..index + ch_len].trim();
                 let last_token = candidate
                     .split_whitespace()
@@ -1237,9 +1574,25 @@ fn split_sentences(text: &str, abbreviations: &[String]) -> Vec<(TextRange, Stri
                     })
                     .to_ascii_lowercase();
                 let next_non_ws = text[index + ch_len..].chars().find(|c| !c.is_whitespace());
-                !abbreviation_set.contains(&last_token) && next_non_ws.is_some()
+                !abbreviation_set.contains(&last_token)
+                    && next_non_ws.is_some_and(|next| {
+                        if config.tts.language.starts_with("en")
+                            || config.tts.language.starts_with("es")
+                        {
+                            next.is_uppercase()
+                                || matches!(
+                                    next,
+                                    '"' | '\'' | '(' | '[' | '{' | '\u{00BF}' | '\u{00A1}'
+                                )
+                        } else {
+                            true
+                        }
+                    })
             }
-            '\n' => text[index + ch_len..].starts_with('\n'),
+            '\n' => {
+                config.tts.sentence_break_on_double_newline
+                    && text[index + ch_len..].starts_with('\n')
+            }
             _ => false,
         };
 
@@ -1306,6 +1659,10 @@ struct PageNormalizationStats {
     repeated_edge_lines_removed: usize,
     joined_hyphenations: usize,
     collapsed_whitespace_runs: usize,
+    table_like_blocks: usize,
+    caption_like_blocks: usize,
+    footnote_like_blocks: usize,
+    sidenote_like_blocks: usize,
 }
 
 #[derive(Debug)]
@@ -1318,6 +1675,27 @@ struct NormalizedPageText {
 #[derive(Debug, Clone)]
 struct NormalizedBlockText {
     lines: Vec<String>,
+}
+
+#[derive(Debug, Default, Clone)]
+struct PageExtractionStats {
+    rotated_segments_suppressed: usize,
+    duplicate_segments_suppressed: usize,
+    column_reorders: usize,
+}
+
+#[derive(Debug, Clone)]
+struct ExtractedPageText {
+    text: String,
+    stats: PageExtractionStats,
+}
+
+#[derive(Debug, Clone)]
+struct PositionedLine {
+    text: String,
+    left: f32,
+    top: f32,
+    bottom: f32,
 }
 
 fn normalize_page_text(
@@ -1419,6 +1797,22 @@ fn normalize_page_text(
         .filter(|block| block.lines.join(" ").chars().count() >= config.tts.min_chars_per_line_kept)
         .collect::<Vec<_>>();
 
+    for block in &blocks {
+        let joined = block.lines.join(" ");
+        if is_table_like_block(&joined) {
+            stats.table_like_blocks += 1;
+        }
+        if is_caption_like_block(&joined) {
+            stats.caption_like_blocks += 1;
+        }
+        if is_footnote_like_block(&joined) {
+            stats.footnote_like_blocks += 1;
+        }
+        if is_sidenote_like_block(block) {
+            stats.sidenote_like_blocks += 1;
+        }
+    }
+
     let text = blocks
         .iter()
         .map(|block| block.lines.join(" "))
@@ -1451,6 +1845,37 @@ fn collapse_inline_whitespace(line: &str, stats: &mut PageNormalizationStats) ->
     }
 
     out.trim().to_string()
+}
+
+fn is_table_like_block(text: &str) -> bool {
+    let tokens = text.split_whitespace().collect::<Vec<_>>();
+    let numeric_tokens = tokens
+        .iter()
+        .filter(|token| token.chars().any(|ch| ch.is_ascii_digit()))
+        .count();
+    tokens.len() >= 4 && numeric_tokens * 2 >= tokens.len()
+}
+
+fn is_caption_like_block(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    lower.starts_with("figure ")
+        || lower.starts_with("fig. ")
+        || lower.starts_with("table ")
+        || lower.starts_with("caption ")
+}
+
+fn is_footnote_like_block(text: &str) -> bool {
+    text.chars()
+        .next()
+        .is_some_and(|ch| ch.is_ascii_digit() || matches!(ch, '*' | '\u{2020}'))
+}
+
+fn is_sidenote_like_block(block: &NormalizedBlockText) -> bool {
+    block.lines.len() <= 2
+        && block
+            .lines
+            .iter()
+            .all(|line| line.split_whitespace().count() <= 6)
 }
 
 fn collect_repeated_edge_lines(
@@ -1710,6 +2135,7 @@ mod tests {
                         start_page: 0,
                         end_page: 0,
                     },
+                    unit_kind: SentenceUnitKind::Sentence,
                 })
                 .collect(),
             pages: Vec::new(),
@@ -1754,6 +2180,176 @@ mod tests {
     }
 
     #[test]
+    fn extractor_reorders_simple_two_column_layout() {
+        let config = AppConfig::default();
+        let extracted = extract_page_text_for_tts(
+            &[
+                TextSegmentData {
+                    text: "Right one".into(),
+                    rect: PdfRectData {
+                        left: 300.0,
+                        right: 360.0,
+                        top: 780.0,
+                        bottom: 768.0,
+                    },
+                },
+                TextSegmentData {
+                    text: "Left one".into(),
+                    rect: PdfRectData {
+                        left: 40.0,
+                        right: 96.0,
+                        top: 780.0,
+                        bottom: 768.0,
+                    },
+                },
+                TextSegmentData {
+                    text: "Left two".into(),
+                    rect: PdfRectData {
+                        left: 40.0,
+                        right: 96.0,
+                        top: 744.0,
+                        bottom: 732.0,
+                    },
+                },
+                TextSegmentData {
+                    text: "Right two".into(),
+                    rect: PdfRectData {
+                        left: 300.0,
+                        right: 362.0,
+                        top: 744.0,
+                        bottom: 732.0,
+                    },
+                },
+            ],
+            &config,
+        );
+
+        assert!(extracted.text.starts_with("Left one"));
+        let left_one = extracted.text.find("Left one").unwrap_or(usize::MAX);
+        let left_two = extracted.text.find("Left two").unwrap_or(usize::MAX);
+        let right_one = extracted.text.find("Right one").unwrap_or(usize::MAX);
+        let right_two = extracted.text.find("Right two").unwrap_or(usize::MAX);
+        assert!(left_one < left_two);
+        assert!(left_two < right_one);
+        assert!(right_one < right_two);
+        assert_eq!(extracted.stats.column_reorders, 1);
+    }
+
+    #[test]
+    fn extractor_suppresses_rotated_and_duplicate_segments() {
+        let config = AppConfig::default();
+        let extracted = extract_page_text_for_tts(
+            &[
+                TextSegmentData {
+                    text: "Alpha".into(),
+                    rect: PdfRectData {
+                        left: 10.0,
+                        right: 60.0,
+                        top: 100.0,
+                        bottom: 90.0,
+                    },
+                },
+                TextSegmentData {
+                    text: "Alpha".into(),
+                    rect: PdfRectData {
+                        left: 10.0,
+                        right: 60.0,
+                        top: 100.0,
+                        bottom: 90.0,
+                    },
+                },
+                TextSegmentData {
+                    text: "Rotated".into(),
+                    rect: PdfRectData {
+                        left: 200.0,
+                        right: 205.0,
+                        top: 160.0,
+                        bottom: 100.0,
+                    },
+                },
+            ],
+            &config,
+        );
+
+        assert_eq!(extracted.text, "Alpha");
+        assert_eq!(extracted.stats.duplicate_segments_suppressed, 1);
+        assert_eq!(extracted.stats.rotated_segments_suppressed, 1);
+    }
+
+    #[test]
+    fn sentence_splitter_respects_citations_and_lowercase_continuations() {
+        let config = AppConfig::default();
+        let sentences = split_sentences("See Smith et al. for context. then continue.", &config);
+
+        assert_eq!(sentences.len(), 1);
+    }
+
+    #[test]
+    fn sentence_planner_falls_back_to_blocks_when_punctuation_is_weak() {
+        let mut config = AppConfig::default();
+        config.tts.sentence_break_on_double_newline = false;
+        config.tts.block_fallback_min_chars = 8;
+        let canonical = CanonicalTtsTextArtifact {
+            text: "alpha beta gamma delta epsilon\n\nzeta eta theta iota kappa".into(),
+            pages: vec![CanonicalPageArtifact {
+                page_index: 0,
+                range: Some(TextRange { start: 0, end: 58 }),
+                blocks: vec![
+                    CanonicalBlockArtifact {
+                        page_index: 0,
+                        block_index: 0,
+                        text: "alpha beta gamma delta epsilon".into(),
+                        range: TextRange { start: 0, end: 30 },
+                        lines: vec![],
+                    },
+                    CanonicalBlockArtifact {
+                        page_index: 0,
+                        block_index: 1,
+                        text: "zeta eta theta iota kappa".into(),
+                        range: TextRange { start: 32, end: 58 },
+                        lines: vec![],
+                    },
+                ],
+            }],
+            block_count: 2,
+            line_count: 2,
+            token_count: 10,
+        };
+
+        let planned = build_sentence_plan(&canonical, "fixture", &config);
+        assert_eq!(planned.len(), 2);
+        assert!(
+            planned
+                .iter()
+                .all(|sentence| sentence.unit_kind == SentenceUnitKind::BlockFallback)
+        );
+    }
+
+    #[test]
+    fn normalization_marks_table_and_caption_like_blocks() {
+        let config = AppConfig::default();
+        let repeated = HashSet::new();
+        let normalized = normalize_page_text(
+            "Table 1 Revenue 2024 2025\n10 20 30 40\n\nFigure 1 Sample caption",
+            &repeated,
+            &config,
+        );
+
+        assert!(normalized.stats.table_like_blocks >= 1);
+        assert!(normalized.stats.caption_like_blocks >= 1);
+    }
+
+    #[test]
+    fn normalization_joins_hyphenated_line_wraps() {
+        let config = AppConfig::default();
+        let repeated = HashSet::new();
+        let normalized = normalize_page_text("coordi-\nnated text", &repeated, &config);
+
+        assert!(normalized.text.contains("coordinated text"));
+        assert_eq!(normalized.stats.joined_hyphenations, 1);
+    }
+
+    #[test]
     fn prepare_sentence_clip_writes_tone_preview_files() {
         let temp = tempfile::tempdir().unwrap();
         let source_path = temp.path().join("fixture.pdf");
@@ -1779,6 +2375,7 @@ mod tests {
                     start_page: 0,
                     end_page: 0,
                 },
+                unit_kind: SentenceUnitKind::Sentence,
             }],
             pages: Vec::new(),
             stats: NormalizationStats::default(),
@@ -1896,6 +2493,7 @@ mod tests {
                     start_page: 0,
                     end_page: 0,
                 },
+                unit_kind: SentenceUnitKind::Sentence,
             }],
             pages: Vec::new(),
             stats: NormalizationStats::default(),

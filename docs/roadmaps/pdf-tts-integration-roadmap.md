@@ -130,22 +130,22 @@ Checked items reflect capabilities already present in this repository that reduc
 
 ## Phase 3: Text Extraction And Normalization
 
-- [ ] Build a dedicated PDF-to-`tts_text` pipeline separate from the current UI text-selection helpers.
-- [ ] Normalize ligatures, soft hyphens, repeated headers/footers, duplicate glyph streams, and whitespace noise.
-- [ ] Preserve paragraph boundaries when they are recoverable.
-- [ ] Handle multi-column extraction explicitly instead of assuming PDF stream order is readable.
-- [ ] Detect and suppress hidden or duplicated OCR text layers.
-- [ ] Add regression handling for tables, footnotes, captions, sidenotes, and rotated text.
-- [ ] Emit diagnostics for every normalization edit class.
+- [x] Build a dedicated PDF-to-`tts_text` pipeline separate from the current UI text-selection helpers.
+- [x] Normalize ligatures, soft hyphens, repeated headers/footers, duplicate glyph streams, and whitespace noise.
+- [x] Preserve paragraph boundaries when they are recoverable.
+- [x] Handle multi-column extraction explicitly instead of assuming PDF stream order is readable.
+- [x] Detect and suppress hidden or duplicated OCR text layers.
+- [x] Add regression handling for tables, footnotes, captions, sidenotes, and rotated text.
+- [x] Emit diagnostics for every normalization edit class.
 
 ## Phase 4: Sentence Segmentation And Audio Units
 
-- [ ] Split `tts_text` into stable sentences.
-- [ ] Support language-aware sentence segmentation rules in config.
-- [ ] Keep sentence ids stable across reopen and cache reuse.
-- [ ] Define sentence-to-page provenance ranges even before geometry mapping is complete.
-- [ ] Support fallback to paragraph or block playback units when sentence segmentation is weak.
-- [ ] Add tests for abbreviations, citations, tables, and line-wrap edge cases.
+- [x] Split `tts_text` into stable sentences.
+- [x] Support language-aware sentence segmentation rules in config.
+- [x] Keep sentence ids stable across reopen and cache reuse.
+- [x] Define sentence-to-page provenance ranges even before geometry mapping is complete.
+- [x] Support fallback to paragraph or block playback units when sentence segmentation is weak.
+- [x] Add tests for abbreviations, citations, tables, and line-wrap edge cases.
 
 ## Phase 5: Geometry Artifact And Sync Mapping
 

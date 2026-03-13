@@ -159,6 +159,46 @@ impl AppConfig {
             .set_default("tts.voice", defaults.tts.voice.clone())?
             .set_default("tts.rate", f64::from(defaults.tts.rate))?
             .set_default("tts.volume", f64::from(defaults.tts.volume))?
+            .set_default(
+                "tts.sentence_boundary_markers",
+                defaults.tts.sentence_boundary_markers.clone(),
+            )?
+            .set_default(
+                "tts.sentence_break_on_double_newline",
+                defaults.tts.sentence_break_on_double_newline,
+            )?
+            .set_default(
+                "tts.min_sentence_chars",
+                defaults.tts.min_sentence_chars as i64,
+            )?
+            .set_default(
+                "tts.block_fallback_min_chars",
+                defaults.tts.block_fallback_min_chars as i64,
+            )?
+            .set_default(
+                "tts.line_merge_vertical_tolerance",
+                f64::from(defaults.tts.line_merge_vertical_tolerance),
+            )?
+            .set_default(
+                "tts.column_split_min_gap",
+                f64::from(defaults.tts.column_split_min_gap),
+            )?
+            .set_default(
+                "tts.column_detection_min_lines",
+                defaults.tts.column_detection_min_lines as i64,
+            )?
+            .set_default(
+                "tts.block_vertical_gap_multiplier",
+                f64::from(defaults.tts.block_vertical_gap_multiplier),
+            )?
+            .set_default(
+                "tts.suppress_rotated_narrow_segments",
+                defaults.tts.suppress_rotated_narrow_segments,
+            )?
+            .set_default(
+                "tts.rotated_segment_aspect_ratio",
+                f64::from(defaults.tts.rotated_segment_aspect_ratio),
+            )?
             .set_default("tts.ocr_policy", defaults.tts.ocr_policy.as_str())?
             .set_default(
                 "tts.ocr_min_confidence",
@@ -587,6 +627,16 @@ pub struct TtsConfig {
     pub voice: String,
     pub rate: f32,
     pub volume: f32,
+    pub sentence_boundary_markers: Vec<String>,
+    pub sentence_break_on_double_newline: bool,
+    pub min_sentence_chars: usize,
+    pub block_fallback_min_chars: usize,
+    pub line_merge_vertical_tolerance: f32,
+    pub column_split_min_gap: f32,
+    pub column_detection_min_lines: usize,
+    pub block_vertical_gap_multiplier: f32,
+    pub suppress_rotated_narrow_segments: bool,
+    pub rotated_segment_aspect_ratio: f32,
     pub ocr_policy: TtsOcrPolicy,
     pub ocr_min_confidence: f32,
     pub sentence_prefetch: usize,
@@ -619,6 +669,16 @@ impl Default for TtsConfig {
             voice: "default".into(),
             rate: 1.0,
             volume: 1.0,
+            sentence_boundary_markers: vec![".".into(), "!".into(), "?".into()],
+            sentence_break_on_double_newline: true,
+            min_sentence_chars: 8,
+            block_fallback_min_chars: 32,
+            line_merge_vertical_tolerance: 0.75,
+            column_split_min_gap: 96.0,
+            column_detection_min_lines: 4,
+            block_vertical_gap_multiplier: 1.8,
+            suppress_rotated_narrow_segments: true,
+            rotated_segment_aspect_ratio: 3.0,
             ocr_policy: TtsOcrPolicy::Deferred,
             ocr_min_confidence: 0.85,
             sentence_prefetch: 8,

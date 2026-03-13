@@ -4,7 +4,7 @@
 
 The current build is no longer just a minimal viewer. It includes thumbnail navigation, cached page renders, large-page tiled rendering, comparison presets, a pixel inspector, benchmark export, persisted session state, layered TOML config, and file-backed tracing.
 
-It also now includes the first four PDF TTS tranches plus completed Phase 1 and Phase 2 roadmap work: canonical PDF text analysis with page/block/line/token provenance, stable sentence ids, persisted trust classification summaries, a tone-preview playback backend, ahead-of-time clip preparation, cached sentence-to-PDF sync targets, confidence-scored overlays, OCR/degraded-mode runtime policy, viewport-local TTS budgeting, and tranche-level diagnostics. OCR-backed text extraction and stronger alignment still remain future work.
+It also now includes the first four PDF TTS tranches plus completed Phase 1 through Phase 4 roadmap work: canonical PDF text analysis with page/block/line/token provenance, a dedicated segment-based TTS extraction pipeline, explicit multi-column ordering, normalization heuristics for duplicate/rotated text and boilerplate, stable sentence ids, configurable sentence boundary rules, block-fallback playback units, persisted trust classification summaries, a tone-preview playback backend, ahead-of-time clip preparation, cached sentence-to-PDF sync targets, confidence-scored overlays, OCR/degraded-mode runtime policy, viewport-local TTS budgeting, and tranche-level diagnostics. OCR-backed text extraction and stronger alignment still remain future work.
 
 ## Stack
 
@@ -29,11 +29,13 @@ It also now includes the first four PDF TTS tranches plus completed Phase 1 and 
 - Write logs to stdout and a file sink
 - Build and inspect canonical PDF TTS analysis artifacts in the background when a document opens
 - Persist canonical TTS artifacts with sentence provenance and classification summaries in a stable sidecar
+- Extract TTS text from PDF segments with explicit line/block/column handling instead of relying on the viewer text layer
 - Exercise a tone-preview TTS runtime with play/pause, sentence stepping, direct sentence seek, follow mode, and cached prepared clips
 - Highlight the active spoken sentence on the PDF with exact, fuzzy, block, or page-level fallback behavior
 - Apply OCR/degraded-mode policy so scan-first PDFs degrade honestly instead of pretending sentence-accurate sync exists
 - Track TTS prep, sync, activation latency, and cache-hit diagnostics while keeping runtime state bounded around the viewport
 - Keep TTS sentence ids stable across reopen, search activation, zoom, and view-mode changes
+- Fall back from sentence units to block units when punctuation or reading order is too weak for reliable sentence planning
 
 ## Pdfium Runtime
 
