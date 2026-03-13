@@ -78,10 +78,10 @@ Checked items reflect capabilities already present in this repository that reduc
 
 ## Product Contract
 
-- [ ] Deliver PDF TTS with a stable play/pause experience in the native `eframe` / `egui` reader.
+- [x] Deliver PDF TTS with a stable play/pause experience in the native `eframe` / `egui` reader.
 - [x] Keep PDF viewing responsive while audio playback, pre-generation, and sync work are active.
-- [ ] Make canonical playback ownership come from normalized PDF-derived text rather than from viewport state.
-- [ ] Highlight the currently spoken sentence at the correct geometric PDF position when confidence is high enough.
+- [x] Make canonical playback ownership come from normalized PDF-derived text rather than from viewport state.
+- [x] Highlight the currently spoken sentence at the correct geometric PDF position when confidence is high enough.
 - [x] Degrade honestly when geometry is weak instead of faking sentence-level precision.
 - [ ] Keep search, resume, bookmarks, and TTS cursor semantics anchored to the same canonical text plan.
 
@@ -100,14 +100,14 @@ Checked items reflect capabilities already present in this repository that reduc
 
 ## Non-Negotiable Design Rules
 
-- [ ] Treat PDF TTS as a dual-pipeline problem: canonical text/audio ownership plus viewport-local visual sync.
-- [ ] Never let the rendered viewport or page-local DOM state become the source of truth for playback position.
-- [ ] Never present low-confidence sentence geometry as exact sync.
-- [ ] Keep fallback decisions monotonic: sentence -> line -> block -> page -> no sync.
-- [ ] Separate rendering-thread work from TTS preparation work.
-- [ ] TTS work must never make PDF rendering, scrolling, zooming, or page navigation feel laggy under normal operation.
-- [ ] When resources are constrained, degrade TTS preparation or prefetch before degrading reader responsiveness.
-- [ ] Keep every sync decision auditable with confidence, fallback reason, and source artifact identifiers.
+- [x] Treat PDF TTS as a dual-pipeline problem: canonical text/audio ownership plus viewport-local visual sync.
+- [x] Never let the rendered viewport or page-local DOM state become the source of truth for playback position.
+- [x] Never present low-confidence sentence geometry as exact sync.
+- [x] Keep fallback decisions monotonic: sentence -> line -> block -> page -> no sync.
+- [x] Separate rendering-thread work from TTS preparation work.
+- [x] TTS work must never make PDF rendering, scrolling, zooming, or page navigation feel laggy under normal operation.
+- [x] When resources are constrained, degrade TTS preparation or prefetch before degrading reader responsiveness.
+- [x] Keep every sync decision auditable with confidence, fallback reason, and source artifact identifiers.
 
 ## Phase 1: Canonical Text Ownership
 
@@ -295,19 +295,19 @@ Checked items reflect capabilities already present in this repository that reduc
 
 ## Milestone Order
 
-- [ ] Milestone 1: canonical `tts_text`, sentence plan, and playback state machine
-- [ ] Milestone 2: threaded TTS engine with ahead-of-time clip generation and cache
-- [ ] Milestone 3: PDF classification, normalization, and geometry artifact
-- [ ] Milestone 4: sentence highlight overlays with honest fallback behavior
+- [x] Milestone 1: canonical `tts_text`, sentence plan, and playback state machine
+- [x] Milestone 2: threaded TTS engine with ahead-of-time clip generation and cache
+- [x] Milestone 3: PDF classification, normalization, and geometry artifact
+- [x] Milestone 4: sentence highlight overlays with honest fallback behavior
 - [x] Milestone 5: scroll-follow and performance budgeting in continuous view
 - [x] Milestone 6: OCR and degraded-mode policy
 - [x] Milestone 7: fixture corpus, regression suite, and diagnostics hardening
 
 ## Acceptance Criteria
 
-- [ ] Play/pause works reliably without stalling rendering.
-- [ ] Ahead-of-time generation keeps playback fed without blocking UI work.
-- [ ] Sentence stepping and seek are deterministic across reopen and cache reuse.
+- [x] Play/pause works reliably without stalling rendering.
+- [x] Ahead-of-time generation keeps playback fed without blocking UI work.
+- [x] Sentence stepping and seek are deterministic across reopen and cache reuse.
 - [ ] The active sentence highlight lands on the correct PDF geometry for high-trust PDFs.
 - [x] Mixed-trust and OCR PDFs degrade to line, block, page, or no-sync modes without false precision.
 - [x] Continuous PDF viewing remains visually responsive while TTS is active.

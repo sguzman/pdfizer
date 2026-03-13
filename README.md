@@ -127,3 +127,4 @@ RUST_LOG=pdfizer=trace cargo run
 The active implementation checklist lives in [docs/roadmap.md](/win/linux/Code/rust/pdfizer/docs/roadmap.md).
 The PDF-specific TTS integration plan lives in [docs/roadmaps/pdf-tts-integration-roadmap.md](/win/linux/Code/rust/pdfizer/docs/roadmaps/pdf-tts-integration-roadmap.md).
 Manual QA gates for PDF TTS live in [docs/qa/pdf-tts-manual-checklist.md](/win/linux/Code/rust/pdfizer/docs/qa/pdf-tts-manual-checklist.md) and [docs/qa/pdf-tts-acceptance-gates.md](/win/linux/Code/rust/pdfizer/docs/qa/pdf-tts-acceptance-gates.md).
+The remaining open roadmap items are the explicit manual QA verification steps for real PDFs and captured evidence.
