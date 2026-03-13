@@ -58,6 +58,61 @@ pub struct PageRange {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CanonicalTokenArtifact {
+    pub page_index: usize,
+    pub block_index: usize,
+    pub line_index: usize,
+    pub token_index: usize,
+    pub text: String,
+    pub range: TextRange,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CanonicalLineArtifact {
+    pub page_index: usize,
+    pub block_index: usize,
+    pub line_index: usize,
+    pub text: String,
+    pub range: TextRange,
+    pub tokens: Vec<CanonicalTokenArtifact>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CanonicalBlockArtifact {
+    pub page_index: usize,
+    pub block_index: usize,
+    pub text: String,
+    pub range: TextRange,
+    pub lines: Vec<CanonicalLineArtifact>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CanonicalPageArtifact {
+    pub page_index: usize,
+    pub range: Option<TextRange>,
+    pub blocks: Vec<CanonicalBlockArtifact>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CanonicalTtsTextArtifact {
+    pub text: String,
+    pub pages: Vec<CanonicalPageArtifact>,
+    pub block_count: usize,
+    pub line_count: usize,
+    pub token_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClassificationSummary {
+    pub coverage_ratio: f32,
+    pub duplicate_ratio: f32,
+    pub boilerplate_ratio: f32,
+    pub avg_chars_per_text_page: f32,
+    pub avg_segments_per_text_page: f32,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SentencePlan {
     pub id: u64,
     pub text: String,
@@ -100,7 +155,9 @@ pub struct TtsAnalysisArtifacts {
     pub generated_at_unix_secs: u64,
     pub mode: PdfTtsMode,
     pub confidence: f32,
+    pub classification: ClassificationSummary,
     pub tts_text: String,
+    pub canonical_text: CanonicalTtsTextArtifact,
     pub sentences: Vec<SentencePlan>,
     pub pages: Vec<PageTtsArtifact>,
     pub stats: NormalizationStats,
@@ -315,6 +372,13 @@ pub fn persist_artifacts(config: &AppConfig, artifacts: &TtsAnalysisArtifacts) -
     Ok(path)
 }
 
+pub fn sentence_index_for_id(analysis: &TtsAnalysisArtifacts, sentence_id: u64) -> Option<usize> {
+    analysis
+        .sentences
+        .iter()
+        .position(|sentence| sentence.id == sentence_id)
+}
+
 pub fn build_prefetch_plan(
     analysis: &TtsAnalysisArtifacts,
     start_sentence_index: usize,
@@ -526,6 +590,13 @@ pub fn estimate_sentence_duration_ms(text: &str, rate: f32) -> u64 {
         * 120;
     let base = (word_count * 360 + punctuation_pause).clamp(900, 12_000) as f32;
     (base / rate.max(0.25)).round() as u64
+}
+
+#[derive(Debug, Clone)]
+struct ClassificationResult {
+    mode: PdfTtsMode,
+    confidence: f32,
+    summary: ClassificationSummary,
 }
 
 pub fn compute_sentence_sync_from_document(
@@ -798,6 +869,10 @@ pub fn build_artifacts_from_document(
     let mut stats = NormalizationStats::default();
     let mut full_text = String::new();
     let mut pages = Vec::with_capacity(document.metadata.page_count);
+    let mut canonical_pages = Vec::with_capacity(document.metadata.page_count);
+    let mut block_count = 0usize;
+    let mut line_count = 0usize;
+    let mut token_count = 0usize;
 
     for page_index in 0..document.metadata.page_count {
         let page_text = document.full_text_for_page(page_index)?;
@@ -826,6 +901,11 @@ pub fn build_artifacts_from_document(
                 empty_after_normalization: true,
                 range: None,
             });
+            canonical_pages.push(CanonicalPageArtifact {
+                page_index,
+                range: None,
+                blocks: Vec::new(),
+            });
             continue;
         }
 
@@ -834,8 +914,15 @@ pub fn build_artifacts_from_document(
             full_text.push_str("\n\n");
         }
         let start = full_text.len();
-        full_text.push_str(&normalized.text);
+        let page_blocks = append_page_to_canonical_text(
+            &mut full_text,
+            page_index,
+            &normalized,
+            &mut line_count,
+            &mut token_count,
+        );
         let end = full_text.len();
+        block_count += page_blocks.len();
 
         pages.push(PageTtsArtifact {
             page_index,
@@ -847,21 +934,35 @@ pub fn build_artifacts_from_document(
             empty_after_normalization: false,
             range: Some(TextRange { start, end }),
         });
+        canonical_pages.push(CanonicalPageArtifact {
+            page_index,
+            range: Some(TextRange { start, end }),
+            blocks: page_blocks,
+        });
     }
 
-    let sentences = build_sentence_plan(&full_text, &pages, &fingerprint, config);
+    let canonical_text = CanonicalTtsTextArtifact {
+        text: full_text.clone(),
+        pages: canonical_pages,
+        block_count,
+        line_count,
+        token_count,
+    };
+
+    let sentences = build_sentence_plan(&canonical_text, &fingerprint, config);
     stats.sentence_count = sentences.len();
 
-    let (mode, confidence) =
-        classify_pdf_for_tts(document.metadata.page_count, &pages, &stats, config);
+    let classification = classify_pdf_for_tts(document.metadata.page_count, &pages, &stats, config);
 
     let mut artifacts = TtsAnalysisArtifacts {
         source_path: source_path.to_path_buf(),
         source_fingerprint: fingerprint,
         generated_at_unix_secs: unix_timestamp_secs(),
-        mode,
-        confidence,
-        tts_text: full_text,
+        mode: classification.mode,
+        confidence: classification.confidence,
+        classification: classification.summary,
+        tts_text: canonical_text.text.clone(),
+        canonical_text,
         sentences,
         pages,
         stats,
@@ -877,6 +978,10 @@ pub fn build_artifacts_from_document(
         confidence = artifacts.confidence,
         sentences = artifacts.sentences.len(),
         chars = artifacts.stats.normalized_chars,
+        blocks = artifacts.canonical_text.block_count,
+        lines = artifacts.canonical_text.line_count,
+        tokens = artifacts.canonical_text.token_count,
+        classification_reason = %artifacts.classification.reason,
         artifact = %artifact_path.display(),
         "built PDF TTS analysis artifacts"
     );
@@ -889,13 +994,36 @@ fn classify_pdf_for_tts(
     pages: &[PageTtsArtifact],
     stats: &NormalizationStats,
     config: &AppConfig,
-) -> (PdfTtsMode, f32) {
+) -> ClassificationResult {
     if stats.normalized_chars == 0 || stats.pages_with_text == 0 {
-        return (PdfTtsMode::OcrRequired, 0.05);
+        return ClassificationResult {
+            mode: PdfTtsMode::OcrRequired,
+            confidence: 0.05,
+            summary: ClassificationSummary {
+                coverage_ratio: 0.0,
+                duplicate_ratio: 0.0,
+                boilerplate_ratio: 0.0,
+                avg_chars_per_text_page: 0.0,
+                avg_segments_per_text_page: 0.0,
+                reason: "no_usable_embedded_text".into(),
+            },
+        };
     }
 
     if stats.sentence_count == 0 {
-        return (PdfTtsMode::RenderOnlyNoSync, 0.15);
+        return ClassificationResult {
+            mode: PdfTtsMode::RenderOnlyNoSync,
+            confidence: 0.15,
+            summary: ClassificationSummary {
+                coverage_ratio: stats.pages_with_text as f32 / total_pages.max(1) as f32,
+                duplicate_ratio: 0.0,
+                boilerplate_ratio: 0.0,
+                avg_chars_per_text_page: stats.normalized_chars as f32
+                    / stats.pages_with_text.max(1) as f32,
+                avg_segments_per_text_page: 0.0,
+                reason: "text_present_but_sentence_plan_empty".into(),
+            },
+        };
     }
 
     let coverage_ratio = stats.pages_with_text as f32 / total_pages.max(1) as f32;
@@ -923,26 +1051,47 @@ fn classify_pdf_for_tts(
             + (coverage_ratio * 0.1)
             + (avg_segments_per_text_page.min(120.0) / 120.0) * 0.08)
             .clamp(0.0, 0.98);
-        return (PdfTtsMode::HighTextTrust, confidence);
+        return ClassificationResult {
+            mode: PdfTtsMode::HighTextTrust,
+            confidence,
+            summary: ClassificationSummary {
+                coverage_ratio,
+                duplicate_ratio,
+                boilerplate_ratio,
+                avg_chars_per_text_page,
+                avg_segments_per_text_page,
+                reason: "embedded_text_meets_high_trust_thresholds".into(),
+            },
+        };
     }
 
     let mixed_confidence = (0.35
         + (coverage_ratio * 0.2)
         + ((avg_chars_per_text_page / config.tts.min_chars_per_text_page.max(1) as f32) * 0.05))
         .clamp(0.0, 0.7);
-    (PdfTtsMode::MixedTextTrust, mixed_confidence)
+    ClassificationResult {
+        mode: PdfTtsMode::MixedTextTrust,
+        confidence: mixed_confidence,
+        summary: ClassificationSummary {
+            coverage_ratio,
+            duplicate_ratio,
+            boilerplate_ratio,
+            avg_chars_per_text_page,
+            avg_segments_per_text_page,
+            reason: "embedded_text_usable_but_below_high_trust_thresholds".into(),
+        },
+    }
 }
 
 fn build_sentence_plan(
-    text: &str,
-    pages: &[PageTtsArtifact],
+    canonical_text: &CanonicalTtsTextArtifact,
     fingerprint: &str,
     config: &AppConfig,
 ) -> Vec<SentencePlan> {
-    split_sentences(text, &config.tts.abbreviations)
+    split_sentences(&canonical_text.text, &config.tts.abbreviations)
         .into_iter()
         .map(|(range, sentence)| {
-            let page_range = sentence_page_range(&range, pages);
+            let page_range = sentence_page_range(&range, &canonical_text.pages);
             let mut hasher = DefaultHasher::new();
             fingerprint.hash(&mut hasher);
             range.start.hash(&mut hasher);
@@ -958,7 +1107,7 @@ fn build_sentence_plan(
         .collect()
 }
 
-fn sentence_page_range(range: &TextRange, pages: &[PageTtsArtifact]) -> PageRange {
+fn sentence_page_range(range: &TextRange, pages: &[CanonicalPageArtifact]) -> PageRange {
     let mut start_page = 0;
     let mut end_page = 0;
 
@@ -986,6 +1135,81 @@ fn sentence_page_range(range: &TextRange, pages: &[PageTtsArtifact]) -> PageRang
         start_page,
         end_page,
     }
+}
+
+fn append_page_to_canonical_text(
+    full_text: &mut String,
+    page_index: usize,
+    normalized: &NormalizedPageText,
+    line_count: &mut usize,
+    token_count: &mut usize,
+) -> Vec<CanonicalBlockArtifact> {
+    let page_start = full_text.len();
+    let mut blocks = Vec::new();
+
+    for (block_index, block) in normalized.blocks.iter().enumerate() {
+        if block.lines.is_empty() {
+            continue;
+        }
+        if full_text.len() > page_start {
+            full_text.push_str("\n\n");
+        }
+        let block_start = full_text.len();
+        let mut lines = Vec::new();
+
+        for (line_index, line_text) in block.lines.iter().enumerate() {
+            let line_start = full_text.len();
+            let mut tokens = Vec::new();
+            for (token_index, token) in line_text.split_whitespace().enumerate() {
+                if full_text.len() > line_start {
+                    full_text.push(' ');
+                }
+                let token_start = full_text.len();
+                full_text.push_str(token);
+                let token_end = full_text.len();
+                tokens.push(CanonicalTokenArtifact {
+                    page_index,
+                    block_index,
+                    line_index,
+                    token_index,
+                    text: token.to_string(),
+                    range: TextRange {
+                        start: token_start,
+                        end: token_end,
+                    },
+                });
+                *token_count += 1;
+            }
+
+            let line_end = full_text.len();
+            lines.push(CanonicalLineArtifact {
+                page_index,
+                block_index,
+                line_index,
+                text: line_text.clone(),
+                range: TextRange {
+                    start: line_start,
+                    end: line_end,
+                },
+                tokens,
+            });
+            *line_count += 1;
+        }
+
+        let block_end = full_text.len();
+        blocks.push(CanonicalBlockArtifact {
+            page_index,
+            block_index,
+            text: full_text[block_start..block_end].to_string(),
+            range: TextRange {
+                start: block_start,
+                end: block_end,
+            },
+            lines,
+        });
+    }
+
+    blocks
 }
 
 fn split_sentences(text: &str, abbreviations: &[String]) -> Vec<(TextRange, String)> {
@@ -1088,6 +1312,12 @@ struct PageNormalizationStats {
 struct NormalizedPageText {
     text: String,
     stats: PageNormalizationStats,
+    blocks: Vec<NormalizedBlockText>,
+}
+
+#[derive(Debug, Clone)]
+struct NormalizedBlockText {
+    lines: Vec<String>,
 }
 
 fn normalize_page_text(
@@ -1142,48 +1372,64 @@ fn normalize_page_text(
         filtered_lines.push(compact);
     }
 
-    let mut paragraphs = Vec::new();
-    let mut current = String::new();
+    let mut blocks = Vec::new();
+    let mut current_block = Vec::new();
     for line in filtered_lines {
         if line.is_empty() {
-            if !current.is_empty() {
-                paragraphs.push(current.trim().to_string());
-                current.clear();
+            if !current_block.is_empty() {
+                blocks.push(NormalizedBlockText {
+                    lines: current_block.clone(),
+                });
+                current_block.clear();
             }
             continue;
         }
 
-        if current.is_empty() {
-            current.push_str(&line);
+        if current_block.is_empty() {
+            current_block.push(line);
             continue;
         }
 
-        if current.ends_with('-')
+        if current_block
+            .last()
+            .is_some_and(|current| current.ends_with('-'))
             && line
                 .chars()
                 .next()
                 .is_some_and(|ch| ch.is_ascii_lowercase())
         {
-            current.pop();
-            current.push_str(&line);
+            if let Some(current) = current_block.last_mut() {
+                current.pop();
+                current.push_str(&line);
+            }
             stats.joined_hyphenations += 1;
         } else {
-            current.push(' ');
-            current.push_str(&line);
+            current_block.push(line);
         }
     }
 
-    if !current.is_empty() {
-        paragraphs.push(current.trim().to_string());
+    if !current_block.is_empty() {
+        blocks.push(NormalizedBlockText {
+            lines: current_block,
+        });
     }
 
-    let text = paragraphs
+    let blocks = blocks
         .into_iter()
-        .filter(|paragraph| paragraph.chars().count() >= config.tts.min_chars_per_line_kept)
+        .filter(|block| block.lines.join(" ").chars().count() >= config.tts.min_chars_per_line_kept)
+        .collect::<Vec<_>>();
+
+    let text = blocks
+        .iter()
+        .map(|block| block.lines.join(" "))
         .collect::<Vec<_>>()
         .join("\n\n");
 
-    NormalizedPageText { text, stats }
+    NormalizedPageText {
+        text,
+        stats,
+        blocks,
+    }
 }
 
 fn collapse_inline_whitespace(line: &str, stats: &mut PageNormalizationStats) -> String {
@@ -1273,6 +1519,74 @@ mod tests {
     use crate::config::AppConfig;
     use crate::pdf::TextSegmentData;
 
+    fn sample_canonical_text(text: &str) -> CanonicalTtsTextArtifact {
+        CanonicalTtsTextArtifact {
+            text: text.into(),
+            pages: vec![CanonicalPageArtifact {
+                page_index: 0,
+                range: Some(TextRange {
+                    start: 0,
+                    end: text.len(),
+                }),
+                blocks: vec![CanonicalBlockArtifact {
+                    page_index: 0,
+                    block_index: 0,
+                    text: text.into(),
+                    range: TextRange {
+                        start: 0,
+                        end: text.len(),
+                    },
+                    lines: vec![CanonicalLineArtifact {
+                        page_index: 0,
+                        block_index: 0,
+                        line_index: 0,
+                        text: text.into(),
+                        range: TextRange {
+                            start: 0,
+                            end: text.len(),
+                        },
+                        tokens: text
+                            .split_whitespace()
+                            .enumerate()
+                            .scan(0usize, |cursor, (token_index, token)| {
+                                if *cursor > 0 {
+                                    *cursor += 1;
+                                }
+                                let start = *cursor;
+                                *cursor += token.len();
+                                Some(CanonicalTokenArtifact {
+                                    page_index: 0,
+                                    block_index: 0,
+                                    line_index: 0,
+                                    token_index,
+                                    text: token.into(),
+                                    range: TextRange {
+                                        start,
+                                        end: *cursor,
+                                    },
+                                })
+                            })
+                            .collect(),
+                    }],
+                }],
+            }],
+            block_count: 1,
+            line_count: 1,
+            token_count: text.split_whitespace().count(),
+        }
+    }
+
+    fn sample_classification(mode: PdfTtsMode, _confidence: f32) -> ClassificationSummary {
+        ClassificationSummary {
+            coverage_ratio: 1.0,
+            duplicate_ratio: 0.0,
+            boilerplate_ratio: 0.0,
+            avg_chars_per_text_page: 100.0,
+            avg_segments_per_text_page: 32.0,
+            reason: mode.label().into(),
+        }
+    }
+
     #[test]
     fn normalization_replaces_ligatures_and_soft_hyphens() {
         let config = AppConfig::default();
@@ -1306,17 +1620,7 @@ mod tests {
         config.tts.abbreviations = vec!["dr.".into()];
 
         let sentences = build_sentence_plan(
-            "Dr. Smith arrived. Then he left.",
-            &[PageTtsArtifact {
-                page_index: 0,
-                original_char_count: 32,
-                normalized_char_count: 32,
-                segment_count: 10,
-                duplicate_lines_removed: 0,
-                repeated_edge_lines_removed: 0,
-                empty_after_normalization: false,
-                range: Some(TextRange { start: 0, end: 32 }),
-            }],
+            &sample_canonical_text("Dr. Smith arrived. Then he left."),
             "fixture",
             &config,
         );
@@ -1330,10 +1634,11 @@ mod tests {
     fn classifier_marks_empty_documents_as_ocr_required() {
         let config = AppConfig::default();
         let stats = NormalizationStats::default();
-        let (mode, confidence) = classify_pdf_for_tts(4, &[], &stats, &config);
+        let classification = classify_pdf_for_tts(4, &[], &stats, &config);
 
-        assert_eq!(mode, PdfTtsMode::OcrRequired);
-        assert!(confidence < 0.1);
+        assert_eq!(classification.mode, PdfTtsMode::OcrRequired);
+        assert!(classification.confidence < 0.1);
+        assert_eq!(classification.summary.reason, "no_usable_embedded_text");
     }
 
     #[test]
@@ -1373,9 +1678,13 @@ mod tests {
             ..NormalizationStats::default()
         };
 
-        let (mode, confidence) = classify_pdf_for_tts(2, &pages, &stats, &config);
-        assert_eq!(mode, PdfTtsMode::HighTextTrust);
-        assert!(confidence > 0.7);
+        let classification = classify_pdf_for_tts(2, &pages, &stats, &config);
+        assert_eq!(classification.mode, PdfTtsMode::HighTextTrust);
+        assert!(classification.confidence > 0.7);
+        assert_eq!(
+            classification.summary.reason,
+            "embedded_text_meets_high_trust_thresholds"
+        );
     }
 
     #[test]
@@ -1386,7 +1695,9 @@ mod tests {
             generated_at_unix_secs: 0,
             mode: PdfTtsMode::HighTextTrust,
             confidence: 0.9,
+            classification: sample_classification(PdfTtsMode::HighTextTrust, 0.9),
             tts_text: "a b c".into(),
+            canonical_text: sample_canonical_text("a b c"),
             sentences: (0..5)
                 .map(|index| SentencePlan {
                     id: index as u64,
@@ -1417,6 +1728,32 @@ mod tests {
     }
 
     #[test]
+    fn sentence_ids_are_stable_for_same_canonical_text() {
+        let config = AppConfig::default();
+        let canonical = sample_canonical_text("Alpha. Beta.");
+
+        let first = build_sentence_plan(&canonical, "fixture", &config);
+        let second = build_sentence_plan(&canonical, "fixture", &config);
+
+        assert_eq!(
+            first.iter().map(|sentence| sentence.id).collect::<Vec<_>>(),
+            second
+                .iter()
+                .map(|sentence| sentence.id)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn canonical_text_artifact_preserves_token_provenance() {
+        let canonical = sample_canonical_text("Alpha beta");
+        assert_eq!(canonical.block_count, 1);
+        assert_eq!(canonical.line_count, 1);
+        assert_eq!(canonical.token_count, 2);
+        assert_eq!(canonical.pages[0].blocks[0].lines[0].tokens[1].text, "beta");
+    }
+
+    #[test]
     fn prepare_sentence_clip_writes_tone_preview_files() {
         let temp = tempfile::tempdir().unwrap();
         let source_path = temp.path().join("fixture.pdf");
@@ -1432,6 +1769,8 @@ mod tests {
             mode: PdfTtsMode::HighTextTrust,
             confidence: 0.9,
             tts_text: "Sentence zero.".into(),
+            canonical_text: sample_canonical_text("Sentence zero."),
+            classification: sample_classification(PdfTtsMode::HighTextTrust, 0.9),
             sentences: vec![SentencePlan {
                 id: 42,
                 text: "Sentence zero.".into(),
@@ -1547,6 +1886,8 @@ mod tests {
             mode: PdfTtsMode::OcrRequired,
             confidence: 0.2,
             tts_text: "Scanned fallback".into(),
+            canonical_text: sample_canonical_text("Scanned fallback"),
+            classification: sample_classification(PdfTtsMode::OcrRequired, 0.2),
             sentences: vec![SentencePlan {
                 id: 1,
                 text: "Scanned fallback".into(),
@@ -1602,6 +1943,8 @@ mod tests {
             mode: PdfTtsMode::OcrRequired,
             confidence: 0.1,
             tts_text: String::new(),
+            canonical_text: sample_canonical_text(""),
+            classification: sample_classification(PdfTtsMode::OcrRequired, 0.1),
             sentences: Vec::new(),
             pages: Vec::new(),
             stats: NormalizationStats::default(),

@@ -67,6 +67,7 @@ pub struct PdfizerApp {
     tts_analysis: Option<TtsAnalysisArtifacts>,
     tts_analysis_status: TtsAnalysisStatus,
     tts_policy: Option<tts::TtsRuntimePolicy>,
+    pending_tts_sentence_id: Option<u64>,
     tts_worker_tx: Option<Sender<TtsWorkerMessage>>,
     tts_worker_rx: Option<Receiver<TtsWorkerMessage>>,
     tts_request_id: u64,
@@ -165,6 +166,7 @@ impl PdfizerApp {
                 TtsAnalysisStatus::Disabled
             },
             tts_policy: None,
+            pending_tts_sentence_id: None,
             tts_worker_tx: None,
             tts_worker_rx: None,
             tts_request_id: 0,
@@ -228,6 +230,7 @@ impl PdfizerApp {
                     TtsAnalysisStatus::Disabled
                 };
                 self.tts_policy = None;
+                self.pending_tts_sentence_id = None;
                 self.reset_tts_runtime();
                 self.single_scroll_offset = Vec2::ZERO;
                 self.continuous_scroll_offset = Vec2::ZERO;
@@ -314,7 +317,17 @@ impl PdfizerApp {
                     self.tts_policy = Some(policy);
                     self.tts_analysis = Some(artifacts);
                     self.tts_analysis_status = TtsAnalysisStatus::Ready;
-                    self.sync_tts_sentence_to_current_page();
+                    if let Some(sentence_id) = self.pending_tts_sentence_id.take() {
+                        if let Some(analysis) = &self.tts_analysis {
+                            if let Some(index) = tts::sentence_index_for_id(analysis, sentence_id) {
+                                self.tts_active_sentence_index = index;
+                            } else {
+                                self.sync_tts_sentence_to_current_page();
+                            }
+                        }
+                    } else {
+                        self.sync_tts_sentence_to_current_page();
+                    }
                 }
                 Ok(TtsWorkerMessage::Failed { request_id, error })
                     if request_id == self.tts_request_id =>
@@ -420,6 +433,53 @@ impl PdfizerApp {
             .and_then(|analysis| analysis.sentences.get(self.tts_active_sentence_index))
     }
 
+    fn sentence_index_for_page(&self, page_index: usize) -> Option<usize> {
+        let analysis = self.tts_analysis.as_ref()?;
+        analysis
+            .sentences
+            .iter()
+            .enumerate()
+            .find(|(_, sentence)| {
+                sentence.page_range.start_page <= page_index
+                    && sentence.page_range.end_page >= page_index
+            })
+            .map(|(index, _)| index)
+    }
+
+    fn set_tts_cursor_to_sentence_index(&mut self, sentence_index: usize) {
+        let Some(analysis) = &self.tts_analysis else {
+            return;
+        };
+        if sentence_index >= analysis.sentences.len() {
+            return;
+        }
+        self.tts_active_sentence_index = sentence_index;
+        self.persist_session();
+    }
+
+    fn trace_active_sentence_origin(&self, action: &str) {
+        let Some(analysis) = &self.tts_analysis else {
+            return;
+        };
+        let Some(sentence) = self.active_sentence() else {
+            return;
+        };
+        info!(
+            action,
+            source_fingerprint = %analysis.source_fingerprint,
+            sentence_id = sentence.id,
+            sentence_index = self.tts_active_sentence_index,
+            text_range_start = sentence.range.start,
+            text_range_end = sentence.range.end,
+            page_start = sentence.page_range.start_page,
+            page_end = sentence.page_range.end_page,
+            canonical_blocks = analysis.canonical_text.block_count,
+            canonical_lines = analysis.canonical_text.line_count,
+            canonical_tokens = analysis.canonical_text.token_count,
+            "resolved playback step from canonical PDF TTS text"
+        );
+    }
+
     fn active_tts_policy(&self) -> Option<&tts::TtsRuntimePolicy> {
         self.tts_policy.as_ref()
     }
@@ -438,7 +498,7 @@ impl PdfizerApp {
             sentence.page_range.start_page <= self.current_page
                 && sentence.page_range.end_page >= self.current_page
         }) {
-            self.tts_active_sentence_index = index;
+            self.set_tts_cursor_to_sentence_index(index);
         }
     }
 
@@ -653,6 +713,7 @@ impl PdfizerApp {
             }
             self.tts_started_at = Some(Instant::now());
             self.tts_playback_state = TtsPlaybackState::Playing;
+            self.trace_active_sentence_origin("resume_sentence");
             self.focus_active_sentence(ctx);
             ctx.request_repaint_after(Duration::from_millis(40));
         }
@@ -674,7 +735,7 @@ impl PdfizerApp {
             return;
         };
         if self.tts_active_sentence_index + 1 < analysis.sentences.len() {
-            self.tts_active_sentence_index += 1;
+            self.set_tts_cursor_to_sentence_index(self.tts_active_sentence_index + 1);
             self.tts_started_at = None;
             self.tts_activation_requested_at = Some(Instant::now());
             self.start_tts_prefetch();
@@ -686,7 +747,7 @@ impl PdfizerApp {
 
     fn previous_tts_sentence(&mut self, ctx: &egui::Context) {
         if self.tts_active_sentence_index > 0 {
-            self.tts_active_sentence_index -= 1;
+            self.set_tts_cursor_to_sentence_index(self.tts_active_sentence_index - 1);
             self.tts_started_at = None;
             self.tts_activation_requested_at = Some(Instant::now());
             self.start_tts_prefetch();
@@ -709,6 +770,7 @@ impl PdfizerApp {
                 self.tts_playback_state = TtsPlaybackState::Failed;
                 return;
             }
+            self.trace_active_sentence_origin("activate_sentence");
             if let Some(requested_at) = self.tts_activation_requested_at.take() {
                 let activation_ms = requested_at.elapsed().as_secs_f64() * 1000.0;
                 self.tts_profile.activation.record(activation_ms);
@@ -780,7 +842,7 @@ impl PdfizerApp {
         if target_sentence_index >= analysis.sentences.len() {
             return;
         }
-        self.tts_active_sentence_index = target_sentence_index;
+        self.set_tts_cursor_to_sentence_index(target_sentence_index);
         self.tts_started_at = None;
         self.tts_activation_requested_at = Some(Instant::now());
         self.tts_elapsed_before_pause = Duration::ZERO;
@@ -1626,6 +1688,19 @@ impl PdfizerApp {
                     analysis.pages.len()
                 ));
                 ui.label(format!(
+                    "Canonical: blocks {} | lines {} | tokens {}",
+                    analysis.canonical_text.block_count,
+                    analysis.canonical_text.line_count,
+                    analysis.canonical_text.token_count
+                ));
+                ui.label(format!(
+                    "Classification: coverage {:.2} | duplicate {:.2} | boilerplate {:.2} | reason {}",
+                    analysis.classification.coverage_ratio,
+                    analysis.classification.duplicate_ratio,
+                    analysis.classification.boilerplate_ratio,
+                    analysis.classification.reason
+                ));
+                ui.label(format!(
                     "Normalization: ligatures {} | soft hyphens {} | duplicate lines {} | repeated edge lines {}",
                     analysis.stats.ligatures_replaced,
                     analysis.stats.soft_hyphens_removed,
@@ -1637,6 +1712,7 @@ impl PdfizerApp {
                 }
                 if let Some(sentence) = self.active_sentence() {
                     let mut sentence_text = sentence.text.clone();
+                    ui.label(format!("Sentence id: {}", sentence.id));
                     ui.label(format!(
                         "Sentence page range: {}-{}",
                         sentence.page_range.start_page + 1,
@@ -1891,15 +1967,26 @@ impl PdfizerApp {
         self.active_search_result = (!self.search_results.is_empty()).then_some(0);
         if let Some(index) = self.active_search_result {
             self.current_page = self.search_results[index].page_index;
+            if let Some(sentence_index) =
+                self.sentence_index_for_page(self.search_results[index].page_index)
+            {
+                self.set_tts_cursor_to_sentence_index(sentence_index);
+            }
         }
         self.status_message = Some(format!("Found {} result(s)", self.search_results.len()));
     }
 
     fn activate_search_result(&mut self, index: usize, ctx: &egui::Context) {
-        if let Some(result) = self.search_results.get(index) {
+        if let Some((page_index, focus_rect)) = self
+            .search_results
+            .get(index)
+            .map(|result| (result.page_index, result.rects.first().copied()))
+        {
             self.active_search_result = Some(index);
-            let focus_rect = result.rects.first().copied();
-            self.navigate_to_page(result.page_index, focus_rect, ctx);
+            if let Some(sentence_index) = self.sentence_index_for_page(page_index) {
+                self.set_tts_cursor_to_sentence_index(sentence_index);
+            }
+            self.navigate_to_page(page_index, focus_rect, ctx);
         }
     }
 
@@ -2386,6 +2473,7 @@ impl PdfizerApp {
             },
             compare_enabled: self.compare_enabled,
             compare_preset: self.compare_preset.as_str().into(),
+            tts_sentence_id: self.active_sentence().map(|sentence| sentence.id),
         };
 
         match self.config.session_path() {
@@ -2429,6 +2517,7 @@ impl PdfizerApp {
         };
         self.compare_enabled = session.compare_enabled;
         self.compare_preset = RenderPreset::from_name(&session.compare_preset);
+        self.pending_tts_sentence_id = session.tts_sentence_id;
 
         if let Some(document_path) = session.last_document {
             if document_path.exists() {
@@ -2735,6 +2824,7 @@ struct SessionState {
     view_mode: String,
     compare_enabled: bool,
     compare_preset: String,
+    tts_sentence_id: Option<u64>,
 }
 
 fn render_metadata(ui: &mut Ui, metadata: &PdfMetadata) {

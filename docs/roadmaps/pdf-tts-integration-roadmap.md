@@ -111,21 +111,21 @@ Checked items reflect capabilities already present in this repository that reduc
 
 ## Phase 1: Canonical Text Ownership
 
-- [ ] Define a canonical `tts_text` artifact for PDFs.
-- [ ] Define a canonical `sentence_plan` artifact built only from normalized `tts_text`.
-- [ ] Preserve page, block, line, and token provenance when deriving `tts_text`.
-- [ ] Store stable sentence ids so playback, search, resume, and bookmarks all target the same units.
-- [ ] Ensure zoom, page changes, and view-mode changes do not alter sentence ids.
-- [ ] Add explicit tracing proving each playback step originated from canonical `tts_text`.
+- [x] Define a canonical `tts_text` artifact for PDFs.
+- [x] Define a canonical `sentence_plan` artifact built only from normalized `tts_text`.
+- [x] Preserve page, block, line, and token provenance when deriving `tts_text`.
+- [x] Store stable sentence ids so playback, search, resume, and bookmarks all target the same units.
+- [x] Ensure zoom, page changes, and view-mode changes do not alter sentence ids.
+- [x] Add explicit tracing proving each playback step originated from canonical `tts_text`.
 
 ## Phase 2: PDF Type Classification
 
-- [ ] Classify each opened PDF into runtime modes before enabling fine-grained sync.
-- [ ] Support `high_text_trust` for clean embedded text and strong geometry.
-- [ ] Support `mixed_text_trust` for usable text with imperfect reading order or geometry.
+- [x] Classify each opened PDF into runtime modes before enabling fine-grained sync.
+- [x] Support `high_text_trust` for clean embedded text and strong geometry.
+- [x] Support `mixed_text_trust` for usable text with imperfect reading order or geometry.
 - [x] Support `ocr_required` for scanned or image-first PDFs.
 - [x] Support `render_only_no_sync` when text or geometry cannot be trusted.
-- [ ] Persist classification results and confidence summaries in cache.
+- [x] Persist classification results and confidence summaries in cache.
 - [x] Gate TTS and highlight behavior based on classification rather than optimistic assumptions.
 
 ## Phase 3: Text Extraction And Normalization
