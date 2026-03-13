@@ -7,8 +7,8 @@ use std::{
 
 use anyhow::{Context as _, Result};
 use eframe::egui::{
-    self, Color32, ColorImage, Key, Pos2, Rect, RichText, ScrollArea, Sense, Slider, TextureHandle,
-    TextureOptions, Ui, Vec2,
+    self, Color32, ColorImage, Key, Label, Pos2, Rect, RichText, ScrollArea, Sense, Slider,
+    TextureHandle, TextureOptions, Ui, UiBuilder, Vec2,
 };
 use rfd::FileDialog;
 use serde::{Deserialize, Serialize};
@@ -18,7 +18,8 @@ use crate::{
     config::AppConfig,
     pdf::{
         PageSizePoints, PdfDocument, PdfMetadata, PdfRectData, PdfRuntime, RenderMode,
-        RenderPreset, RenderRequest, RenderedPageImage, SearchHit, TileRenderRequest,
+        RenderPreset, RenderRequest, RenderedPageImage, SearchHit, TextSegmentData,
+        TileRenderRequest,
     },
 };
 
@@ -45,11 +46,6 @@ pub struct PdfizerApp {
     config_editor: String,
     status_message: Option<String>,
     pixel_sample: Option<PixelSample>,
-    selection_anchor: Option<Pos2>,
-    selection_rect: Option<Rect>,
-    selected_text: String,
-    selected_text_page: Option<usize>,
-    selected_pdf_rect: Option<PdfRectData>,
     search_query: String,
     search_match_case: bool,
     search_whole_word: bool,
@@ -59,6 +55,7 @@ pub struct PdfizerApp {
     continuous_scroll_offset: Vec2,
     highlight_text: bool,
     text_rect_cache: HashMap<usize, Vec<PdfRectData>>,
+    text_segment_cache: HashMap<usize, Vec<TextSegmentData>>,
 }
 
 impl PdfizerApp {
@@ -104,11 +101,6 @@ impl PdfizerApp {
             render_history: Vec::new(),
             status_message: None,
             pixel_sample: None,
-            selection_anchor: None,
-            selection_rect: None,
-            selected_text: String::new(),
-            selected_text_page: None,
-            selected_pdf_rect: None,
             search_query: String::new(),
             search_match_case: false,
             search_whole_word: false,
@@ -118,6 +110,7 @@ impl PdfizerApp {
             continuous_scroll_offset: Vec2::ZERO,
             highlight_text: false,
             text_rect_cache: HashMap::new(),
+            text_segment_cache: HashMap::new(),
         };
 
         app.restore_session(&cc.egui_ctx);
@@ -146,13 +139,11 @@ impl PdfizerApp {
                 self.compare_view = None;
                 self.primary_tile_job = None;
                 self.compare_tile_job = None;
-                self.selection_rect = None;
-                self.selected_pdf_rect = None;
-                self.selected_text.clear();
                 self.pixel_sample = None;
                 self.search_results.clear();
                 self.active_search_result = None;
                 self.text_rect_cache.clear();
+                self.text_segment_cache.clear();
                 self.single_scroll_offset = Vec2::ZERO;
                 self.continuous_scroll_offset = Vec2::ZERO;
                 self.render_current_page(ctx);
@@ -837,29 +828,9 @@ impl PdfizerApp {
             ));
         }
 
-        if let Some(rect) = &self.selection_rect {
-            ui.label(format!(
-                "Selection: {:.0} x {:.0} px",
-                rect.width().abs(),
-                rect.height().abs()
-            ));
-        }
-
         ui.separator();
-        ui.collapsing("Selected text", |ui| {
-            if self.selected_text.is_empty() {
-                ui.label("Drag a rectangle over a page to extract selectable text.");
-            } else {
-                ui.label(format!(
-                    "Page {}",
-                    self.selected_text_page.map(|page| page + 1).unwrap_or(0)
-                ));
-                ui.add(
-                    egui::TextEdit::multiline(&mut self.selected_text)
-                        .font(egui::TextStyle::Monospace)
-                        .desired_rows(6),
-                );
-            }
+        ui.collapsing("Text selection", |ui| {
+            ui.label("Select text directly on the PDF page and copy it with the usual clipboard shortcut.");
         });
 
         ui.collapsing("Search results", |ui| {
@@ -1190,34 +1161,16 @@ impl PdfizerApp {
             page_rect,
             egui::Image::new(&view.texture)
                 .fit_to_exact_size(page_rect.size())
-                .sense(Sense::click_and_drag()),
+                .sense(Sense::click()),
         );
 
         if self.config.ui.enable_pixel_inspector {
             self.update_inspector_from_response(&response, &view.image);
-
-            if response.drag_started() {
-                self.selection_anchor = response.interact_pointer_pos();
-                self.selected_text_page = Some(page_index);
-            }
-
-            if response.dragged() {
-                if let (Some(start), Some(current)) =
-                    (self.selection_anchor, response.interact_pointer_pos())
-                {
-                    self.selection_rect = Some(Rect::from_two_pos(start, current));
-                }
-            }
-
-            if response.drag_stopped() {
-                self.capture_selection_for_page(page_index, &response, &view.image);
-                self.selection_anchor = None;
-            }
         }
 
+        self.paint_selectable_text_layer(ui, page_index, &response, &view.image);
         self.paint_text_region_highlights(ui, page_index, &response, &view.image);
         self.paint_search_highlights(ui, page_index, &response, &view.image);
-        self.paint_selection_highlight(ui, page_index, &response, &view.image);
 
         if response.clicked() {
             self.current_page = page_index;
@@ -1255,34 +1208,16 @@ impl PdfizerApp {
                         let response = ui.add(
                             egui::Image::new(&view.texture)
                                 .fit_to_exact_size(image_size)
-                                .sense(Sense::click_and_drag()),
+                                .sense(Sense::click()),
                         );
 
                         if enable_inspector && self.config.ui.enable_pixel_inspector {
                             self.update_inspector_from_response(&response, &view.image);
-
-                            if response.drag_started() {
-                                self.selection_anchor = response.interact_pointer_pos();
-                                self.selected_text_page = Some(page_index);
-                            }
-
-                            if response.dragged() {
-                                if let (Some(start), Some(current)) =
-                                    (self.selection_anchor, response.interact_pointer_pos())
-                                {
-                                    self.selection_rect = Some(Rect::from_two_pos(start, current));
-                                }
-                            }
-
-                            if response.drag_stopped() {
-                                self.capture_selection_for_page(page_index, &response, &view.image);
-                                self.selection_anchor = None;
-                            }
                         }
 
+                        self.paint_selectable_text_layer(ui, page_index, &response, &view.image);
                         self.paint_text_region_highlights(ui, page_index, &response, &view.image);
                         self.paint_search_highlights(ui, page_index, &response, &view.image);
-                        self.paint_selection_highlight(ui, page_index, &response, &view.image);
 
                         if response.clicked() {
                             self.current_page = page_index;
@@ -1296,36 +1231,6 @@ impl PdfizerApp {
                     });
                 self.single_scroll_offset = output.state.offset;
             });
-    }
-
-    fn capture_selection_for_page(
-        &mut self,
-        page_index: usize,
-        response: &egui::Response,
-        image: &ColorImage,
-    ) {
-        let Some(screen_rect) = self.selection_rect else {
-            return;
-        };
-
-        let Some(pdf_rect) =
-            self.page_screen_rect_to_pdf_rect(page_index, response.rect, screen_rect, image)
-        else {
-            return;
-        };
-
-        let Some(document) = &self.document else {
-            return;
-        };
-
-        match document.extract_text_in_rect(page_index, pdf_rect) {
-            Ok(text) => {
-                self.selected_text = text;
-                self.selected_text_page = Some(page_index);
-                self.selected_pdf_rect = Some(pdf_rect);
-            }
-            Err(err) => self.last_error = Some(err.to_string()),
-        }
     }
 
     fn paint_search_highlights(
@@ -1361,6 +1266,71 @@ impl PdfizerApp {
                 );
             }
         }
+    }
+
+    fn paint_selectable_text_layer(
+        &mut self,
+        ui: &mut Ui,
+        page_index: usize,
+        response: &egui::Response,
+        image: &ColorImage,
+    ) {
+        if !self.text_segment_cache.contains_key(&page_index) {
+            if let Some(document) = &self.document {
+                match document.text_segments_for_page(page_index) {
+                    Ok(segments) => {
+                        self.text_segment_cache.insert(page_index, segments);
+                    }
+                    Err(err) => {
+                        self.last_error = Some(err.to_string());
+                        return;
+                    }
+                }
+            }
+        }
+
+        let Some(document) = &self.document else {
+            return;
+        };
+        let Some(page_size) = document.page_size(page_index) else {
+            return;
+        };
+        let Some(segments) = self.text_segment_cache.get(&page_index) else {
+            return;
+        };
+
+        ui.scope_builder(
+            UiBuilder::new()
+                .id_salt(("text-layer", page_index))
+                .max_rect(response.rect),
+            |ui| {
+                for (segment_index, segment) in segments.iter().enumerate() {
+                    if segment.text.trim().is_empty() {
+                        continue;
+                    }
+
+                    let segment_rect =
+                        pdf_rect_to_screen_rect(segment.rect, page_size, response.rect, image);
+                    if segment_rect.width() <= 1.0 || segment_rect.height() <= 1.0 {
+                        continue;
+                    }
+
+                    ui.scope_builder(
+                        UiBuilder::new()
+                            .id_salt(("text-segment", page_index, segment_index))
+                            .max_rect(segment_rect),
+                        |ui| {
+                            let label = Label::new(
+                                RichText::new(segment.text.clone())
+                                    .color(Color32::from_rgba_premultiplied(0, 0, 0, 1)),
+                            )
+                            .selectable(true);
+                            ui.put(segment_rect, label);
+                        },
+                    );
+                }
+            },
+        );
     }
 
     fn paint_text_region_highlights(
@@ -1400,69 +1370,6 @@ impl PdfizerApp {
                 Color32::from_rgba_premultiplied(90, 170, 255, 24),
             );
         }
-    }
-
-    fn paint_selection_highlight(
-        &self,
-        ui: &Ui,
-        page_index: usize,
-        response: &egui::Response,
-        image: &ColorImage,
-    ) {
-        let Some(selected_page) = self.selected_text_page else {
-            return;
-        };
-        if selected_page != page_index {
-            return;
-        }
-        let Some(document) = &self.document else {
-            return;
-        };
-        let Some(page_size) = document.page_size(page_index) else {
-            return;
-        };
-        let Some(rect) = self.selected_pdf_rect else {
-            return;
-        };
-
-        let screen_rect = pdf_rect_to_screen_rect(rect, page_size, response.rect, image);
-        ui.painter().rect_stroke(
-            screen_rect,
-            0.0,
-            egui::Stroke::new(2.0, Color32::from_rgb(100, 180, 255)),
-            egui::StrokeKind::Outside,
-        );
-    }
-
-    fn page_screen_rect_to_pdf_rect(
-        &self,
-        page_index: usize,
-        image_rect: Rect,
-        selected_rect: Rect,
-        image: &ColorImage,
-    ) -> Option<PdfRectData> {
-        let document = self.document.as_ref()?;
-        let page_size = document.page_size(page_index)?;
-        let clipped = selected_rect.intersect(image_rect);
-        if clipped.width() <= 1.0 || clipped.height() <= 1.0 {
-            return None;
-        }
-
-        let left_ratio =
-            ((clipped.left() - image_rect.left()) / image_rect.width()).clamp(0.0, 1.0);
-        let right_ratio =
-            ((clipped.right() - image_rect.left()) / image_rect.width()).clamp(0.0, 1.0);
-        let top_ratio = ((clipped.top() - image_rect.top()) / image_rect.height()).clamp(0.0, 1.0);
-        let bottom_ratio =
-            ((clipped.bottom() - image_rect.top()) / image_rect.height()).clamp(0.0, 1.0);
-
-        let _ = image; // ratio uses displayed image dimensions only
-        Some(PdfRectData {
-            left: page_size.width * left_ratio,
-            right: page_size.width * right_ratio,
-            top: page_size.height * (1.0 - top_ratio),
-            bottom: page_size.height * (1.0 - bottom_ratio),
-        })
     }
 
     fn page_image_size(&self, page_index: usize) -> Option<Vec2> {

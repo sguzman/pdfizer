@@ -128,19 +128,6 @@ impl PdfDocument<'_> {
         self.page_sizes.get(page_index).copied()
     }
 
-    pub fn extract_text_in_rect(&self, page_index: usize, rect: PdfRectData) -> Result<String> {
-        let page = self
-            .document
-            .pages()
-            .get(page_index as u16)
-            .with_context(|| format!("page index {page_index} is out of bounds"))?;
-        let text = page
-            .text()
-            .map_err(|err| anyhow!("failed to load page text: {err}"))?;
-
-        Ok(text.inside_rect(rect.to_pdf_rect()))
-    }
-
     pub fn search_page(
         &self,
         page_index: usize,
@@ -203,6 +190,26 @@ impl PdfDocument<'_> {
             .segments()
             .iter()
             .map(|segment| PdfRectData::from_pdf_rect(segment.bounds()))
+            .collect())
+    }
+
+    pub fn text_segments_for_page(&self, page_index: usize) -> Result<Vec<TextSegmentData>> {
+        let page = self
+            .document
+            .pages()
+            .get(page_index as u16)
+            .with_context(|| format!("page index {page_index} is out of bounds"))?;
+        let text = page
+            .text()
+            .map_err(|err| anyhow!("failed to load page text: {err}"))?;
+
+        Ok(text
+            .segments()
+            .iter()
+            .map(|segment| TextSegmentData {
+                text: segment.text(),
+                rect: PdfRectData::from_pdf_rect(segment.bounds()),
+            })
             .collect())
     }
 
@@ -453,6 +460,12 @@ pub struct SearchHit {
     pub rects: Vec<PdfRectData>,
 }
 
+#[derive(Debug, Clone)]
+pub struct TextSegmentData {
+    pub text: String,
+    pub rect: PdfRectData,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PdfRectData {
     pub bottom: f32,
@@ -469,10 +482,6 @@ impl PdfRectData {
             top: rect.top().value,
             right: rect.right().value,
         }
-    }
-
-    pub fn to_pdf_rect(self) -> PdfRect {
-        PdfRect::new_from_values(self.bottom, self.left, self.top, self.right)
     }
 }
 
