@@ -24,14 +24,12 @@ This roadmap is organized by feature dimension rather than by milestone. Checked
 - [ ] Selection rectangle / pixel inspector
 - [ ] Side-by-side render comparison presets
 
-## Text, Reading Order, And TTS Prep
+## Explicit Non-Features For Now
 
-- [ ] Extract text runs and positional boxes from PDFium/PDF layer data
-- [ ] Normalize page text into line and block groupings
-- [ ] Build a reading-order model suitable for speech playback
-- [ ] Add overlay highlighting tied to normalized text segments
-- [ ] Integrate TTS playback controls
-- [ ] Track timing alignment quality for spoken highlights
+- [ ] TTS playback and speech engine integration
+- [ ] Spoken-text highlighting and timing alignment
+- [ ] Reading-order modeling for narration
+- [ ] Text extraction work intended specifically for TTS pipelines
 
 ## Configuration And Runtime Controls
 
