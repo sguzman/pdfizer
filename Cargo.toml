@@ -4,3 +4,17 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+anyhow = "1.0.102"
+config = { version = "0.15.21", default-features = false, features = ["toml"] }
+directories = "6.0.0"
+eframe = "0.33.3"
+egui = "0.33.3"
+pdfium-render = "0.8.37"
+rfd = "0.17.2"
+serde = { version = "1.0.228", features = ["derive"] }
+toml = "0.9.7"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.22", features = ["env-filter", "fmt"] }
+
+[dev-dependencies]
+tempfile = "3.27.0"
