@@ -1537,7 +1537,11 @@ impl PdfizerApp {
         let sender = self.ensure_tts_worker_channel();
         let request_id = self.tts_prefetch_request_id;
         let cancel_token = self.tts_cancel_token;
-        let clip_limit = self.config.tts.clip_worker_concurrency.max(1);
+        let clip_limit = if self.tts_engine == TtsEngineKind::Piper {
+            1
+        } else {
+            self.config.tts.clip_worker_concurrency.max(1)
+        };
         let sync_limit = self.config.tts.sync_worker_concurrency.max(1);
 
         while self.tts_prefetch_in_flight < clip_limit {
@@ -1626,7 +1630,7 @@ impl PdfizerApp {
                         request_id,
                         cancel_token,
                         sentence_index,
-                        error: err.to_string(),
+                        error: format!("{err:#}"),
                         elapsed_ms: started.elapsed().as_millis() as u64,
                     },
                 };

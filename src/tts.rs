@@ -3,6 +3,7 @@ use std::{
     env, fs,
     hash::{DefaultHasher, Hash, Hasher},
     path::{Path, PathBuf},
+    sync::{Mutex, OnceLock},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -2234,6 +2235,12 @@ fn synthesize_piper_clip(
     sentence: &str,
     settings: &TtsSynthesisSettings,
 ) -> Result<()> {
+    static PIPER_SYNTHESIS_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    let _guard = PIPER_SYNTHESIS_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .map_err(|_| anyhow::anyhow!("Piper synthesis lock was poisoned"))?;
+
     let model_path = PathBuf::from(&settings.model_path);
     if !model_path.exists() {
         bail!("Piper model not found at {}", model_path.display());
