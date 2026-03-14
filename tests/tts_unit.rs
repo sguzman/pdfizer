@@ -129,10 +129,10 @@ mod tts {
         }
     }
 
-    fn sample_ocr_artifacts(path: PathBuf) -> OcrArtifacts {
+    fn sample_ocr_artifacts(path: PathBuf, source_path: PathBuf) -> OcrArtifacts {
         OcrArtifacts {
-            source_path: PathBuf::from("fixture.pdf"),
-            source_fingerprint: "abc".into(),
+            source_path: source_path.clone(),
+            source_fingerprint: fingerprint_document_path(&source_path).unwrap(),
             generated_at_unix_secs: 0,
             confidence: 0.91,
             trust_class: OcrTrustClass::OcrMixedTrust,
@@ -783,6 +783,7 @@ mod tts {
             &SentenceSyncTarget {
                 sentence_index: 0,
                 sentence_id: 1,
+                source_fingerprint: "fixture".into(),
                 confidence: SentenceSyncConfidence::ExactSentence,
                 page_index: Some(0),
                 rects: vec![PdfRectData {
@@ -840,11 +841,12 @@ mod tts {
         let mut config = AppConfig::default();
         config.tts.ocr_artifacts_dir = temp.path().join("ocr").display().to_string();
 
-        let ocr_path = config.tts_ocr_artifact_path(&source_path).unwrap();
+        let ocr_path = config.tts_ocr_artifact_file_path(&source_path).unwrap();
         std::fs::create_dir_all(ocr_path.parent().unwrap()).unwrap();
         std::fs::write(
             &ocr_path,
-            toml::to_string_pretty(&sample_ocr_artifacts(ocr_path.clone())).unwrap(),
+            toml::to_string_pretty(&sample_ocr_artifacts(ocr_path.clone(), source_path.clone()))
+                .unwrap(),
         )
         .unwrap();
 
@@ -879,6 +881,7 @@ mod tts {
         let target = SentenceSyncTarget {
             sentence_index: 0,
             sentence_id: 42,
+            source_fingerprint: analysis.source_fingerprint.clone(),
             confidence: SentenceSyncConfidence::ExactSentence,
             page_index: Some(0),
             rects: vec![PdfRectData {

@@ -3167,12 +3167,13 @@ impl PdfizerApp {
             }
 
             if let Some(path) = &self.current_document_path {
-                if let Ok(cache_dir) = self.config.tts_document_cache_dir(path) {
+                if let Ok(cache_dir) = self.config.tts_document_cache_path(path) {
                     ui.label(format!("Document cache dir: {}", cache_dir.display()));
                 }
             }
             if let Some(analysis) = &self.tts_analysis
-                && let Ok(audio_cache_dir) = self.config.tts_audio_cache_dir(&analysis.source_path)
+                && let Ok(audio_cache_dir) =
+                    self.config.tts_audio_cache_path(&analysis.source_path)
             {
                 ui.label(format!("Audio cache dir: {}", audio_cache_dir.display()));
             }

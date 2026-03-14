@@ -490,6 +490,8 @@ impl SentenceSyncConfidence {
 pub struct SentenceSyncTarget {
     pub sentence_index: usize,
     pub sentence_id: u64,
+    #[serde(default)]
+    pub source_fingerprint: String,
     pub confidence: SentenceSyncConfidence,
     pub page_index: Option<usize>,
     pub rects: Vec<PdfRectData>,
@@ -835,26 +837,35 @@ pub fn compute_sentence_sync(
         .sentences
         .get(sentence_index)
         .with_context(|| format!("sentence index {sentence_index} is out of bounds"))?;
-    let sync_path = config.tts_sync_artifact_path(&analysis.source_path, sentence.id)?;
+    let sync_path = config.tts_sync_artifact_file_path(&analysis.source_path, sentence.id)?;
     if sync_path.exists() {
         let contents = fs::read_to_string(&sync_path)
             .with_context(|| format!("failed to read {}", sync_path.display()))?;
         let mut cached = toml::from_str::<SentenceSyncTarget>(&contents)
             .with_context(|| format!("failed to parse {}", sync_path.display()))?;
-        cached.artifact_path = Some(sync_path);
+        if cached.source_fingerprint == analysis.source_fingerprint {
+            cached.artifact_path = Some(sync_path);
+            debug!(
+                sentence_index,
+                sentence_id = sentence.id,
+                confidence = %cached.confidence.label(),
+                score = cached.score,
+                text_similarity = cached.score_breakdown.text_similarity,
+                reading_order = cached.score_breakdown.reading_order,
+                geometry_compactness = cached.score_breakdown.geometry_compactness,
+                page_continuity = cached.score_breakdown.page_continuity,
+                cache_hit = true,
+                "loaded cached PDF sentence sync target"
+            );
+            return Ok(cached);
+        }
         debug!(
             sentence_index,
             sentence_id = sentence.id,
-            confidence = %cached.confidence.label(),
-            score = cached.score,
-            text_similarity = cached.score_breakdown.text_similarity,
-            reading_order = cached.score_breakdown.reading_order,
-            geometry_compactness = cached.score_breakdown.geometry_compactness,
-            page_continuity = cached.score_breakdown.page_continuity,
-            cache_hit = true,
-            "loaded cached PDF sentence sync target"
+            cached_fingerprint = %cached.source_fingerprint,
+            current_fingerprint = %analysis.source_fingerprint,
+            "ignoring stale cached PDF sentence sync target"
         );
-        return Ok(cached);
     }
     let runtime =
         PdfRuntime::new(config).context("failed to initialize Pdfium for TTS sync analysis")?;
@@ -902,7 +913,7 @@ pub fn load_cached_artifacts(
     config: &AppConfig,
     source_path: &Path,
 ) -> Result<Option<TtsAnalysisArtifacts>> {
-    let path = config.tts_artifact_path(source_path)?;
+    let path = config.tts_artifact_file_path(source_path)?;
     if !path.exists() {
         return Ok(None);
     }
@@ -911,12 +922,22 @@ pub fn load_cached_artifacts(
         .with_context(|| format!("failed to read TTS artifacts from {}", path.display()))?;
     let mut artifacts = toml::from_str::<TtsAnalysisArtifacts>(&contents)
         .with_context(|| format!("failed to parse TTS artifacts from {}", path.display()))?;
+    let current_fingerprint = fingerprint_document_path(source_path)?;
+    if artifacts.source_fingerprint != current_fingerprint {
+        debug!(
+            artifact = %path.display(),
+            cached_fingerprint = %artifacts.source_fingerprint,
+            current_fingerprint = %current_fingerprint,
+            "ignoring stale cached TTS analysis artifacts"
+        );
+        return Ok(None);
+    }
     artifacts.artifact_path = Some(path);
     Ok(Some(artifacts))
 }
 
 pub fn load_ocr_artifacts(config: &AppConfig, source_path: &Path) -> Result<Option<OcrArtifacts>> {
-    let path = config.tts_ocr_artifact_path(source_path)?;
+    let path = config.tts_ocr_artifact_file_path(source_path)?;
     if !path.exists() {
         return Ok(None);
     }
@@ -925,6 +946,16 @@ pub fn load_ocr_artifacts(config: &AppConfig, source_path: &Path) -> Result<Opti
         .with_context(|| format!("failed to read OCR artifacts from {}", path.display()))?;
     let mut artifacts = toml::from_str::<OcrArtifacts>(&contents)
         .with_context(|| format!("failed to parse OCR artifacts from {}", path.display()))?;
+    let current_fingerprint = fingerprint_document_path(source_path)?;
+    if artifacts.source_fingerprint != current_fingerprint {
+        debug!(
+            artifact = %path.display(),
+            cached_fingerprint = %artifacts.source_fingerprint,
+            current_fingerprint = %current_fingerprint,
+            "ignoring stale cached OCR artifacts"
+        );
+        return Ok(None);
+    }
     artifacts.artifact_path = Some(path);
     Ok(Some(artifacts))
 }
@@ -1120,6 +1151,7 @@ pub fn apply_runtime_policy(
         return SentenceSyncTarget {
             sentence_index: target.sentence_index,
             sentence_id: target.sentence_id,
+            source_fingerprint: target.source_fingerprint.clone(),
             confidence: if policy.max_sync_confidence == SentenceSyncConfidence::Missing {
                 SentenceSyncConfidence::Missing
             } else if target.page_index.is_some() {
@@ -1144,6 +1176,7 @@ pub fn apply_runtime_policy(
     SentenceSyncTarget {
         sentence_index: target.sentence_index,
         sentence_id: target.sentence_id,
+        source_fingerprint: target.source_fingerprint.clone(),
         confidence: policy.max_sync_confidence,
         page_index: target.page_index,
         rects: if policy.max_sync_confidence == SentenceSyncConfidence::PageFallback {
@@ -1805,7 +1838,7 @@ pub fn compute_sentence_sync_from_document(
 
     for page_index in sentence.page_range.start_page..=sentence.page_range.end_page {
         let segments = document.text_segments_for_page(page_index)?;
-        let candidate = sync_target_for_page(
+        let mut candidate = sync_target_for_page(
             page_index,
             sentence_index,
             sentence.id,
@@ -1813,6 +1846,7 @@ pub fn compute_sentence_sync_from_document(
             &normalized_sentence,
             &segments,
         );
+        candidate.source_fingerprint = analysis.source_fingerprint.clone();
         if best
             .as_ref()
             .is_none_or(|current| candidate.score > current.score)
@@ -1824,6 +1858,7 @@ pub fn compute_sentence_sync_from_document(
     Ok(best.unwrap_or(SentenceSyncTarget {
         sentence_index,
         sentence_id: sentence.id,
+        source_fingerprint: analysis.source_fingerprint.clone(),
         confidence: SentenceSyncConfidence::Missing,
         page_index: None,
         rects: Vec::new(),
@@ -1870,6 +1905,7 @@ fn sync_target_for_page(
                 return SentenceSyncTarget {
                     sentence_index,
                     sentence_id,
+                    source_fingerprint: String::new(),
                     confidence: SentenceSyncConfidence::ExactSentence,
                     page_index: Some(page_index),
                     rects,
@@ -1967,6 +2003,7 @@ fn sync_target_for_page(
         return SentenceSyncTarget {
             sentence_index,
             sentence_id,
+            source_fingerprint: String::new(),
             confidence,
             page_index: Some(page_index),
             rects: if confidence == SentenceSyncConfidence::PageFallback {
@@ -2000,6 +2037,7 @@ fn sync_target_for_page(
     SentenceSyncTarget {
         sentence_index,
         sentence_id,
+        source_fingerprint: String::new(),
         confidence: SentenceSyncConfidence::PageFallback,
         page_index: Some(page_index),
         rects: Vec::new(),

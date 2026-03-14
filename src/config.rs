@@ -459,8 +459,12 @@ impl AppConfig {
         Ok(dir.join(file_name))
     }
 
+    pub fn tts_cache_root_path(&self) -> Result<PathBuf> {
+        self.resolve_storage_dir(&self.tts.cache_root_dir)
+    }
+
     pub fn tts_cache_root_dir(&self) -> Result<PathBuf> {
-        let path = self.resolve_storage_dir(&self.tts.cache_root_dir)?;
+        let path = self.tts_cache_root_path()?;
         fs::create_dir_all(&path).with_context(|| {
             format!(
                 "failed to create TTS cache root directory {}",
@@ -468,6 +472,11 @@ impl AppConfig {
             )
         })?;
         Ok(path)
+    }
+
+    pub fn tts_document_cache_path(&self, source_path: &Path) -> Result<PathBuf> {
+        let root = self.tts_cache_root_path()?;
+        Ok(root.join(stable_source_fingerprint(source_path)?))
     }
 
     pub fn tts_document_cache_dir(&self, source_path: &Path) -> Result<PathBuf> {
@@ -482,20 +491,28 @@ impl AppConfig {
         Ok(path)
     }
 
+    pub fn tts_artifacts_path(&self, source_path: &Path) -> Result<PathBuf> {
+        Ok(self
+            .tts_document_cache_path(source_path)?
+            .join(&self.tts.artifacts_dir))
+    }
+
     pub fn tts_artifacts_dir(&self, source_path: &Path) -> Result<PathBuf> {
-        let path = self
-            .tts_document_cache_dir(source_path)?
-            .join(&self.tts.artifacts_dir);
+        let path = self.tts_artifacts_path(source_path)?;
         fs::create_dir_all(&path).with_context(|| {
             format!("failed to create TTS artifact directory {}", path.display())
         })?;
         Ok(path)
     }
 
+    pub fn tts_audio_cache_path(&self, source_path: &Path) -> Result<PathBuf> {
+        Ok(self
+            .tts_document_cache_path(source_path)?
+            .join(&self.tts.audio_cache_dir))
+    }
+
     pub fn tts_audio_cache_dir(&self, source_path: &Path) -> Result<PathBuf> {
-        let path = self
-            .tts_document_cache_dir(source_path)?
-            .join(&self.tts.audio_cache_dir);
+        let path = self.tts_audio_cache_path(source_path)?;
         fs::create_dir_all(&path).with_context(|| {
             format!(
                 "failed to create TTS audio cache directory {}",
@@ -505,10 +522,14 @@ impl AppConfig {
         Ok(path)
     }
 
+    pub fn tts_sync_artifacts_path(&self, source_path: &Path) -> Result<PathBuf> {
+        Ok(self
+            .tts_document_cache_path(source_path)?
+            .join(&self.tts.sync_artifacts_dir))
+    }
+
     pub fn tts_sync_artifacts_dir(&self, source_path: &Path) -> Result<PathBuf> {
-        let path = self
-            .tts_document_cache_dir(source_path)?
-            .join(&self.tts.sync_artifacts_dir);
+        let path = self.tts_sync_artifacts_path(source_path)?;
         fs::create_dir_all(&path).with_context(|| {
             format!(
                 "failed to create TTS sync artifact directory {}",
@@ -518,17 +539,15 @@ impl AppConfig {
         Ok(path)
     }
 
-    pub fn tts_ocr_artifacts_dir(&self, source_path: &Path) -> Result<PathBuf> {
-        let path = self
-            .tts_document_cache_dir(source_path)?
-            .join(&self.tts.ocr_artifacts_dir);
-        fs::create_dir_all(&path).with_context(|| {
-            format!(
-                "failed to create TTS OCR artifact directory {}",
-                path.display()
-            )
-        })?;
-        Ok(path)
+    pub fn tts_ocr_artifacts_path(&self, source_path: &Path) -> Result<PathBuf> {
+        Ok(self
+            .tts_document_cache_path(source_path)?
+            .join(&self.tts.ocr_artifacts_dir))
+    }
+
+    pub fn tts_artifact_file_path(&self, source_path: &Path) -> Result<PathBuf> {
+        let dir = self.tts_artifacts_path(source_path)?;
+        Ok(dir.join("analysis.toml"))
     }
 
     pub fn tts_artifact_path(&self, source_path: &Path) -> Result<PathBuf> {
@@ -536,13 +555,22 @@ impl AppConfig {
         Ok(dir.join("analysis.toml"))
     }
 
+    pub fn tts_sync_artifact_file_path(
+        &self,
+        source_path: &Path,
+        sentence_id: u64,
+    ) -> Result<PathBuf> {
+        let dir = self.tts_sync_artifacts_path(source_path)?;
+        Ok(dir.join(format!("{:016x}.toml", sentence_id)))
+    }
+
     pub fn tts_sync_artifact_path(&self, source_path: &Path, sentence_id: u64) -> Result<PathBuf> {
         let dir = self.tts_sync_artifacts_dir(source_path)?;
         Ok(dir.join(format!("{:016x}.toml", sentence_id)))
     }
 
-    pub fn tts_ocr_artifact_path(&self, source_path: &Path) -> Result<PathBuf> {
-        let dir = self.tts_ocr_artifacts_dir(source_path)?;
+    pub fn tts_ocr_artifact_file_path(&self, source_path: &Path) -> Result<PathBuf> {
+        let dir = self.tts_ocr_artifacts_path(source_path)?;
         Ok(dir.join("ocr.toml"))
     }
 
@@ -1025,18 +1053,8 @@ fn unix_timestamp_secs() -> u64 {
 fn stable_source_fingerprint(path: &Path) -> Result<String> {
     use std::hash::{DefaultHasher, Hash, Hasher};
 
-    let metadata = fs::metadata(path)
-        .with_context(|| format!("failed to read metadata for {}", path.display()))?;
-    let modified = metadata
-        .modified()
-        .ok()
-        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|duration| duration.as_secs())
-        .unwrap_or(0);
-
     let mut hasher = DefaultHasher::new();
-    path.display().to_string().hash(&mut hasher);
-    metadata.len().hash(&mut hasher);
-    modified.hash(&mut hasher);
+    let canonical = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    canonical.display().to_string().hash(&mut hasher);
     Ok(format!("{:016x}", hasher.finish()))
 }
