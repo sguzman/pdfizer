@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs,
     num::{NonZeroU16, NonZeroU32},
     path::PathBuf,
@@ -96,11 +96,14 @@ pub struct PdfizerApp {
     tts_sync_targets: HashMap<usize, SentenceSyncTarget>,
     tts_prefetch_queue: Vec<usize>,
     tts_sync_queue: Vec<usize>,
+    tts_prefetch_active: HashSet<usize>,
+    tts_sync_active: HashSet<usize>,
     tts_failed_prefetch: HashMap<usize, String>,
     tts_failed_sync: HashMap<usize, String>,
     tts_prefetch_request_id: u64,
     tts_cancel_token: u64,
     tts_prefetch_in_flight: usize,
+    tts_sync_in_flight: usize,
     tts_started_at: Option<Instant>,
     tts_activation_requested_at: Option<Instant>,
     tts_elapsed_before_pause: Duration,
@@ -341,11 +344,14 @@ impl PdfizerApp {
             tts_sync_targets: HashMap::new(),
             tts_prefetch_queue: Vec::new(),
             tts_sync_queue: Vec::new(),
+            tts_prefetch_active: HashSet::new(),
+            tts_sync_active: HashSet::new(),
             tts_failed_prefetch: HashMap::new(),
             tts_failed_sync: HashMap::new(),
             tts_prefetch_request_id: 0,
             tts_cancel_token: 0,
             tts_prefetch_in_flight: 0,
+            tts_sync_in_flight: 0,
             tts_started_at: None,
             tts_activation_requested_at: None,
             tts_elapsed_before_pause: Duration::ZERO,
@@ -813,7 +819,7 @@ impl PdfizerApp {
         }
     }
 
-    fn poll_tts_analysis(&mut self) {
+    fn poll_tts_analysis(&mut self, ctx: &egui::Context) {
         let Some(receiver) = self.tts_worker_rx.take() else {
             return;
         };
@@ -917,20 +923,27 @@ impl PdfizerApp {
                     if clip.cache_hit {
                         self.tts_profile.prepare_cache_hits += 1;
                     }
+                    self.tts_prefetch_active.remove(&clip.sentence_index);
                     debug!(
                         sentence_index = clip.sentence_index,
                         cache_hit = clip.cache_hit,
-                        queued_remaining = self.tts_prefetch_queue.len().saturating_sub(1),
+                        queued_remaining = self.tts_prefetch_queue.len(),
                         in_flight_before = self.tts_prefetch_in_flight,
                         prepare_cache_hits = self.tts_profile.prepare_cache_hits,
                         elapsed_ms,
                         "processed prepared TTS clip"
                     );
                     self.tts_prepared_clips.insert(clip.sentence_index, clip);
-                    self.tts_prefetch_queue
-                        .retain(|index| !self.tts_prepared_clips.contains_key(index));
                     self.tts_prefetch_in_flight = self.tts_prefetch_in_flight.saturating_sub(1);
                     self.enforce_tts_runtime_budget();
+                    self.pump_tts_job_dispatch();
+                    if self.tts_playback_state == TtsPlaybackState::Preparing
+                        && self
+                            .tts_prepared_clips
+                            .contains_key(&self.tts_active_sentence_index)
+                    {
+                        self.try_activate_current_sentence(ctx);
+                    }
                 }
                 Ok(TtsWorkerMessage::PrefetchFailed {
                     request_id,
@@ -942,20 +955,20 @@ impl PdfizerApp {
                     && cancel_token == self.tts_cancel_token =>
                 {
                     self.tts_profile.prepare.record(elapsed_ms as f64);
+                    self.tts_prefetch_active.remove(&sentence_index);
                     debug!(
                         sentence_index,
-                        queued_remaining = self.tts_prefetch_queue.len().saturating_sub(1),
+                        queued_remaining = self.tts_prefetch_queue.len(),
                         in_flight_before = self.tts_prefetch_in_flight,
                         elapsed_ms,
                         error = %error,
                         "processed failed TTS clip preparation"
                     );
-                    self.tts_prefetch_queue
-                        .retain(|index| *index != sentence_index);
                     self.tts_prefetch_in_flight = self.tts_prefetch_in_flight.saturating_sub(1);
                     self.tts_failed_prefetch
                         .insert(sentence_index, error.clone());
                     warn!(sentence_index, error = %error, "TTS prefetch failed");
+                    self.pump_tts_job_dispatch();
                 }
                 Ok(TtsWorkerMessage::SyncCompleted {
                     request_id,
@@ -968,6 +981,7 @@ impl PdfizerApp {
                     self.tts_profile.sync.record(elapsed_ms as f64);
                     self.tts_profile.record_sync_confidence(target.confidence);
                     self.record_sync_failure_counters(&target);
+                    self.tts_sync_active.remove(&target.sentence_index);
                     debug!(
                         sentence_index = target.sentence_index,
                         sentence_id = target.sentence_id,
@@ -982,9 +996,9 @@ impl PdfizerApp {
                         "computed TTS sync mapping summary"
                     );
                     self.tts_sync_targets.insert(target.sentence_index, target);
-                    self.tts_sync_queue
-                        .retain(|index| !self.tts_sync_targets.contains_key(index));
+                    self.tts_sync_in_flight = self.tts_sync_in_flight.saturating_sub(1);
                     self.enforce_tts_runtime_budget();
+                    self.pump_tts_job_dispatch();
                 }
                 Ok(TtsWorkerMessage::SyncFailed {
                     request_id,
@@ -996,9 +1010,11 @@ impl PdfizerApp {
                     && cancel_token == self.tts_cancel_token =>
                 {
                     self.tts_profile.sync.record(elapsed_ms as f64);
-                    self.tts_sync_queue.retain(|index| *index != sentence_index);
+                    self.tts_sync_active.remove(&sentence_index);
+                    self.tts_sync_in_flight = self.tts_sync_in_flight.saturating_sub(1);
                     self.tts_failed_sync.insert(sentence_index, error.clone());
                     warn!(sentence_index, error = %error, "TTS sync computation failed");
+                    self.pump_tts_job_dispatch();
                 }
                 Ok(_) => {
                     self.tts_profile.stale_worker_results += 1;
@@ -1062,9 +1078,12 @@ impl PdfizerApp {
         self.tts_sync_targets.clear();
         self.tts_prefetch_queue.clear();
         self.tts_sync_queue.clear();
+        self.tts_prefetch_active.clear();
+        self.tts_sync_active.clear();
         self.tts_failed_prefetch.clear();
         self.tts_failed_sync.clear();
         self.tts_prefetch_in_flight = 0;
+        self.tts_sync_in_flight = 0;
         self.tts_started_at = None;
         self.tts_activation_requested_at = None;
         self.tts_elapsed_before_pause = Duration::ZERO;
@@ -1262,37 +1281,6 @@ impl PdfizerApp {
         Some(self.apply_local_sync_controls(adapted))
     }
 
-    fn ensure_active_sentence_sync_target(&mut self) {
-        let Some(analysis) = self.tts_analysis.clone() else {
-            return;
-        };
-        if self
-            .tts_sync_targets
-            .contains_key(&self.tts_active_sentence_index)
-        {
-            return;
-        }
-        let Some(policy) = self.active_tts_policy() else {
-            return;
-        };
-        if !policy.allow_sync_prefetch {
-            return;
-        }
-
-        match tts::compute_sentence_sync(&self.config, &analysis, self.tts_active_sentence_index) {
-            Ok(target) => {
-                self.tts_profile.record_sync_confidence(target.confidence);
-                self.record_sync_failure_counters(&target);
-                self.tts_sync_targets
-                    .insert(self.tts_active_sentence_index, target);
-            }
-            Err(err) => {
-                self.tts_failed_sync
-                    .insert(self.tts_active_sentence_index, err.to_string());
-            }
-        }
-    }
-
     fn apply_local_sync_controls(&self, target: SentenceSyncTarget) -> SentenceSyncTarget {
         let mut adapted = target;
 
@@ -1464,20 +1452,23 @@ impl PdfizerApp {
             .filter(|index| {
                 !self.tts_prepared_clips.contains_key(index)
                     && !self.tts_prefetch_queue.contains(index)
+                    && !self.tts_prefetch_active.contains(index)
             })
             .collect();
         if force_restart {
             self.tts_failed_prefetch.clear();
             self.tts_prefetch_queue.clear();
             self.tts_prefetch_in_flight = 0;
+            self.tts_prefetch_active.clear();
         }
         self.tts_prefetch_queue.extend(new_prefetch.iter().copied());
-        self.tts_prefetch_in_flight += new_prefetch.len();
         self.enforce_tts_runtime_budget();
-        self.tts_profile.scheduler_queue_peak = self
-            .tts_profile
-            .scheduler_queue_peak
-            .max((self.tts_prefetch_queue.len() + self.tts_sync_queue.len()) as u64);
+        self.tts_profile.scheduler_queue_peak = self.tts_profile.scheduler_queue_peak.max(
+            (self.tts_prefetch_queue.len()
+                + self.tts_sync_queue.len()
+                + self.tts_prefetch_active.len()
+                + self.tts_sync_active.len()) as u64,
+        );
         debug!(
             request_id,
             cancel_token,
@@ -1504,34 +1495,6 @@ impl PdfizerApp {
             }
         }
 
-        let sender = self.ensure_tts_worker_channel();
-        for sentence_index in new_prefetch {
-            let config = self.config.clone();
-            let analysis = analysis.clone();
-            let sender = sender.clone();
-            let engine = self.tts_engine;
-            thread::spawn(move || {
-                let started = Instant::now();
-                let message =
-                    match tts::prepare_sentence_clip(&config, &analysis, sentence_index, engine) {
-                        Ok(clip) => TtsWorkerMessage::PrefetchCompleted {
-                            request_id,
-                            cancel_token,
-                            clip,
-                            elapsed_ms: started.elapsed().as_millis() as u64,
-                        },
-                        Err(err) => TtsWorkerMessage::PrefetchFailed {
-                            request_id,
-                            cancel_token,
-                            sentence_index,
-                            error: err.to_string(),
-                            elapsed_ms: started.elapsed().as_millis() as u64,
-                        },
-                    };
-                let _ = sender.send(message);
-            });
-        }
-
         if !policy.allow_sync_prefetch {
             self.tts_sync_queue.clear();
             return;
@@ -1544,33 +1507,122 @@ impl PdfizerApp {
         )
         .into_iter()
         .filter(|index| {
-            !self.tts_sync_targets.contains_key(index) && !self.tts_sync_queue.contains(index)
+            !self.tts_sync_targets.contains_key(index)
+                && !self.tts_sync_queue.contains(index)
+                && !self.tts_sync_active.contains(index)
         })
         .collect();
         if force_restart {
             self.tts_sync_queue.clear();
             self.tts_failed_sync.clear();
+            self.tts_sync_active.clear();
+            self.tts_sync_in_flight = 0;
         }
         self.tts_sync_queue.extend(new_sync.iter().copied());
-        self.tts_profile.scheduler_queue_peak = self
-            .tts_profile
-            .scheduler_queue_peak
-            .max((self.tts_prefetch_queue.len() + self.tts_sync_queue.len()) as u64);
+        self.tts_profile.scheduler_queue_peak = self.tts_profile.scheduler_queue_peak.max(
+            (self.tts_prefetch_queue.len()
+                + self.tts_sync_queue.len()
+                + self.tts_prefetch_active.len()
+                + self.tts_sync_active.len()) as u64,
+        );
 
-        for sentence_index in new_sync {
-            let config = self.config.clone();
-            let analysis = analysis.clone();
-            let sender = sender.clone();
-            thread::spawn(move || {
-                let started = Instant::now();
-                let message = match tts::compute_sentence_sync(&config, &analysis, sentence_index) {
-                    Ok(target) => TtsWorkerMessage::SyncCompleted {
+        self.pump_tts_job_dispatch();
+    }
+
+    fn pump_tts_job_dispatch(&mut self) {
+        let Some(analysis) = self.tts_analysis.clone() else {
+            return;
+        };
+
+        let sender = self.ensure_tts_worker_channel();
+        let request_id = self.tts_prefetch_request_id;
+        let cancel_token = self.tts_cancel_token;
+        let clip_limit = self.config.tts.clip_worker_concurrency.max(1);
+        let sync_limit = self.config.tts.sync_worker_concurrency.max(1);
+
+        while self.tts_prefetch_in_flight < clip_limit {
+            let Some(sentence_index) = self.next_pending_tts_prefetch() else {
+                break;
+            };
+            self.tts_prefetch_active.insert(sentence_index);
+            self.tts_prefetch_in_flight += 1;
+            debug!(
+                sentence_index,
+                in_flight = self.tts_prefetch_in_flight,
+                queued_remaining = self.tts_prefetch_queue.len(),
+                clip_limit,
+                "dispatching TTS clip job"
+            );
+            self.spawn_tts_prefetch_job(
+                sender.clone(),
+                analysis.clone(),
+                request_id,
+                cancel_token,
+                sentence_index,
+            );
+        }
+
+        while self.tts_sync_in_flight < sync_limit {
+            let Some(sentence_index) = self.next_pending_tts_sync() else {
+                break;
+            };
+            self.tts_sync_active.insert(sentence_index);
+            self.tts_sync_in_flight += 1;
+            debug!(
+                sentence_index,
+                in_flight = self.tts_sync_in_flight,
+                queued_remaining = self.tts_sync_queue.len(),
+                sync_limit,
+                "dispatching TTS sync job"
+            );
+            self.spawn_tts_sync_job(
+                sender.clone(),
+                analysis.clone(),
+                request_id,
+                cancel_token,
+                sentence_index,
+            );
+        }
+    }
+
+    fn next_pending_tts_prefetch(&mut self) -> Option<usize> {
+        let next = self.tts_prefetch_queue.iter().copied().find(|index| {
+            !self.tts_prepared_clips.contains_key(index)
+                && !self.tts_prefetch_active.contains(index)
+        })?;
+        self.tts_prefetch_queue.retain(|index| *index != next);
+        Some(next)
+    }
+
+    fn next_pending_tts_sync(&mut self) -> Option<usize> {
+        let next = self.tts_sync_queue.iter().copied().find(|index| {
+            !self.tts_sync_targets.contains_key(index) && !self.tts_sync_active.contains(index)
+        })?;
+        self.tts_sync_queue.retain(|index| *index != next);
+        Some(next)
+    }
+
+    fn spawn_tts_prefetch_job(
+        &self,
+        sender: Sender<TtsWorkerMessage>,
+        analysis: TtsAnalysisArtifacts,
+        request_id: u64,
+        cancel_token: u64,
+        sentence_index: usize,
+    ) {
+        let config = self.config.clone();
+        let engine = self.tts_engine;
+        thread::spawn(move || {
+            let started = Instant::now();
+            let message =
+                match tts::prepare_sentence_clip(&config, &analysis, sentence_index, engine) {
+                    Ok(clip) => TtsWorkerMessage::PrefetchCompleted {
                         request_id,
                         cancel_token,
-                        target,
+                        clip,
                         elapsed_ms: started.elapsed().as_millis() as u64,
                     },
-                    Err(err) => TtsWorkerMessage::SyncFailed {
+                    Err(err) => TtsWorkerMessage::PrefetchFailed {
                         request_id,
                         cancel_token,
                         sentence_index,
@@ -1578,9 +1630,38 @@ impl PdfizerApp {
                         elapsed_ms: started.elapsed().as_millis() as u64,
                     },
                 };
-                let _ = sender.send(message);
-            });
-        }
+            let _ = sender.send(message);
+        });
+    }
+
+    fn spawn_tts_sync_job(
+        &self,
+        sender: Sender<TtsWorkerMessage>,
+        analysis: TtsAnalysisArtifacts,
+        request_id: u64,
+        cancel_token: u64,
+        sentence_index: usize,
+    ) {
+        let config = self.config.clone();
+        thread::spawn(move || {
+            let started = Instant::now();
+            let message = match tts::compute_sentence_sync(&config, &analysis, sentence_index) {
+                Ok(target) => TtsWorkerMessage::SyncCompleted {
+                    request_id,
+                    cancel_token,
+                    target,
+                    elapsed_ms: started.elapsed().as_millis() as u64,
+                },
+                Err(err) => TtsWorkerMessage::SyncFailed {
+                    request_id,
+                    cancel_token,
+                    sentence_index,
+                    error: err.to_string(),
+                    elapsed_ms: started.elapsed().as_millis() as u64,
+                },
+            };
+            let _ = sender.send(message);
+        });
     }
 
     fn start_tts_playback(&mut self, ctx: &egui::Context) {
@@ -1739,7 +1820,6 @@ impl PdfizerApp {
     }
 
     fn try_activate_current_sentence(&mut self, ctx: &egui::Context) {
-        self.ensure_active_sentence_sync_target();
         if let Some(clip) = self
             .tts_prepared_clips
             .get(&self.tts_active_sentence_index)
@@ -3113,13 +3193,14 @@ impl PdfizerApp {
                 self.tts_engine,
             );
             ui.label(format!(
-                "Prepared clips: {} | queued: {} | sync queued: {} | failed prep: {} | failed sync: {} | in flight: {} | prefetch request: {} | cancel token: {}",
+                "Prepared clips: {} | clip queued: {} | clip in flight: {} | sync queued: {} | sync in flight: {} | failed prep: {} | failed sync: {} | prefetch request: {} | cancel token: {}",
                 snapshot.prepared_sentence_indexes.len(),
                 snapshot.queued_sentence_indexes.len(),
+                self.tts_prefetch_in_flight,
                 self.tts_sync_queue.len(),
+                self.tts_sync_in_flight,
                 snapshot.failed_sentence_indexes.len(),
                 self.tts_failed_sync.len(),
-                self.tts_prefetch_in_flight,
                 snapshot.request_id,
                 self.tts_cancel_token
             ));
@@ -3726,6 +3807,22 @@ impl PdfizerApp {
             return;
         }
         let Some(target) = self.effective_sync_target(self.tts_active_sentence_index) else {
+            if self.active_sentence().is_some_and(|sentence| {
+                sentence.page_range.start_page <= page_index
+                    && sentence.page_range.end_page >= page_index
+            }) {
+                let (fill, stroke) = self.tts_highlight_palette(TtsHighlightKind::PageFallback);
+                let highlight = response
+                    .rect
+                    .shrink2(Vec2::splat(self.config.tts.highlight_page_margin));
+                ui.painter().rect_filled(highlight, 2.0, fill);
+                ui.painter().rect_stroke(
+                    highlight,
+                    2.0,
+                    egui::Stroke::new(self.config.tts.highlight_stroke_width, stroke),
+                    egui::StrokeKind::Outside,
+                );
+            }
             return;
         };
         if target.page_index != Some(page_index) {
@@ -4145,7 +4242,7 @@ impl PdfizerApp {
 impl eframe::App for PdfizerApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         ctx.set_pixels_per_point(1.0);
-        self.poll_tts_analysis();
+        self.poll_tts_analysis(ctx);
         self.emit_tts_analysis_heartbeat();
         self.poll_playback_events();
         self.advance_tts_clock(ctx);

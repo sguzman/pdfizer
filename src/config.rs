@@ -231,6 +231,14 @@ impl AppConfig {
                 defaults.tts.sentence_prefetch as i64,
             )?
             .set_default(
+                "tts.clip_worker_concurrency",
+                defaults.tts.clip_worker_concurrency as i64,
+            )?
+            .set_default(
+                "tts.sync_worker_concurrency",
+                defaults.tts.sync_worker_concurrency as i64,
+            )?
+            .set_default(
                 "tts.clip_budget_sentences",
                 defaults.tts.clip_budget_sentences as i64,
             )?
@@ -822,6 +830,8 @@ pub struct TtsConfig {
     pub ocr_policy: TtsOcrPolicy,
     pub ocr_min_confidence: f32,
     pub sentence_prefetch: usize,
+    pub clip_worker_concurrency: usize,
+    pub sync_worker_concurrency: usize,
     pub clip_budget_sentences: usize,
     pub sync_budget_sentences: usize,
     pub active_latency_budget_ms: u64,
@@ -890,6 +900,8 @@ impl Default for TtsConfig {
             ocr_policy: TtsOcrPolicy::Deferred,
             ocr_min_confidence: 0.85,
             sentence_prefetch: 8,
+            clip_worker_concurrency: 2,
+            sync_worker_concurrency: 1,
             clip_budget_sentences: 16,
             sync_budget_sentences: 12,
             active_latency_budget_ms: 120,
