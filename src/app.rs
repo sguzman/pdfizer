@@ -3596,9 +3596,17 @@ impl PdfizerApp {
                     };
 
                     let available_width = ui.available_width().max(size.x);
+                    let row_height = size.y
+                        + if page_index + 1 < page_count {
+                            gap
+                        } else {
+                            0.0
+                        };
                     let x_offset = ((available_width - size.x) * 0.5).max(0.0);
-                    let (full_row_rect, _) =
-                        ui.allocate_exact_size(Vec2::new(available_width, size.y), Sense::hover());
+                    let (full_row_rect, _) = ui.allocate_exact_size(
+                        Vec2::new(available_width, row_height),
+                        Sense::hover(),
+                    );
                     let page_rect = Rect::from_min_size(
                         Pos2::new(full_row_rect.left() + x_offset, full_row_rect.top()),
                         size,
@@ -3614,7 +3622,16 @@ impl PdfizerApp {
                         if let Some(view) =
                             self.ensure_page_view_cached(ctx, page_index, self.current_preset)
                         {
-                            self.render_continuous_page(ctx, ui, page_index, &view, page_rect);
+                            ui.scope_builder(
+                                UiBuilder::new()
+                                    .id_salt(("continuous-page", page_index))
+                                    .max_rect(page_rect),
+                                |ui| {
+                                    self.render_continuous_page(
+                                        ctx, ui, page_index, &view, page_rect,
+                                    );
+                                },
+                            );
                         } else {
                             ui.painter().text(
                                 page_rect.center(),
@@ -3633,8 +3650,6 @@ impl PdfizerApp {
                             Color32::GRAY,
                         );
                     }
-
-                    ui.add_space(gap);
                 }
             });
         self.continuous_viewport = ScrollViewport {
